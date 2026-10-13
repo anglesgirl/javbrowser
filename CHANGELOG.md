@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — 2026-10-14
+## 1.2.0 Update — 2026-10-14
 
 The app version remains 1.2.0. These updates extend the existing 1.2.0 codebase.
 
