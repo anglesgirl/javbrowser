@@ -167,7 +167,7 @@ class AdFilterRules(private val context: Context) {
           "domains": {
             "missav": "missav.ws",
             "jable": "jable.tv",
-            "rou_video": "rouva8.xyz",
+            "rou_video": "rouvb1.xyz",
             "avjoy": "avjoy.me",
             "7mmtv": "7mmtv.sx",
             "avple": "avple.tv",
@@ -429,6 +429,11 @@ class AdFilterRules(private val context: Context) {
                 return false  // 完全沒有規則
             }
             
+            val oldRouDomain = getDomains()["rou_video"]
+            val newRouDomain = jsonObject.optJSONObject("domains")?.optString("rou_video")
+            if (!newRouDomain.isNullOrBlank() && oldRouDomain != newRouDomain) {
+                prefs.edit().remove("rou_resolved_domain").remove("rou_domain_checked_at").apply()
+            }
             // 保存
             prefs.edit().apply {
                 putString(KEY_RULES_JSON, json)
@@ -441,6 +446,62 @@ class AdFilterRules(private val context: Context) {
         }
     }
     
+    fun getResolvedRouVideoDomain(): String {
+        val learned = prefs.getString("rou_resolved_domain", null)
+        if (!learned.isNullOrBlank() && RouVideoDomains.isHost(learned)) return learned
+        val configured = getDomains()["rou_video"].orEmpty().trim().lowercase()
+        return if (configured.isBlank() || Regex("^(?:www\\.)?rouva[1-8]\\.xyz$").matches(configured)) {
+            RouVideoDomains.DEFAULT_HOST
+        } else configured
+    }
+
+    fun rememberRouVideoDomain(url: String) {
+        val host = RouVideoDomains.redirectedHost(url) ?: return
+        prefs.edit().putString("rou_resolved_domain", host).apply()
+    }
+
+    /** Probe only trusted site redirects, keeping the last usable domain on network failure. */
+    fun refreshRouVideoDomain() {
+        val current = getResolvedRouVideoDomain()
+        if (prefs.getString("rou_domain_checked_host", null) == current &&
+            System.currentTimeMillis() - prefs.getLong("rou_domain_checked_at", 0L) < 6 * 60 * 60 * 1000L) return
+        thread {
+            var resolved: String? = null
+            for (host in listOf(current, "rou.video").distinct()) {
+                var target = "https://$host/home"
+                try {
+                    for (hop in 0..5) {
+                        val connection = URL(target).openConnection() as HttpURLConnection
+                        try {
+                            connection.connectTimeout = 5_000
+                            connection.readTimeout = 5_000
+                            connection.instanceFollowRedirects = false
+                            connection.requestMethod = "HEAD"
+                            val status = connection.responseCode
+                            if (status == 200) {
+                                resolved = RouVideoDomains.redirectedHost(target)
+                                break
+                            }
+                            if (status !in setOf(301, 302, 303, 307, 308)) break
+                            val location = connection.getHeaderField("Location") ?: break
+                            val next = java.net.URI(target).resolve(location).toString()
+                            if (RouVideoDomains.redirectedHost(next) == null) break
+                            target = next
+                        } finally {
+                            connection.disconnect()
+                        }
+                    }
+                } catch (_: Exception) { /* Keep the cached domain while offline. */ }
+                if (resolved != null) break
+            }
+            if (resolved != null) {
+                prefs.edit().putString("rou_resolved_domain", resolved)
+                    .putString("rou_domain_checked_host", resolved)
+                    .putLong("rou_domain_checked_at", System.currentTimeMillis()).apply()
+            }
+        }
+    }
+
     // 從雲端更新規則
     fun updateRulesFromCloud(url: String, callback: (success: Boolean, message: String) -> Unit) {
         thread {

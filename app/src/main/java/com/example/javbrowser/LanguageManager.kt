@@ -69,6 +69,11 @@ object LanguageManager {
             "已加入下載佇列" to "Added to download queue",
             "正在取消下載..." to "Canceling download...",
             "下載完成" to "Download complete",
+            "下載完成（已內嵌字幕）" to "Download complete (subtitles embedded)",
+            "下載完成（字幕合併失敗，影片已保留）" to "Download complete (subtitle embedding failed; video kept)",
+            "正在合併字幕" to "Embedding subtitles",
+            "等待補入字幕" to "Waiting to add subtitles",
+            "字幕補入已取消，影片已保留" to "Subtitle embedding canceled; video kept",
             "下載已取消" to "Download canceled",
             "本地影片" to "Local video",
             "檔案已移動或無法存取" to "File moved or unavailable; import it again",
@@ -82,6 +87,8 @@ object LanguageManager {
         )
         exact[value]?.let { return it }
         return value
+            .replace("下載完成（已內嵌字幕）", "Download complete (subtitles embedded)")
+            .replace("下載完成（字幕合併失敗，影片已保留）", "Download complete (subtitle embedding failed; video kept)")
             .replace("下載完成：", "Download complete: ")
             .replace("下載失敗：", "Download failed: ")
             .replace("單線下載分段", "Downloading sequential segments")

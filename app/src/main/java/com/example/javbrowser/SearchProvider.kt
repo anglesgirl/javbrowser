@@ -191,6 +191,10 @@ class SearchHtmlParser(private val site: SearchSite, private val rules: SearchPa
         val image = card.select("img").firstOrNull()
         val cover = image?.let { img ->
             listOf("data-src", "data-original", "src").map { img.absUrl(it) }.firstOrNull { it.toHttpUrlOrNull() != null }
+        } ?: card.select(".videoBox-cover[style]").firstOrNull()?.let { element ->
+            Regex("url\\(['\"]?([^)'\"]+)").find(element.attr("style"))?.groupValues?.get(1)
+                ?.let { runCatching { java.net.URI(element.baseUri()).resolve(it).toString() }.getOrNull() }
+                ?.takeIf { it.toHttpUrlOrNull() != null }
         }
         val evidence = title + " " + href
         val tags = buildList {
@@ -199,7 +203,9 @@ class SearchHtmlParser(private val site: SearchSite, private val rules: SearchPa
             if (Regex("(?i)(?<![a-z0-9])4k(?![a-z0-9])").containsMatchIn(evidence)) add("4K")
         }
         return SearchResultNormalizer.RawItem(title, href, cover,
-            SearchQueryNormalizer.extractCode(title, href), tags, index)
+            SearchQueryNormalizer.extractCode(
+                if (site.parserKind == SearchParserKind.ROU_VIDEO) card.select("span.truncate").text() else "",
+                title, href), tags, index)
     }
 
     private fun safeRoute(segments: List<String>): String = "/" + segments.filter { it.isNotBlank() }.map { segment ->
@@ -238,6 +244,10 @@ object SearchProviderFactory {
             SearchParserKind.SEVEN_MM_TV -> SevenMmTvSearchProvider(context, site)
             SearchParserKind.AVPLE -> AvpleSearchProvider(context, site)
             SearchParserKind.WHOS -> WhosSearchProvider(context, site)
+            SearchParserKind.JAVDAY -> JavdaySearchProvider(context, site)
+            SearchParserKind.SUPJAV -> SupjavSearchProvider(context, site)
+            SearchParserKind.JAVRATE -> JavrateSearchProvider(context, site)
+            SearchParserKind.ROU_VIDEO, SearchParserKind.ROU_SERIES -> RouSearchProvider(context, site)
         }
     }
 }

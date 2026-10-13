@@ -45,13 +45,7 @@ class DomainConfig(private val adFilterRules: AdFilterRules) {
     fun getJableDomain(): String = adFilterRules.getDomains()["jable"] ?: "jable.tv"
 
     fun getRouVideoDomain(): String {
-        val configured = adFilterRules.getDomains()["rou_video"].orEmpty()
-        // 已安裝版本可能仍快取 rouva1~rouva7；新版站點已宣告 rouva8 為目前網域。
-        return if (Regex("^rouva[1-7]\\.xyz$", RegexOption.IGNORE_CASE).matches(configured)) {
-            "rouva8.xyz"
-        } else {
-            configured.ifBlank { "rouva8.xyz" }
-        }
+        return adFilterRules.getResolvedRouVideoDomain()
     }
 
     fun getAvJoyDomain(): String = adFilterRules.getDomains()["avjoy"] ?: "avjoy.me"
@@ -102,7 +96,7 @@ class DomainConfig(private val adFilterRules: AdFilterRules) {
                 return uri.buildUpon().authority(getMissAvDomain()).build().toString()
             } else if (host.contains("jable.", ignoreCase = true)) {
                 return uri.buildUpon().authority(getJableDomain()).build().toString()
-            } else if (host.contains("rou.video", ignoreCase = true) || host.contains("rouva", ignoreCase = true)) {
+            } else if (RouVideoDomains.isHost(host, getRouVideoDomain())) {
                 return uri.buildUpon().authority(getRouVideoDomain()).build().toString()
             } else if (host.contains("avjoy.", ignoreCase = true)) {
                 return uri.buildUpon().authority(getAvJoyDomain()).build().toString()

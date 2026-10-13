@@ -19,6 +19,7 @@ object UnifiedSearchSourceSheet {
         val dialog = BottomSheetDialog(context)
         val root = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.rgb(30, 27, 36))
             setPadding(dp(context, 16), dp(context, 12), dp(context, 16), dp(context, 8))
         }
         root.addView(TextView(context).apply {
@@ -55,8 +56,14 @@ object UnifiedSearchSourceSheet {
             val site = siteNames[item.siteId] ?: item.siteId
             holder.root.removeAllViews()
             holder.root.addView(TextView(context).apply {
-                text = site + " · " + SearchResultGrouping.linkLabel(group, item, site, LanguageManager.isEnglish(context))
-                textSize = 13f; setTextColor(Color.WHITE)
+                text = SearchResultGrouping.linkLabel(group, item, site, LanguageManager.isEnglish(context))
+                textSize = 15f
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                setTextColor(Color.rgb(187, 134, 252))
+            })
+            holder.root.addView(TextView(context).apply {
+                text = runCatching { java.net.URI(item.detailUrl).host }.getOrNull() ?: item.siteId
+                textSize = 12f; setTextColor(Color.LTGRAY)
             })
             holder.root.addView(TextView(context).apply {
                 text = item.title; textSize = 11f; setTextColor(Color.LTGRAY); maxLines = 2
@@ -71,7 +78,7 @@ object UnifiedSearchSourceSheet {
                     }
                 })
                 addView(Button(context).apply {
-                    text = LanguageManager.text(context, "開啟", "Open"); isAllCaps = false; minWidth = 0
+                    text = LanguageManager.text(context, "開啟 $site", "Open $site"); isAllCaps = false; minWidth = 0
                     setOnClickListener { onOpen(item); close() }
                 })
             })

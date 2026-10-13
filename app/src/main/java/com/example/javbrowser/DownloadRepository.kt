@@ -25,7 +25,10 @@ data class VideoDownloadRecord(
     val createdAt: Long,
     val completedAt: Long?,
     val referer: String,
-    val cookieSourceUrl: String
+    val cookieSourceUrl: String,
+    val subtitleSources: String = "[]",
+    val subtitleError: String? = null,
+    val packagingRevision: Int = 0
 )
 
 object DownloadRepository {
@@ -158,10 +161,11 @@ object DownloadRepository {
                 }
             }
             if (index >= 0) {
+                if (records[index].status == STATUS_PENDING || records[index].status == STATUS_DOWNLOADING) return@forEach
                 records[index] = records[index].copy(
                     status = STATUS_COMPLETED,
                     progress = 100,
-                    message = if (records[index].sourceUrl.isBlank()) "本地影片" else "下載完成",
+                    message = localScanMessage(records[index].status, records[index].message, records[index].sourceUrl.isNotBlank()),
                     fileName = file.fileName,
                     fileUri = uri,
                     fileSizeBytes = file.sizeBytes,
@@ -216,6 +220,15 @@ object DownloadRepository {
         notifyChanged(context)
     }
 
+    internal fun localScanMessage(status: String, message: String, hasSource: Boolean): String =
+        if (status == STATUS_COMPLETED && message.isNotBlank()) message
+        else if (hasSource) "下載完成" else "本地影片"
+
+    fun canRepairSubtitles(record: VideoDownloadRecord): Boolean =
+        record.status == STATUS_COMPLETED && !record.fileUri.isNullOrBlank() &&
+            record.subtitleSources.isNotBlank() && record.subtitleSources != "[]" &&
+            (record.message != "下載完成（已內嵌字幕）" || record.packagingRevision < 2)
+
     private fun deduplicateRecords(
         context: Context,
         records: List<VideoDownloadRecord>
@@ -265,21 +278,25 @@ object DownloadRepository {
         return documentId.replace('\\', '/')
     }
 
-    private fun mergeDuplicateRecords(
+    internal fun mergeDuplicateRecords(
         first: VideoDownloadRecord,
         second: VideoDownloadRecord
     ): VideoDownloadRecord {
-        val keep = if (recordPreference(second) > recordPreference(first)) second else first
+        val active = listOf(first, second).firstOrNull {
+            (it.status == STATUS_PENDING || it.status == STATUS_DOWNLOADING) && !it.id.startsWith("local-")
+        }
+        val keep = active ?: if (recordPreference(second) > recordPreference(first)) second else first
         val other = if (keep === first) second else first
+        val completed = active == null && (keep.status == STATUS_COMPLETED || other.status == STATUS_COMPLETED)
         return keep.copy(
             title = keep.title.takeIf { it.isNotBlank() } ?: other.title,
             sourceUrl = keep.sourceUrl.ifBlank { other.sourceUrl },
-            status = if (keep.status == STATUS_COMPLETED || other.status == STATUS_COMPLETED) {
+            status = if (completed) {
                 STATUS_COMPLETED
             } else {
                 keep.status
             },
-            progress = if (keep.status == STATUS_COMPLETED || other.status == STATUS_COMPLETED) 100 else keep.progress,
+            progress = if (completed) 100 else keep.progress,
             fileName = keep.fileName ?: other.fileName,
             fileUri = keep.fileUri ?: other.fileUri,
             fileSizeBytes = maxOf(keep.fileSizeBytes, other.fileSizeBytes),
@@ -289,7 +306,8 @@ object DownloadRepository {
             createdAt = minOf(keep.createdAt, other.createdAt),
             completedAt = listOfNotNull(keep.completedAt, other.completedAt).maxOrNull(),
             referer = keep.referer.ifBlank { other.referer },
-            cookieSourceUrl = keep.cookieSourceUrl.ifBlank { other.cookieSourceUrl }
+            cookieSourceUrl = keep.cookieSourceUrl.ifBlank { other.cookieSourceUrl },
+            subtitleSources = keep.subtitleSources.takeUnless { it.isBlank() || it == "[]" } ?: other.subtitleSources
         )
     }
 
@@ -330,6 +348,9 @@ object DownloadRepository {
         put("completedAt", record.completedAt)
         put("referer", record.referer)
         put("cookieSourceUrl", record.cookieSourceUrl)
+        put("subtitleSources", record.subtitleSources)
+        put("subtitleError", record.subtitleError)
+        put("packagingRevision", record.packagingRevision)
     }
 
     private fun fromJson(json: JSONObject) = VideoDownloadRecord(
@@ -349,6 +370,9 @@ object DownloadRepository {
         createdAt = json.optLong("createdAt", 0L),
         completedAt = json.optLong("completedAt").takeIf { it > 0L },
         referer = json.optString("referer"),
-        cookieSourceUrl = json.optString("cookieSourceUrl")
+        cookieSourceUrl = json.optString("cookieSourceUrl"),
+        subtitleSources = json.optString("subtitleSources", "[]"),
+        subtitleError = json.optString("subtitleError").takeIf { it.isNotBlank() && it != "null" },
+        packagingRevision = json.optInt("packagingRevision", 0)
     )
 }

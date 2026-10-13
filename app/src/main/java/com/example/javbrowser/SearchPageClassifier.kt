@@ -52,13 +52,17 @@ object SearchPageClassifier {
     }
 
     fun confirmedEmpty(document: Document, rules: SearchParserRules): Boolean {
+        fun emptyText(node: Element): Boolean {
+            val text = node.text().trim()
+            return emptyWords.matches(text) || text in setOf("沒有找到符合的影集", "沒有找到符合的劇集")
+        }
         fun eligible(node: Element): Boolean = visible(node) && node.closest(
             "nav, header, footer, .comments, #comments, .recommendations, .related, .related-videos"
         ) == null && node.closest(rules.card) == null
         val explicit = document.select(rules.empty + ", " + EMPTY_SELECTORS)
-        if (explicit.any { eligible(it) && it.text().length <= 500 && emptyWords.matches(it.text().trim()) }) return true
+        if (explicit.any { eligible(it) && it.text().length <= 500 && emptyText(it) }) return true
         // Headings can state an empty search without any of the known site-specific class names.
         return document.select("main h1, main h2, [role=main] h1, [role=main] h2, .search-results h1, .search-results h2")
-            .any { eligible(it) && it.text().length <= 200 && emptyWords.matches(it.text().trim()) }
+            .any { eligible(it) && it.text().length <= 200 && emptyText(it) }
     }
 }

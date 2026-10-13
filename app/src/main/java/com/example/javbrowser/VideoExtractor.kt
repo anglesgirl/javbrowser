@@ -1,6 +1,7 @@
 package com.example.javbrowser
 
 import java.util.regex.Pattern
+import org.jsoup.Jsoup
 
 data class MissAvThumbnailConfig(
     val picNum: Int,
@@ -12,6 +13,9 @@ data class MissAvThumbnailConfig(
 )
 
 object VideoExtractor {
+
+    data class RouVideoEpisode(val id: String, val number: Int)
+    data class AdditionalVideoEpisode(val url: String, val title: String)
 
     fun extractJable(html: String): String? {
         // Pattern: var hlsUrl = 'URL'
@@ -154,39 +158,32 @@ object VideoExtractor {
     }
 
     fun extractRouVideo(html: String, pageUrl: String? = null): String? {
+        // The main playlist is available before the page player fetches media or thumbnails.
+        pageUrl?.let(RouVideoStreams::playlistForPage)?.let { return it }
         try {
-            // New logic: Check for "ev" object with "d" and "k"
-            val evBlockPattern = Pattern.compile("\"ev\"\\s*:\\s*\\{([^}]+)\\}")
-            val evBlockMatcher = evBlockPattern.matcher(html)
-            
-            if (evBlockMatcher.find()) {
-                val block = evBlockMatcher.group(1) ?: ""
-                val dMatcher = Pattern.compile("\"d\"\\s*:\\s*\"([^\"]+)\"").matcher(block)
-                val kMatcher = Pattern.compile("\"k\"\\s*:\\s*(\\d+)").matcher(block)
-                
-                if (dMatcher.find() && kMatcher.find()) {
-                    val dBase64 = dMatcher.group(1)
-                    val kStr = kMatcher.group(1)
-                    val k = kStr.toInt()
-                    
-                    // Decode base64
+            // Rou's current SSR payload uses `ev:$R[n]={d:"...",k:...}` rather than
+            // the older quoted JSON form. Find the payload object after either spelling.
+            val evKey = Regex("""(?:\"ev\"|(?<![A-Za-z0-9_])ev)\s*:""")
+                .find(html)
+            val blockStart = evKey?.range?.last?.let { html.indexOf('{', it + 1) } ?: -1
+            val blockEnd = if (blockStart >= 0) html.indexOf('}', blockStart) else -1
+            if (blockStart >= 0 && blockEnd > blockStart) {
+                val block = html.substring(blockStart + 1, blockEnd)
+                val dBase64 = Regex("""(?:\"d\"|d)\s*:\s*[\"']([^\"']+)[\"']""")
+                    .find(block)?.groupValues?.getOrNull(1)
+                val shift = Regex("""(?:\"k\"|k)\s*:\s*(\d+)""")
+                    .find(block)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                if (!dBase64.isNullOrBlank() && shift != null) {
                     val decodedBytes = android.util.Base64.decode(dBase64, android.util.Base64.DEFAULT)
-                    // Shift characters
-                    val builder = java.lang.StringBuilder()
-                    for (byte in decodedBytes) {
-                        val shifted = (byte.toInt() and 0xFF) - k
-                        builder.append(shifted.toChar())
-                    }
-                    val decryptedJson = builder.toString()
-                    
-                    // Extract videoUrl
-                    val urlPattern = Pattern.compile("\"videoUrl\"\\s*:\\s*\"([^\"]+)\"")
-                    val urlMatcher = urlPattern.matcher(decryptedJson)
-                    if (urlMatcher.find()) {
-                        var videoUrl = urlMatcher.group(1)
-                        if (videoUrl != null) {
-                            return normalizeRouVideoUrl(videoUrl, pageUrl)
+                    val decryptedJson = buildString(decodedBytes.size) {
+                        decodedBytes.forEach { byte ->
+                            append(((byte.toInt() and 0xFF) - shift).toChar())
                         }
+                    }
+                    val videoUrl = Regex("""\"videoUrl\"\s*:\s*\"([^\"]+)\"""")
+                        .find(decryptedJson)?.groupValues?.getOrNull(1)
+                    if (!videoUrl.isNullOrBlank()) {
+                        return normalizeRouVideoUrl(videoUrl, pageUrl)
                     }
                 }
             }
@@ -210,6 +207,46 @@ object VideoExtractor {
         }
         return null
     }
+
+    fun extractRouEpisodes(html: String): List<RouVideoEpisode> {
+        val anchorPattern = Regex(
+            """<a\b[^>]*href=[\"'](/v/([A-Za-z0-9_-]+)(?:[?#][^\"']*)?)[\"'][^>]*>([\s\S]*?)</a>""",
+            RegexOption.IGNORE_CASE
+        )
+        val episodes = anchorPattern.findAll(html).mapNotNull { match ->
+            val id = match.groupValues.getOrNull(2).orEmpty()
+            val text = match.groupValues.getOrNull(3).orEmpty()
+                .replace(Regex("""<!--[\s\S]*?-->"""), " ")
+                .replace(Regex("""<[^>]*>"""), " ")
+                .replace("&nbsp;", " ", ignoreCase = true)
+                .replace("&#x27;", "'", ignoreCase = true)
+                .replace("&amp;", "&", ignoreCase = true)
+                .replace(Regex("\\s+"), " ")
+                .trim()
+            val number = Regex("第\\s*(\\d+)\\s*集")
+                .find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            if (id.isBlank() || number == null || number <= 0) null
+            else RouVideoEpisode(id, number)
+        }.distinctBy { it.id }
+            .sortedBy { it.number }
+            .take(500)
+            .toList()
+        return episodes
+    }
+
+    fun extractJavdayEpisodes(html: String, pageUrl: String): List<AdditionalVideoEpisode> {
+        if (!AdditionalSiteMedia.hostMatches(pageUrl, "javday.app")) return emptyList()
+        val base = runCatching { java.net.URI(pageUrl) }.getOrNull() ?: return emptyList()
+        return Jsoup.parse(html, pageUrl).select(".episode-btn[data-url]").mapNotNull { button ->
+            val rawUrl = button.attr("data-url").trim()
+            val url = runCatching { base.resolve(rawUrl).toString() }.getOrNull() ?: return@mapNotNull null
+            if (!AdditionalSiteMedia.accepts(pageUrl, url, pageUrl)) return@mapNotNull null
+            val title = button.attr("data-name").trim().ifBlank { button.text().trim() }
+                .take(80)
+            if (title.isBlank()) null else AdditionalVideoEpisode(url, title)
+        }.distinctBy { it.url }.take(500)
+    }
+
     fun extractAvJoy(html: String): String? {
         // Find all <source> tags and pick the one with the highest res value
         val sourceTagPattern = Pattern.compile("<source([^>]+)>", Pattern.CASE_INSENSITIVE)

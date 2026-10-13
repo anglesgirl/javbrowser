@@ -8,6 +8,9 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
 import java.io.InputStream
+import android.os.ParcelFileDescriptor
+import org.json.JSONArray
+import org.json.JSONObject
 import kotlin.math.min
 
 class LocalVideoHttpServer(
@@ -16,6 +19,20 @@ class LocalVideoHttpServer(
 ) : NanoHTTPD("127.0.0.1", 0) {
     private val appContext = context.applicationContext
     private val sourceName: String by lazy { querySourceName() }
+    private val embeddedSubtitles: List<EmbeddedSubtitles.Subtitle> by lazy {
+        runCatching {
+            if (sourceUri.scheme == "file") {
+                FileInputStream(File(requireNotNull(sourceUri.path))).use { EmbeddedSubtitles.read(it.channel) }
+            } else {
+                val descriptor = appContext.contentResolver.openFileDescriptor(sourceUri, "r")
+                    ?: throw IOException("Unable to open local video")
+                ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { EmbeddedSubtitles.read(it.channel) }
+            }
+        }.getOrElse {
+            android.util.Log.w("OFFLINE_SUBTITLES", "Unable to read embedded subtitles", it)
+            emptyList()
+        }
+    }
 
     fun playbackUrl(): String {
         val extension = sourceName.substringAfterLast('.', "mp4").lowercase()
@@ -25,6 +42,20 @@ class LocalVideoHttpServer(
     }
 
     override fun serve(session: IHTTPSession): Response {
+        if (session.uri == "/subtitles.json") {
+            val tracks = JSONArray()
+            embeddedSubtitles.forEachIndexed { index, subtitle ->
+                tracks.put(JSONObject().put("label", subtitle.label).put("lang", subtitle.language)
+                    .put("src", "http://127.0.0.1:$listeningPort/subtitle/$index.vtt"))
+            }
+            return newFixedLengthResponse(Response.Status.OK, "application/json", tracks.toString())
+        }
+        Regex("^/subtitle/(\\d+)\\.vtt$").matchEntire(session.uri)?.let { match ->
+            val subtitle = match.groupValues[1].toIntOrNull()?.let { embeddedSubtitles.getOrNull(it) }
+                ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found")
+            val bytes = subtitle.vtt.toByteArray(Charsets.UTF_8)
+            return newFixedLengthResponse(Response.Status.OK, "text/vtt; charset=utf-8", bytes.inputStream(), bytes.size.toLong())
+        }
         if (session.uri != "/video" && !session.uri.startsWith("/video.")) {
             return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found")
         }

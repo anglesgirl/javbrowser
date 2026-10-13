@@ -206,26 +206,20 @@ class SalesRankingActivity : LocalizedActivity() {
 
     private fun openInsideApp(url: String) {
         if (url.isBlank()) return
-        // MainActivity 已在排行頁下方暫停；先用本機廣播讓既有 WebView 載入網址。
-        val navigation = Intent(MainActivity.ACTION_LOAD_URL).apply {
-            putExtra(MainActivity.EXTRA_URL, url)
-            putExtra(MainActivity.EXTRA_CLEAR_HISTORY, true)
-        }
-        androidx.localbroadcastmanager.content.LocalBroadcastManager.getInstance(this)
-            .sendBroadcast(navigation)
-
         // 不能直接指定 MainActivity：使用者可能已透過 AppIconManager 將它停用，
-        // 改用目前啟用中的 launcher alias，並把既有 MainActivity 置於排行頁上方。
-        // 使用 REORDER_TO_FRONT 保留 SalesRankingActivity，返回鍵即可回到原本滾動位置。
+        // 改用目前啟用中的 launcher alias，建立獨立的瀏覽實例。
+        // 保留 HOME → 銷售排行 → 瀏覽頁；X 只關閉瀏覽頁，不銷毀 HOME。
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
         if (launchIntent == null) {
             Toast.makeText(this, "找不到 APP 主頁入口", Toast.LENGTH_SHORT).show()
             return
         }
+        // getLaunchIntentForPackage 的 NEW_TASK / RESET_TASK_IF_NEEDED 會重用主頁，
+        // 必須清除，且不能使用 REORDER_TO_FRONT 把原本的 HOME 移到上層。
+        launchIntent.flags = 0
         launchIntent.putExtra(MainActivity.EXTRA_URL, url)
             .putExtra(MainActivity.EXTRA_RETURN_TO_SALES, true)
             .putExtra(MainActivity.EXTRA_CLEAR_HISTORY, true)
-            .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         runCatching { startActivity(launchIntent) }
             .onFailure {
                 Toast.makeText(this, "無法開啟搜尋頁", Toast.LENGTH_SHORT).show()

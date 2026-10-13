@@ -25,7 +25,7 @@ import java.util.zip.InflaterInputStream
  *   val localUrl = proxy.buildProxyUrl(realVideoUrl, referer, cookies)
  *   // 將 localUrl 傳給外部播放器
  */
-class VideoProxyServer : NanoHTTPD(0) { // port=0 讓系統自動選空閒 port
+class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : NanoHTTPD(0) { // port=0 讓系統自動選空閒 port
 
     companion object {
         private const val CONNECT_TIMEOUT = 15000
@@ -109,13 +109,13 @@ class VideoProxyServer : NanoHTTPD(0) { // port=0 讓系統自動選空閒 port
     }
 
     private fun proxyRequest(
-        realUrl: String,
+        requestedUrl: String,
         referer: String,
         cookies: String,
         rangeHeader: String?
     ): Response {
-        val isRouStream = referer.contains("rou.video", ignoreCase = true) ||
-            referer.contains("rouva", ignoreCase = true)
+        val realUrl = authorizeUrl(requestedUrl)
+        val isRouStream = RouVideoDomains.isUrl(referer)
         val connection = URL(realUrl).openConnection() as HttpURLConnection
         try {
             connection.connectTimeout = CONNECT_TIMEOUT
@@ -282,8 +282,7 @@ class VideoProxyServer : NanoHTTPD(0) { // port=0 讓系統自動選空閒 port
 
     // 判斷是否為 m3u8 URL
     private fun isM3u8Url(url: String): Boolean {
-        val path = url.substringBefore("?").lowercase()
-        return path.endsWith(".m3u8") || path.endsWith(".m3u")
+        return MediaStreamFormats.isHls(url)
     }
 
     // 判斷是否為 m3u8 Content-Type
@@ -388,6 +387,7 @@ class VideoProxyServer : NanoHTTPD(0) { // port=0 讓系統自動選空閒 port
 
     // 將相對 URL 解析為絕對 URL
     private fun resolveUrl(baseUrl: String, relative: String): String {
+        if (JavrateStreams.isSigned(baseUrl)) return JavrateStreams.resolve(baseUrl, relative)
         if (relative.startsWith("http://") || relative.startsWith("https://")) return relative
         return try {
             URI(baseUrl).resolve(relative).toString()

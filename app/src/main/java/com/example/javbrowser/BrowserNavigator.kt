@@ -8,7 +8,8 @@ import android.widget.Toast
 /** 統一從結果頁回到可切換圖示的主瀏覽器入口。 */
 object BrowserNavigator {
     const val EXTRA_RETURN_TO_SEARCH = "return_to_unified_search"
-    fun open(context: Context, url: String): Boolean {
+    const val EXTRA_RETURN_TO_HISTORY = "return_to_playback_history"
+    fun open(context: Context, url: String, returnToHistory: Boolean = false): Boolean {
         val cleanUrl = url.trim()
         if (!cleanUrl.startsWith("http://", true) && !cleanUrl.startsWith("https://", true)) {
             Toast.makeText(context, "結果網址無效", Toast.LENGTH_SHORT).show()
@@ -22,7 +23,8 @@ object BrowserNavigator {
         // Keep the search Activity below a fresh browser instance, including with launcher aliases.
         launchIntent.flags = 0
         launchIntent.putExtra(MainActivity.EXTRA_URL, cleanUrl)
-            .putExtra(EXTRA_RETURN_TO_SEARCH, true)
+            .putExtra(EXTRA_RETURN_TO_SEARCH, !returnToHistory)
+            .putExtra(EXTRA_RETURN_TO_HISTORY, returnToHistory)
         if (context !is Activity) launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         return runCatching {
             context.startActivity(launchIntent)

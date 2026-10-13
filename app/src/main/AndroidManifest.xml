@@ -57,6 +57,7 @@
                 <data android:host="rouva2.xyz" />
                 <data android:host="rouva3.xyz" />
                 <data android:host="rouva8.xyz" />
+                <data android:host="rouvb1.xyz" />
                 <data android:host="missav.ws" />
                 <data android:host="missav.ai" />
                 <data android:host="missav.com" />
@@ -75,6 +76,9 @@
 
         <activity
             android:name=".UnifiedSearchActivity"
+            android:exported="false" />
+        <activity
+            android:name=".PlaybackHistoryActivity"
             android:exported="false" />
         <activity
             android:name=".SearchSourceActivity"

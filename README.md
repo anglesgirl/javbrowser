@@ -8,6 +8,17 @@
 
 JAV Browser combines a site-aware WebView browser with stream detection, an internal fullscreen player, external-player handoff, direct MP4/HLS downloads, a searchable bookmark library, local-video management, and cloud-updatable ad-filter rules.
 
+## Latest Development Updates
+
+These updates build on version **1.2.0**. See the [Changelog](CHANGELOG.md) for the full update notes.
+
+- **Visual playback history:** retain the latest 200 pages with covers, website icons, actress names when available, and playback dates. Search by title, actress, or URL; swipe left to delete. The full-width dark yellow HOME button appears below the website shortcuts.
+- **Episode playback:** choose ROU and JAVDAY episodes directly in the internal player and automatically advance to the next episode. ROU can resolve its primary video without first starting the webpage player.
+- **Clean picture:** hide player controls and overlays using the button beside Close, then tap the picture to restore them.
+- **Clipboard links:** HOME offers to open copied URLs from supported websites while the app is in the foreground.
+- **Expanded search:** separate ROU video and series results, plus JAVDAY, SUPJAV, and JavRate adapters.
+- **Site and offline playback:** improved SUPJAV Server detection, AVToday player-source detection, JavRate authorization renewal, embedded offline subtitles, and MP4 packaging repair.
+
 ## Version 1.2.0 Highlights
 
 - Consolidated duplicate download-library entries that refer to the same physical video file.
@@ -57,6 +68,19 @@ This branch extends the original browser-centered design in the following areas:
 
 - Home-page shortcuts for the primary video, metadata, and general video websites supported by this version.
 - Site-specific search URL generation, including PigAV and AVToday search pages.
+- JAVDAY (`javday.app`) and SUPJAV (`supjav.com`) home shortcuts and dedicated cross-site search adapters, including JAVDAY's observed pagination format.
+- Bookmark covers, source filters, and matching-site links for JAVDAY and SUPJAV.
+- JavRate (`javrate.com`) home shortcut, cross-site search with category pagination, bookmark source filters, and the app's full internal player controls in both orientations. A separate authorization session renews short-lived CDN credentials without restarting playback; downloads retain that session after the player closes. Advertising popups are isolated from the main page.
+- JavRate's external WebVTT subtitle tracks are imported into the internal player. Chinese subtitles are selected automatically when available, with a subtitle selector and an off option.
+- New JavRate downloads automatically embed available subtitles as switchable MP4 timed-text tracks without re-encoding audio or video. The internal player reads embedded subtitles locally for offline playback. Subtitle failures keep the downloaded video and are reported in the download record.
+- MP4 packaging holds a temporary CPU wake lock so it can continue with the screen off. Subtitle requests retry transient network errors, and subtitle failure details are retained for diagnosis.
+- Download-library scans preserve packaging status and subtitle errors. Completed JavRate downloads missing subtitles offer **Add subtitles**, which embeds subtitles into the existing video without downloading it again.
+- Downloaded videos retain the original internal player and its controls, including locally loaded embedded subtitles.
+- Subtitle packaging preserves edit-list timing and converts ADTS-wrapped AAC packets into standard MP4 audio samples without re-encoding. Previously packaged downloads offer **Repair packaging**, which repairs the existing file and reuses its embedded subtitles without downloading the video again.
+- JAVDAY episode selection and SUPJAV's selected-Server stream detection feed the existing internal player and download flow. SUPJAV media requests retain the embedded player's Referer.
+- SUPJAV Server changes clear the previous stream and cancel its resolver. Player discovery follows the selected Server's iframe chain, reads declared JW Player/video sources, and retains the actual player's Referer. EVS HLS playlists named `master.txt` and Streamtape's `get_video` endpoint are recognized; unavailable or verification-gated sources report a detection timeout instead of retaining an old Server's stream.
+- SUPJAV internal playback uses direct WebView networking with the detected player origin. EVS, FST, VOE, VAS, and LUC each passed more than 30 seconds of physical-device playback on the tested detail page; ST required website robot verification. These results do not establish playback for every title or a completed offline-download test. See [Server analysis](docs/supjav-server-analysis.md).
+- AVToday detects signed MP4 and legacy HLS from the selected `/player?s=...` iframe, preserves the player Referer, and excludes page previews from source detection.
 - Page recognition that distinguishes video/detail pages from listing, search, and home pages.
 - Scroll-position restoration when returning to a previously visited page.
 - Site-aware extraction of titles, video codes, covers, tags, and playable sources where supported.

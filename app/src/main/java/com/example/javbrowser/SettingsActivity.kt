@@ -56,6 +56,10 @@ class SettingsActivity : LocalizedActivity() {
             window.setFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE, android.view.WindowManager.LayoutParams.FLAG_SECURE)
         }
         setContentView(R.layout.activity_settings)
+        findViewById<Button>(R.id.btn_playback_history).apply {
+            text = t("播放紀錄", "Playback history")
+            setOnClickListener { startActivity(android.content.Intent(this@SettingsActivity, PlaybackHistoryActivity::class.java)) }
+        }
 
         privacySettings = PrivacySettings(this)
         appIconManager = AppIconManager(this)

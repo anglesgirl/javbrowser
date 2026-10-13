@@ -13,7 +13,7 @@ enum class SearchPageState {
 /** Only follow observed pagination controls; never guess a next URL from the search term. */
 object SearchPagination {
     data class Detection(val next: String?, val state: SearchPageState)
-    private const val CONTAINERS = ".pagination, .pagination-block, .paging, .pager, .page-links, nav"
+    private const val CONTAINERS = ".pagination, .pagination-wrapper, .pagination-block, .paging, .pager, .page-links, .layui-laypage, nav"
     private val counters = setOf("page", "p", "paged", "from", "from_videos", "from_albums", "start", "offset")
     private val transport = setOf("mode", "function", "block_id", "_")
     private val nextWords = Regex("^(?:next(?: page)?|下一[頁页]|下[頁页]|次へ|次のページ)?\\s*[›»→>]*$", RegexOption.IGNORE_CASE)
@@ -71,12 +71,14 @@ object SearchPagination {
     }
 
     private fun route(url: HttpUrl): String = url.encodedPath
+        .replace(Regex("^/search/page/\\d+/wd/"), "/search/wd/")
         .replace(Regex("/page/\\d+/?$"), "/")
         .replace(Regex("(/search/[^/]+)/\\d+/?$"), "$1/")
         .replace(Regex("/\\d+\\.html$"), "/PAGE.html").trimEnd('/')
 
     private fun pathPage(url: HttpUrl): Long? = Regex("/(?:page/(\\d+)|(\\d+)\\.html|search/[^/]+/(\\d+))/?$")
         .find(url.encodedPath)?.groupValues?.drop(1)?.firstNotNullOfOrNull { it.toLongOrNull() }
+        ?: Regex("^/search/page/(\\d+)/wd/").find(url.encodedPath)?.groupValues?.get(1)?.toLongOrNull()
 
     private fun pageNumber(url: HttpUrl): Long = counters.asSequence().mapNotNull { url.queryParameter(it)?.toLongOrNull() }
         .firstOrNull() ?: pathPage(url) ?: 1L
@@ -84,7 +86,10 @@ object SearchPagination {
     fun advances(current: HttpUrl, rawNext: String, site: SearchSite, explicit: Boolean): Boolean {
         if (!SearchResultNormalizer.validUrl(rawNext, site)) return false
         val next = rawNext.toHttpUrlOrNull() ?: return false
-        if (current.host != next.host || route(current) != route(next)) return false
+        fun siteRoute(url: HttpUrl): String = route(url).let {
+            if (site.parserKind == SearchParserKind.JAVRATE) it.lowercase(java.util.Locale.ROOT) else it
+        }
+        if (current.host != next.host || siteRoute(current) != siteRoute(next)) return false
         if ((current.queryParameterNames + next.queryParameterNames).filter { it !in counters && it !in transport && it != "cursor" }
                 .any { current.queryParameterValues(it) != next.queryParameterValues(it) }) return false
         // A new block/transport setting alone is never evidence of another results page.

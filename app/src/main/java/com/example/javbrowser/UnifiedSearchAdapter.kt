@@ -76,6 +76,7 @@ class UnifiedSearchAdapter(
             append(" · ").append(LanguageManager.text(context,
                 "${group.links.map { it.siteId }.distinct().size} 站／${group.links.size} 個連結",
                 "${group.links.map { it.siteId }.distinct().size} sites / ${group.links.size} links"))
+            append("\n").append(group.links.map { siteNames[it.siteId] ?: it.siteId }.distinct().joinToString(" · "))
         }
         val flags = localIndex.match(group)
         holder.badges.apply {

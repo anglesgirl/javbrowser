@@ -133,7 +133,10 @@ class FavoritesActivity : LocalizedActivity() {
     private val sourceFilters = listOf(
         SourceFilter("pornhub", "Pornhub", listOf("pornhub.com", "phncdn.com")),
         SourceFilter("stripchat", "Stripchat", listOf("stripchat.com")),
-        SourceFilter("xvideos", "XVideos", listOf("xvideos.com"))
+        SourceFilter("xvideos", "XVideos", listOf("xvideos.com")),
+        SourceFilter("javday", "JAVDAY", listOf("javday.app")),
+        SourceFilter("supjav", "SUPJAV", listOf("supjav.com")),
+        SourceFilter("javrate", "JavRate", listOf("javrate.com"))
     )
 
     // 批量刪除選擇模式
@@ -1770,6 +1773,9 @@ class FavoritesActivity : LocalizedActivity() {
             val chip7mmtv: TextView = view.findViewById(R.id.chip_7mmtv)
             val chipAvple: TextView = view.findViewById(R.id.chip_avple)
             val chipWhos: TextView = view.findViewById(R.id.chip_whos)
+            val chipJavday: TextView = view.findViewById(R.id.chip_javday)
+            val chipSupjav: TextView = view.findViewById(R.id.chip_supjav)
+            val chipJavrate: TextView = view.findViewById(R.id.chip_javrate)
             val chipPigav: TextView = view.findViewById(R.id.chip_pigav)
             val chipAvToday: TextView = view.findViewById(R.id.chip_avtoday)
             val chipMissav: TextView = view.findViewById(R.id.chip_missav)
@@ -1965,7 +1971,7 @@ class FavoritesActivity : LocalizedActivity() {
                 val iconRes = when {
                     item.url.contains("missav") -> android.R.drawable.ic_menu_camera
                     item.url.contains("jable") -> android.R.drawable.ic_menu_gallery
-                    item.url.contains("rou.video") || item.url.contains("rouva") -> android.R.drawable.ic_menu_view
+                    RouVideoDomains.isUrl(item.url) -> android.R.drawable.ic_menu_view
                     else -> android.R.drawable.ic_menu_gallery
                 }
                 holder.ivThumbnail.setImageResource(iconRes)
@@ -2266,6 +2272,9 @@ class FavoritesActivity : LocalizedActivity() {
             bindChip(holder.chip7mmtv, CrossSiteChecker.KEY_7MMTV)
             bindChip(holder.chipAvple, CrossSiteChecker.KEY_AVPLE)
             bindChip(holder.chipWhos, CrossSiteChecker.KEY_WHOS)
+            bindChip(holder.chipJavday, CrossSiteChecker.KEY_JAVDAY)
+            bindChip(holder.chipSupjav, CrossSiteChecker.KEY_SUPJAV)
+            bindChip(holder.chipJavrate, CrossSiteChecker.KEY_JAVRATE)
             bindChip(holder.chipPigav, CrossSiteChecker.KEY_PIGAV)
             bindChip(holder.chipAvToday, CrossSiteChecker.KEY_AVTODAY)
             bindChip(holder.chipMissav, CrossSiteChecker.KEY_MISSAV)
@@ -2552,12 +2561,15 @@ class FavoritesActivity : LocalizedActivity() {
         url.contains("pornhub", ignoreCase = true) -> "PH"
         url.contains("stripchat", ignoreCase = true) -> "SC"
         url.contains("xvideos", ignoreCase = true) -> "XV"
-        url.contains("rou.video", ignoreCase = true) || url.contains("rouva", ignoreCase = true) -> "ROU"
+        RouVideoDomains.isUrl(url) -> "ROU"
         url.contains("missav", ignoreCase = true) -> "MISSAV"
         url.contains("jable", ignoreCase = true) -> "JABLE"
         url.contains("7mmtv", ignoreCase = true) || url.contains("7tv", ignoreCase = true) -> "7MMTV"
         url.contains("avple", ignoreCase = true) -> "AVPLE"
         url.contains("whos.tv", ignoreCase = true) -> "WHOS"
+        AdditionalSiteMedia.hostMatches(url, "javday.app") -> "JAVDAY"
+        AdditionalSiteMedia.hostMatches(url, "supjav.com") -> "SUPJAV"
+        AdditionalSiteMedia.hostMatches(url, "javrate.com") -> "JavRate"
         url.contains("pigav", ignoreCase = true) -> "PIGAV"
         url.contains("avtoday", ignoreCase = true) -> "AVT"
         url.contains("avjoy", ignoreCase = true) -> "AVJOY"

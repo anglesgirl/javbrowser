@@ -32,6 +32,10 @@ object CrossSiteChecker {
     const val KEY_7MMTV             = "7mmtv"
     const val KEY_AVPLE             = "avple"
     const val KEY_WHOS              = "whos"
+    const val KEY_JAVDAY            = "javday"
+    const val KEY_SUPJAV            = "supjav"
+    const val KEY_JAVRATE           = "javrate"
+    private val additionalSiteExecutor = java.util.concurrent.Executors.newFixedThreadPool(2)
 
     fun checkAll(
         context: Context,
@@ -40,6 +44,23 @@ object CrossSiteChecker {
         callback: (Map<String, String>) -> Unit
     ) {
         val code     = javCode.lowercase().trim()
+        val extendedCallback: (Map<String, String>) -> Unit = { existing ->
+            val providers = SearchProviderFactory.create(context.applicationContext).values.filter {
+                it.site.id in setOf(KEY_JAVDAY, KEY_SUPJAV, KEY_JAVRATE) &&
+                    !it.site.isAllowedHost(runCatching { java.net.URI(sourceUrl).host }.getOrNull().orEmpty())
+            }
+            additionalSiteExecutor.execute {
+                val found = existing.toMutableMap()
+                providers.forEach { provider ->
+                    val request = SearchRequest(java.util.UUID.randomUUID().toString(), code, code.uppercase(),
+                        SearchMode.CODE, listOf(provider.site.id), provider.site.configurationKey)
+                    runCatching { provider.search(request) }.getOrNull()?.items?.firstOrNull()?.let {
+                        found[provider.site.id] = it.detailUrl
+                    }
+                }
+                Handler(Looper.getMainLooper()).post { callback(found) }
+            }
+        }
         val isMissav = sourceUrl.contains("missav", ignoreCase = true)
         val isJable  = sourceUrl.contains("jable",  ignoreCase = true)
         val isAvjoy  = sourceUrl.contains("avjoy",  ignoreCase = true)
@@ -83,20 +104,20 @@ object CrossSiteChecker {
                         // Step 3：JavHD 檢查（來源本身是 JavHD 則跳過）
                         if (!isJavhd) {
                             checkJavHD(context, code) { javhdFound ->
-                                checkExtendedSites(context, code, is7mmtv, isAvple, isWhos, jableMissavFound + avjoyFound + javhdFound, callback)
+                                checkExtendedSites(context, code, is7mmtv, isAvple, isWhos, jableMissavFound + avjoyFound + javhdFound, extendedCallback)
                             }
                         } else {
-                            checkExtendedSites(context, code, is7mmtv, isAvple, isWhos, jableMissavFound + avjoyFound, callback)
+                            checkExtendedSites(context, code, is7mmtv, isAvple, isWhos, jableMissavFound + avjoyFound, extendedCallback)
                         }
                     }
                 } else {
                     // Step 3：JavHD 檢查
                     if (!isJavhd) {
                         checkJavHD(context, code) { javhdFound ->
-                            checkExtendedSites(context, code, is7mmtv, isAvple, isWhos, jableMissavFound + javhdFound, callback)
+                        checkExtendedSites(context, code, is7mmtv, isAvple, isWhos, jableMissavFound + javhdFound, extendedCallback)
                         }
                     } else {
-                        checkExtendedSites(context, code, is7mmtv, isAvple, isWhos, jableMissavFound, callback)
+                        checkExtendedSites(context, code, is7mmtv, isAvple, isWhos, jableMissavFound, extendedCallback)
                     }
                 }
             }
@@ -761,6 +782,9 @@ object CrossSiteChecker {
             url.contains("7tv", ignoreCase = true))          -> KEY_7MMTV
         url.contains("avple.tv", ignoreCase = true)          -> KEY_AVPLE
         url.contains("whos.tv", ignoreCase = true)           -> KEY_WHOS
+        AdditionalSiteMedia.hostMatches(url, "javday.app")   -> KEY_JAVDAY
+        AdditionalSiteMedia.hostMatches(url, "supjav.com")   -> KEY_SUPJAV
+        AdditionalSiteMedia.hostMatches(url, "javrate.com")  -> KEY_JAVRATE
         else                                                 -> null
     }
 }

@@ -386,6 +386,17 @@ class DownloadsActivity : LocalizedActivity() {
     }
 
     private fun retryDownload(record: VideoDownloadRecord) {
+        if (DownloadRepository.canRepairSubtitles(record)) {
+            val intent = Intent(this, VideoDownloadService::class.java).apply {
+                action = VideoDownloadService.ACTION_EMBED_SUBTITLES
+                putExtra(VideoDownloadService.EXTRA_URL, record.sourceUrl)
+                putExtra(VideoDownloadService.EXTRA_DOWNLOAD_ID, record.id)
+                putExtra(VideoDownloadService.EXTRA_SUBTITLE_SOURCES, record.subtitleSources)
+            }
+            ContextCompat.startForegroundService(this, intent)
+            Toast.makeText(this, LanguageManager.text(this, "已加入字幕補入佇列", "Subtitle embedding queued"), Toast.LENGTH_SHORT).show()
+            return
+        }
         if (record.status == DownloadRepository.STATUS_DOWNLOADING ||
             record.status == DownloadRepository.STATUS_PENDING
         ) {
@@ -416,6 +427,7 @@ class DownloadsActivity : LocalizedActivity() {
             putExtra(VideoDownloadService.EXTRA_COOKIE_SOURCE_URL, cookieSourceUrl)
             putExtra(VideoDownloadService.EXTRA_FILE_NAME, record.title)
             putExtra(VideoDownloadService.EXTRA_DOWNLOAD_ID, retryRecord.id)
+            putExtra(VideoDownloadService.EXTRA_SUBTITLE_SOURCES, record.subtitleSources)
         }
         ContextCompat.startForegroundService(this, intent)
         Toast.makeText(this, LanguageManager.text(this, "已重新加入下載", "Added to download queue again"), Toast.LENGTH_SHORT).show()
@@ -746,7 +758,7 @@ class DownloadsActivity : LocalizedActivity() {
                     record.status == DownloadRepository.STATUS_DOWNLOADING
                 ) View.VISIBLE else View.GONE
                 retry.visibility = if (
-                    record.sourceUrl.isNotBlank() && (
+                    DownloadRepository.canRepairSubtitles(record) || record.sourceUrl.isNotBlank() && (
                         record.status == DownloadRepository.STATUS_FAILED ||
                         record.status == DownloadRepository.STATUS_CANCELED ||
                         record.status == DownloadRepository.STATUS_DOWNLOADING
@@ -756,7 +768,11 @@ class DownloadsActivity : LocalizedActivity() {
                 } else {
                     View.GONE
                 }
-                retry.text = if (record.status == DownloadRepository.STATUS_DOWNLOADING) {
+                retry.text = if (DownloadRepository.canRepairSubtitles(record)) {
+                    if (record.message == "下載完成（已內嵌字幕）")
+                        LanguageManager.text(itemView.context, "修復封裝", "Repair packaging")
+                    else LanguageManager.text(itemView.context, "補字幕", "Add subtitles")
+                } else if (record.status == DownloadRepository.STATUS_DOWNLOADING) {
                     LanguageManager.text(itemView.context, "重連", "Reconnect")
                 } else {
                     LanguageManager.text(itemView.context, "接續", "Resume")

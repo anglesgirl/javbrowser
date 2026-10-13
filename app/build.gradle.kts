@@ -62,6 +62,7 @@ dependencies {
     implementation("androidx.webkit:webkit:1.10.0")
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("org.mp4parser:muxer:1.9.56")
     implementation("androidx.work:work-runtime-ktx:2.9.0")
     
     testImplementation("junit:junit:4.13.2")

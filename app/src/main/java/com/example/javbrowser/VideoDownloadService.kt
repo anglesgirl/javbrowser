@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.provider.MediaStore
 import android.util.Base64
 import androidx.core.app.NotificationCompat
@@ -34,6 +35,8 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
 import java.nio.ByteBuffer
+import java.nio.channels.Channels
+import org.json.JSONArray
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -54,12 +57,15 @@ class VideoDownloadService : Service() {
     companion object {
         const val ACTION_START = "com.example.javbrowser.DOWNLOAD_START"
         const val ACTION_CANCEL = "com.example.javbrowser.DOWNLOAD_CANCEL"
+        const val ACTION_EMBED_SUBTITLES = "com.example.javbrowser.EMBED_SUBTITLES"
         const val EXTRA_URL = "url"
         const val EXTRA_REFERER = "referer"
         const val EXTRA_COOKIES = "cookies"
         const val EXTRA_COOKIE_SOURCE_URL = "cookie_source_url"
         const val EXTRA_FILE_NAME = "file_name"
         const val EXTRA_DOWNLOAD_ID = "download_id"
+        const val EXTRA_JAVRATE_LEASE = "javrate_lease"
+        const val EXTRA_SUBTITLE_SOURCES = "subtitle_sources"
 
         private const val CHANNEL_ID = "video_downloads"
         private const val LEGACY_SUMMARY_NOTIFICATION_ID = 4201
@@ -119,6 +125,10 @@ class VideoDownloadService : Service() {
         val requestedName = intent.getStringExtra(EXTRA_FILE_NAME).orEmpty()
         val downloadId = intent.getStringExtra(EXTRA_DOWNLOAD_ID)
             ?: DownloadRepository.create(this, requestedName, url, referer, cookieSourceUrl).id
+        val repairRecord = if (intent.action == ACTION_EMBED_SUBTITLES) {
+            DownloadRepository.list(this).firstOrNull { it.id == downloadId && DownloadRepository.canRepairSubtitles(it) }
+                ?: return START_NOT_STICKY
+        } else null
 
         val task = DownloadTask(downloadId, nextNotificationId.getAndIncrement())
         val accepted = synchronized(foregroundLock) {
@@ -139,9 +149,13 @@ class VideoDownloadService : Service() {
         if (!accepted) {
             return START_NOT_STICKY
         }
+        task.javrateLease.set(JavratePlaybackLease.acquire(intent.getStringExtra(EXTRA_JAVRATE_LEASE)))
+        task.subtitleSources = intent.getStringExtra(EXTRA_SUBTITLE_SOURCES)
+            ?: DownloadRepository.list(this).firstOrNull { it.id == downloadId }?.subtitleSources ?: "[]"
 
         DownloadRepository.update(this, downloadId) {
-            it.copy(status = DownloadRepository.STATUS_PENDING, message = "等待下載")
+            it.copy(status = DownloadRepository.STATUS_PENDING, message = if (repairRecord != null) "等待補入字幕" else "等待下載",
+                subtitleSources = task.subtitleSources, subtitleError = null)
         }
         notificationManager.notify(
             task.notificationId,
@@ -157,8 +171,10 @@ class VideoDownloadService : Service() {
                     task.notificationId,
                     buildProgressNotification("準備下載...", 0, true, downloadId)
                 )
-                runDownload(url, referer, cookies, cookieSourceUrl, requestedName, downloadId)
+                if (repairRecord != null) runSubtitleRepair(repairRecord)
+                else runDownload(url, referer, cookies, cookieSourceUrl, requestedName, downloadId)
             } finally {
+                task.javrateLease.getAndSet(null)?.release()
                 currentTask.remove()
             }
         }
@@ -168,11 +184,46 @@ class VideoDownloadService : Service() {
     override fun onDestroy() {
         activeTasks.values.forEach { task ->
             task.canceled.set(true)
+            task.javrateLease.getAndSet(null)?.release()
             task.activeConnections.forEach { it.disconnect() }
             task.activeCalls.forEach { it.cancel() }
         }
         executor.shutdownNow()
         super.onDestroy()
+    }
+
+    private fun runSubtitleRepair(record: VideoDownloadRecord) {
+        val source = Uri.parse(requireNotNull(record.fileUri))
+        var finalUri = source
+        var completionMessage = "下載完成（字幕合併失敗，影片已保留）"
+        try {
+            checkCanceled()
+            updateProgress(record.id, 99, "正在合併字幕", 0L)
+            val existing = runCatching {
+                val descriptor = contentResolver.openFileDescriptor(source, "r") ?: throw IOException("Unable to open video")
+                android.os.ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { EmbeddedSubtitles.read(it.channel) }
+            }.getOrDefault(emptyList())
+            val subtitles = existing.ifEmpty { fetchDownloadSubtitles(currentDownloadTask().subtitleSources) }
+            require(subtitles.isNotEmpty()) { "No subtitles available" }
+            val result = tryEmbedSubtitles(source, sanitizeFileName(record.title), record.id, subtitles)
+                ?: throw IOException(currentDownloadTask().subtitleError ?: "Subtitle embedding failed")
+            finalUri = result.uri
+            completionMessage = "下載完成（已內嵌字幕）"
+        } catch (error: DownloadCanceledException) {
+            completionMessage = "字幕補入已取消，影片已保留"
+        } catch (error: Exception) {
+            currentDownloadTask().subtitleError = subtitleErrorMessage(error)
+            android.util.Log.w("DOWNLOAD_SUBTITLES", "Subtitle repair failed; original video kept", error)
+        } finally {
+            DownloadRepository.update(this, record.id) {
+                it.copy(status = DownloadRepository.STATUS_COMPLETED, progress = 100, message = completionMessage,
+                    fileUri = finalUri.toString(), fileSizeBytes = LocalVideoRepository.querySize(this, finalUri),
+                    subtitleError = currentDownloadTask().subtitleError, speedBytesPerSecond = 0L,
+                    packagingRevision = if (finalUri != source) 2 else it.packagingRevision)
+            }
+            notificationManager.notify(currentDownloadTask().notificationId, buildResultNotification(completionMessage, finalUri))
+            finishTask(record.id)
+        }
     }
 
     private fun runDownload(
@@ -187,6 +238,17 @@ class VideoDownloadService : Service() {
         try {
             checkCanceled()
             val baseName = sanitizeFileName(requestedName)
+            var subtitleFailure = false
+            val subtitles = try {
+                fetchDownloadSubtitles(currentDownloadTask().subtitleSources)
+            } catch (error: DownloadCanceledException) {
+                throw error
+            } catch (error: Exception) {
+                subtitleFailure = true
+                currentDownloadTask().subtitleError = subtitleErrorMessage(error)
+                android.util.Log.w("DOWNLOAD_SUBTITLES", "Subtitle download failed; keeping video download", error)
+                emptyList()
+            }
             val result = if (looksLikeHls(url)) {
                 val playlist = resolveMediaPlaylist(url, referer, cookies, cookieSourceUrl)
                 val parts = parseMediaPlaylist(playlist.url, playlist.text)
@@ -277,19 +339,34 @@ class VideoDownloadService : Service() {
                     finalUri = mp4Target.uri
                 }
             }
+            if (subtitles.isNotEmpty()) {
+                val embedded = tryEmbedSubtitles(finalUri, baseName, downloadId, subtitles)
+                if (embedded != null) {
+                    target = embedded
+                    finalTarget = embedded
+                    finalUri = embedded.uri
+                } else subtitleFailure = true
+            }
+            val completionMessage = when {
+                subtitleFailure -> "下載完成（字幕合併失敗，影片已保留）"
+                subtitles.isNotEmpty() -> "下載完成（已內嵌字幕）"
+                else -> "下載完成"
+            }
             DownloadRepository.update(this, downloadId) {
                 it.copy(
                     status = DownloadRepository.STATUS_COMPLETED,
                     progress = 100,
-                    message = "下載完成",
+                    message = completionMessage,
                     speedBytesPerSecond = 0L,
                     fileSizeBytes = LocalVideoRepository.querySize(this, finalUri),
-                    completedAt = System.currentTimeMillis()
+                    completedAt = System.currentTimeMillis(),
+                    subtitleError = currentDownloadTask().subtitleError,
+                    packagingRevision = if (!subtitleFailure && subtitles.isNotEmpty()) 2 else it.packagingRevision
                 )
             }
             notificationManager.notify(
                 currentDownloadTask().notificationId,
-                buildResultNotification("下載完成：${finalTarget.fileName}", finalUri)
+                buildResultNotification("$completionMessage：${finalTarget.fileName}", finalUri)
             )
         } catch (e: DownloadCanceledException) {
             target?.finish(false)
@@ -638,6 +715,100 @@ class VideoDownloadService : Service() {
         }
     }
 
+    private fun fetchDownloadSubtitles(sources: String): List<EmbeddedSubtitles.Subtitle> {
+        val tracks = JSONArray(sources)
+        require(tracks.length() <= 20) { "Too many subtitle tracks" }
+        return (0 until tracks.length()).map { index ->
+            checkCanceled()
+            val track = tracks.getJSONObject(index)
+            val url = track.getString("src")
+            require(JavrateSubtitles.isAllowed(url)) { "Invalid subtitle address" }
+            val bytes = fetchSubtitleBytes(url)
+            val text = bytes.toString(Charsets.UTF_8)
+            EmbeddedSubtitles.parseVtt(text)
+            EmbeddedSubtitles.Subtitle(track.optString("label"), track.optString("lang"), text)
+        }
+    }
+
+    private fun fetchSubtitleBytes(url: String): ByteArray {
+        var lastError: Exception? = null
+        repeat(3) { attempt ->
+            checkCanceled()
+            try {
+                val connection = openConnection(url, "https://www.javrate.com/", "", "")
+                return try {
+                    connection.inputStream.use { input ->
+                        val output = java.io.ByteArrayOutputStream()
+                        val buffer = ByteArray(8192)
+                        while (true) {
+                            checkCanceled()
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            if (output.size() + count > 5_000_000) throw IOException("Subtitle too large")
+                            output.write(buffer, 0, count)
+                        }
+                        output.toByteArray()
+                    }
+                } finally { closeConnection(connection) }
+            } catch (error: DownloadCanceledException) {
+                throw error
+            } catch (error: IOException) {
+                lastError = error
+                if (attempt < 2) Thread.sleep(500L shl attempt)
+            }
+        }
+        throw lastError ?: IOException("Subtitle download failed")
+    }
+
+    private fun subtitleErrorMessage(error: Exception): String =
+        "${error.javaClass.simpleName}: ${error.message.orEmpty().take(160)}"
+
+    /** Only hold the CPU awake while packaging; release on completion, failure or cancellation. */
+    private fun <T> withPackagingWakeLock(work: () -> T): T {
+        val power = getSystemService(PowerManager::class.java)
+        val wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:mp4-packaging")
+        wakeLock.setReferenceCounted(false)
+        wakeLock.acquire(TimeUnit.HOURS.toMillis(1))
+        try { return work() }
+        finally { if (wakeLock.isHeld) wakeLock.release() }
+    }
+
+    private fun tryEmbedSubtitles(source: Uri, baseName: String, downloadId: String,
+        subtitles: List<EmbeddedSubtitles.Subtitle>): DownloadTarget? {
+        var output: DownloadTarget? = null
+        return try {
+            checkCanceled()
+            updateProgress(downloadId, 99, "正在合併字幕", 0L)
+            notificationManager.notify(currentDownloadTask().notificationId,
+                buildProgressNotification("正在合併字幕", 99, false, downloadId))
+            val descriptor = openDownloadFileDescriptor(source, write = false)
+                ?: throw IOException("無法讀取影片以合併字幕")
+            ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { input ->
+                val destination = createDownloadTarget(baseName, "mp4", "video/mp4")
+                output = destination
+                Channels.newChannel(destination.output).use { channel ->
+                    withPackagingWakeLock {
+                        EmbeddedSubtitles.mux(input.channel, channel, subtitles, ::checkCanceled)
+                    }
+                }
+            }
+            checkCanceled()
+            val completed = requireNotNull(output)
+            completed.finish(true)
+            updateTargetRecord(downloadId, completed, "video/mp4")
+            deleteDownloadUri(source)
+            completed
+        } catch (error: DownloadCanceledException) {
+            output?.finish(false)
+            throw error
+        } catch (error: Exception) {
+            output?.finish(false)
+            currentDownloadTask().subtitleError = subtitleErrorMessage(error)
+            android.util.Log.w("DOWNLOAD_SUBTITLES", "Subtitle mux failed; original video kept", error)
+            null
+        }
+    }
+
     private fun tryRemuxTsToMp4(
         sourceUri: Uri,
         baseName: String,
@@ -654,7 +825,7 @@ class VideoDownloadService : Service() {
             )
             mp4Target = createDownloadTarget(baseName, "mp4", "video/mp4")
             mp4Target.closeOutput()
-            remuxTsToMp4(sourceUri, mp4Target.uri, downloadId)
+            withPackagingWakeLock { remuxTsToMp4(sourceUri, mp4Target.uri, downloadId) }
             mp4Target.finish(true)
             updateTargetRecord(downloadId, mp4Target, "video/mp4")
             deleteDownloadUri(sourceUri)
@@ -691,6 +862,7 @@ class VideoDownloadService : Service() {
                 try {
                     extractor.setDataSource(input.fileDescriptor)
                     val trackMap = IntArray(extractor.trackCount) { -1 }
+                    val aacSampleRates = IntArray(extractor.trackCount)
                     var videoTrackFound = false
                     var maxInputSize = 4 * 1024 * 1024
                     val activeMuxer = MediaMuxer(
@@ -703,6 +875,10 @@ class VideoDownloadService : Service() {
                         val format = extractor.getTrackFormat(trackIndex)
                         val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
                         if (!mime.startsWith("video/") && !mime.startsWith("audio/")) continue
+                        if (mime == "audio/mp4a-latm") {
+                            aacSampleRates[trackIndex] = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                            format.setInteger(MediaFormat.KEY_IS_ADTS, 0)
+                        }
                         trackMap[trackIndex] = activeMuxer.addTrack(format)
                         extractor.selectTrack(trackIndex)
                         if (mime.startsWith("video/")) {
@@ -737,8 +913,22 @@ class VideoDownloadService : Service() {
                             // increasing destroys B-frame composition timing; the old 1 us nudge
                             // was also rounded away at the MP4 track timescale, creating many
                             // duplicate timestamps and visible dropped frames.
-                            info.set(0, sampleSize, extractor.sampleTime, extractor.sampleFlags)
-                            activeMuxer.writeSampleData(destinationTrack, buffer, info)
+                            buffer.position(0)
+                            buffer.limit(sampleSize)
+                            val sampleRate = aacSampleRates.getOrElse(sourceTrack) { 0 }
+                            val frames = if (sampleRate > 0) AdtsMp4Audio.frames(buffer) else null
+                            if (frames == null) {
+                                info.set(0, sampleSize, extractor.sampleTime, extractor.sampleFlags)
+                                activeMuxer.writeSampleData(destinationTrack, buffer, info)
+                            } else {
+                                var elapsedSamples = 0L
+                                frames.forEach { frame ->
+                                    info.set(frame.offset, frame.length,
+                                        extractor.sampleTime + elapsedSamples * 1_000_000L / sampleRate, extractor.sampleFlags)
+                                    activeMuxer.writeSampleData(destinationTrack, buffer, info)
+                                    elapsedSamples += frame.duration
+                                }
+                            }
                             processedBytes += sampleSize
                         }
                         extractor.advance()
@@ -1215,9 +1405,14 @@ class VideoDownloadService : Service() {
         } else {
             val directory = File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "JAV Browser")
             if (!directory.exists() && !directory.mkdirs()) throw IOException("無法建立下載資料夾")
-            val file = File(directory, fileName)
-            DownloadTarget(Uri.fromFile(file), file.outputStream(), fileName) { success ->
-                if (!success) file.delete()
+            var file = File(directory, fileName)
+            var suffix = 1
+            while (!file.createNewFile()) {
+                file = File(directory, "$baseName-$time-${suffix++}.$extension")
+            }
+            val destination = file
+            DownloadTarget(Uri.fromFile(destination), destination.outputStream(), destination.name) { success ->
+                if (!success) destination.delete()
             }
         }
     }
@@ -1368,11 +1563,12 @@ class VideoDownloadService : Service() {
     }
 
     private fun looksLikeHls(url: String): Boolean {
-        val lower = url.substringBefore('?').lowercase(Locale.US)
-        return lower.endsWith(".m3u8") || lower.endsWith(".m3u")
+        return MediaStreamFormats.isHls(url)
     }
 
-    private fun resolveUrl(baseUrl: String, child: String): String = URI(baseUrl).resolve(child).toString()
+    private fun resolveUrl(baseUrl: String, child: String): String =
+        if (JavrateStreams.isSigned(baseUrl)) JavrateStreams.resolve(baseUrl, child)
+        else URI(baseUrl).resolve(child).toString()
 
     private fun originFor(url: String): String? = runCatching {
         val parsed = URL(url)
@@ -1437,6 +1633,9 @@ class VideoDownloadService : Service() {
     private data class DownloadTask(
         val downloadId: String,
         val notificationId: Int,
+        var subtitleSources: String = "[]",
+        var subtitleError: String? = null,
+        val javrateLease: java.util.concurrent.atomic.AtomicReference<JavratePlaybackLease?> = java.util.concurrent.atomic.AtomicReference(null),
         val canceled: AtomicBoolean = AtomicBoolean(false),
         val progress: AtomicInteger = AtomicInteger(0),
         val hlsKeyCache: MutableMap<String, ByteArray> = ConcurrentHashMap(),

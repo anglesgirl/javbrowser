@@ -36,6 +36,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         private const val PREFERENCE_MAX_PICTURE_MODE = "max_picture_mode"
         const val EXTRA_VIDEO_URL = "video_url"
         const val EXTRA_REFERER = "referer"
+        const val EXTRA_JAVRATE_PLAYER = "javrate_player"
         const val EXTRA_THUMB_PIC_NUM = "thumb_pic_num"
         const val EXTRA_THUMB_WIDTH = "thumb_width"
         const val EXTRA_THUMB_HEIGHT = "thumb_height"
@@ -46,6 +47,8 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         const val EXTRA_DOWNLOAD_NAME = "download_name"
         const val EXTRA_LOCAL_PLAYBACK = "local_playback"
         const val EXTRA_PAGE_URL = "page_url"
+        const val EXTRA_ROU_EPISODES_JSON = "rou_episodes_json"
+        const val EXTRA_ADDITIONAL_EPISODES_JSON = "additional_episodes_json"
         const val EXTRA_PC_RECORDING_EVENTS_URI = "pc_recording_events_uri"
         const val EXTRA_PC_RECORDING_CONTACT_URI = "pc_recording_contact_uri"
         const val EXTRA_PC_RECORDING_DISPLAY_NAME = "pc_recording_display_name"
@@ -54,6 +57,9 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
     private lateinit var webView: WebView
     private var localVideoServer: LocalVideoHttpServer? = null
     private var playbackProxyServer: VideoProxyServer? = null
+    private var javrateSession: JavratePlaybackSession? = null
+    private var javrateLease: JavratePlaybackLease? = null
+    private var subtitleTracks = "[]"
     @Volatile
     private var orientationLockMode = "auto"
     @Volatile
@@ -62,6 +68,11 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        if (!intent.getBooleanExtra(EXTRA_LOCAL_PLAYBACK, false)) {
+            PlaybackHistoryRepository.record(this, intent.getStringExtra(EXTRA_PAGE_URL).orEmpty(),
+                intent.getStringExtra(EXTRA_DOWNLOAD_NAME).orEmpty())
+        }
 
         orientationLockMode = savedInstanceState?.getString(STATE_ORIENTATION_LOCK_MODE) ?: "auto"
         val playerUiPreferences = getSharedPreferences(PLAYER_UI_PREFERENCES, MODE_PRIVATE)
@@ -79,15 +90,49 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         )
         applyPlayerSystemUi()
 
+        val javratePlayer = intent.getStringExtra(EXTRA_JAVRATE_PLAYER)
+        if (javratePlayer != null && JavrateStreams.isPlayer(javratePlayer)) {
+            val loading = android.widget.TextView(this).apply {
+                text = "正在取得播放授權…"
+                setTextColor(android.graphics.Color.WHITE)
+                setBackgroundColor(android.graphics.Color.BLACK)
+                gravity = android.view.Gravity.CENTER
+            }
+            setContentView(loading)
+            val session = JavratePlaybackSession(applicationContext)
+            javrateSession = session
+            session.start(javratePlayer, intent.getStringExtra(EXTRA_PAGE_URL).orEmpty(), { source ->
+                if (!isFinishing && !isDestroyed) showPlayer(source, "https://www.javrate.com/", maxPictureMode)
+            }, {
+                loading.text = "無法取得播放授權，請返回網頁重新開啟影片"
+            }, { tracks ->
+                subtitleTracks = tracks
+                if (::webView.isInitialized) webView.evaluateJavascript(
+                    "window.setSubtitleTracks && window.setSubtitleTracks(${subtitlePlaybackJson()})", null)
+            })
+            return
+        }
         val videoUrl = intent.getStringExtra(EXTRA_VIDEO_URL) ?: run {
             finish()
             return
         }
         val referer = intent.getStringExtra(EXTRA_REFERER) ?: "https://missav.ai/"
+        showPlayer(videoUrl, referer, maxPictureMode)
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun showPlayer(videoUrl: String, referer: String, maxPictureMode: Boolean) {
         val thumbnailConfig = readThumbnailConfig()
         val previewVttUrl = intent.getStringExtra(EXTRA_PREVIEW_VTT_URL)
         val downloadName = intent.getStringExtra(EXTRA_DOWNLOAD_NAME) ?: "video"
         val pageUrl = intent.getStringExtra(EXTRA_PAGE_URL).orEmpty()
+        val rouEpisodes = parseRouEpisodes(intent.getStringExtra(EXTRA_ROU_EPISODES_JSON).orEmpty())
+            .takeIf { isRouVideoHost(runCatching { Uri.parse(pageUrl).host.orEmpty() }.getOrDefault("")) }
+            .orEmpty()
+        val additionalEpisodes = parseAdditionalEpisodes(
+            intent.getStringExtra(EXTRA_ADDITIONAL_EPISODES_JSON).orEmpty(), pageUrl
+        )
+        val currentRouEpisodeId = runCatching { Uri.parse(pageUrl).lastPathSegment }.getOrNull()
         val pcRecordingEventsUri = intent.getStringExtra(EXTRA_PC_RECORDING_EVENTS_URI)
             ?.takeIf { it.isNotBlank() }
             ?.let(Uri::parse)
@@ -151,7 +196,9 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                 downloadName,
                 !isLocalPlayback,
                 enableQualitySelector,
-                pcRecordingEventsUri
+                pcRecordingEventsUri,
+                rouEpisodes.associate { it.id to it.number },
+                additionalEpisodes.associate { it.url to it.title }
             ),
             "AndroidPlayer"
         )
@@ -165,12 +212,49 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                 isLocalPlayback,
                 enableQualitySelector,
                 immersiveMode,
-                maxPictureMode
+                maxPictureMode,
+                rouEpisodes,
+                currentRouEpisodeId,
+                additionalEpisodes,
+                videoUrl
             ),
             "text/html",
             "UTF-8",
             null
         )
+    }
+
+    private fun parseRouEpisodes(json: String): List<VideoExtractor.RouVideoEpisode> {
+        return runCatching {
+            val array = JSONArray(json)
+            (0 until array.length()).mapNotNull { index ->
+                val item = array.optJSONObject(index) ?: return@mapNotNull null
+                val id = item.optString("id")
+                val number = item.optInt("number", 0)
+                if (!Regex("[A-Za-z0-9_-]{6,64}").matches(id) || number <= 0) null
+                else VideoExtractor.RouVideoEpisode(id, number)
+            }.distinctBy { it.id }
+                .sortedBy { it.number }
+                .take(500)
+        }.getOrDefault(emptyList())
+    }
+
+    private fun parseAdditionalEpisodes(json: String, pageUrl: String): List<VideoExtractor.AdditionalVideoEpisode> {
+        if (!AdditionalSiteMedia.hostMatches(pageUrl, "javday.app")) return emptyList()
+        return runCatching {
+            val array = JSONArray(json)
+            (0 until array.length()).mapNotNull { index ->
+                val item = array.optJSONObject(index) ?: return@mapNotNull null
+                val url = item.optString("url")
+                val title = item.optString("title").trim().take(80)
+                if (!AdditionalSiteMedia.accepts(pageUrl, url, pageUrl) || title.isBlank()) null
+                else VideoExtractor.AdditionalVideoEpisode(url, title)
+            }.distinctBy { it.url }.take(500)
+        }.getOrDefault(emptyList())
+    }
+
+    private fun isRouVideoHost(host: String): Boolean {
+        return RouVideoDomains.isHost(host)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -183,9 +267,13 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
     }
 
     override fun onDestroy() {
+        javrateSession?.clearSubtitleListener()
+        if (javrateLease != null) javrateLease?.release() else javrateSession?.close()
+        javrateSession = null
         localVideoServer?.stop()
         localVideoServer = null
-        playbackProxyServer?.stop()
+        if (javrateLease == null) playbackProxyServer?.stop()
+        javrateLease = null
         playbackProxyServer = null
         if (::webView.isInitialized) {
             webView.destroy()
@@ -223,8 +311,14 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         private val downloadName: String,
         private val canDownload: Boolean,
         private val canSelectQuality: Boolean,
-        private val pcRecordingEventsUri: Uri?
+        private val pcRecordingEventsUri: Uri?,
+        private val allowedRouEpisodes: Map<String, Int>,
+        private val allowedAdditionalEpisodes: Map<String, String>
     ) {
+        @Volatile private var activeVideoUrl = videoUrl
+        @Volatile private var activePageUrl = pageUrl
+        @Volatile private var activeDownloadName = downloadName
+
         @JavascriptInterface
         fun close() {
             runOnUiThread { finish() }
@@ -256,7 +350,64 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         @JavascriptInterface
         fun download() {
             if (!canDownload) return
-            runOnUiThread { startVideoDownload(videoUrl, referer, pageUrl, downloadName) }
+            runOnUiThread {
+                startVideoDownload(activeVideoUrl, referer, activePageUrl, activeDownloadName)
+            }
+        }
+
+        @JavascriptInterface
+        fun resolveRouEpisode(episodeId: String, episodeNumber: Int): String {
+            if (allowedRouEpisodes[episodeId] != episodeNumber || episodeNumber <= 0) return ""
+            val pageUri = runCatching { Uri.parse(pageUrl) }.getOrNull() ?: return ""
+            val host = pageUri.host.orEmpty()
+            if (!isRouVideoHost(host)) return ""
+            val scheme = pageUri.scheme?.takeIf { it == "http" || it == "https" } ?: "https"
+            val authority = pageUri.encodedAuthority ?: host
+            val sourceUrl = Uri.Builder()
+                .scheme(scheme)
+                .encodedAuthority(authority)
+                .appendPath("api")
+                .appendPath("hls")
+                .appendPath(episodeId)
+                .build()
+                .toString()
+            val episodePageUrl = Uri.Builder()
+                .scheme(scheme)
+                .encodedAuthority(authority)
+                .appendPath("v")
+                .appendPath(episodeId)
+                .build()
+                .toString()
+            val proxy = playbackProxyServer ?: return ""
+            val cookieManager = android.webkit.CookieManager.getInstance()
+            val cookies = cookieManager.getCookie(sourceUrl).orEmpty()
+                .ifEmpty { cookieManager.getCookie(referer).orEmpty() }
+            val proxiedUrl = proxy.buildProxyUrl(sourceUrl, referer, cookies)
+            activeVideoUrl = proxiedUrl
+            activePageUrl = episodePageUrl
+            activeDownloadName = downloadName
+                .replace(Regex("第\\s*\\d+\\s*集"), "")
+                .trim()
+                .ifBlank { "video" } + " - 第 $episodeNumber 集"
+            PlaybackHistoryRepository.record(this@FullscreenInternalPlayerActivity, activePageUrl, activeDownloadName)
+            return proxiedUrl
+        }
+
+        @JavascriptInterface
+        fun resolveAdditionalEpisode(episodeUrl: String, episodeTitle: String): String {
+            if (allowedAdditionalEpisodes[episodeUrl] != episodeTitle ||
+                !AdditionalSiteMedia.hostMatches(pageUrl, "javday.app") ||
+                !AdditionalSiteMedia.accepts(pageUrl, episodeUrl, pageUrl)
+            ) return ""
+            val proxy = playbackProxyServer ?: return ""
+            val cookies = android.webkit.CookieManager.getInstance().getCookie(episodeUrl).orEmpty()
+                .ifEmpty { android.webkit.CookieManager.getInstance().getCookie(referer).orEmpty() }
+            val proxiedUrl = proxy.buildProxyUrl(episodeUrl, referer, cookies)
+            activeVideoUrl = proxiedUrl
+            activePageUrl = pageUrl
+            activeDownloadName = downloadName.trim() + " - " + episodeTitle
+            PlaybackHistoryRepository.record(this@FullscreenInternalPlayerActivity, activePageUrl, activeDownloadName)
+            return proxiedUrl
         }
 
         @JavascriptInterface
@@ -344,6 +495,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         }
 
         val shouldBypassProxy =
+            AdditionalSiteMedia.hostMatches(intent.getStringExtra(EXTRA_PAGE_URL).orEmpty(), "supjav.com") ||
             referer.contains("missav", ignoreCase = true) ||
                 referer.contains("jable.tv", ignoreCase = true) ||
                 referer.contains("avjoy", ignoreCase = true) ||
@@ -362,15 +514,28 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
             val cookies = cookieManager.getCookie(normalizedUrl).orEmpty()
                 .ifEmpty { cookieManager.getCookie(referer).orEmpty() }
 
-            VideoProxyServer().also {
+            val session = javrateSession
+            VideoProxyServer { url -> session?.authorize(url) ?: url }.also {
                 it.start(fi.iki.elonen.NanoHTTPD.SOCKET_READ_TIMEOUT, false)
                 playbackProxyServer = it
+                if (session != null) javrateLease = JavratePlaybackLease.create(session, it)
             }.buildProxyUrl(normalizedUrl, referer, cookies)
         } catch (error: Exception) {
             android.util.Log.w("INTERNAL_PLAYER", "Proxy bootstrap failed, fallback direct", error)
             normalizedUrl
         }
     }
+
+    private fun subtitlePlaybackJson(): String = runCatching {
+        localVideoServer?.let { return@runCatching "[]" }
+        val tracks = JSONArray(subtitleTracks)
+        val proxy = playbackProxyServer ?: return@runCatching "[]"
+        for (i in 0 until tracks.length()) {
+            val track = tracks.getJSONObject(i)
+            track.put("src", proxy.buildProxyUrl(track.getString("src"), "https://www.javrate.com/", null))
+        }
+        tracks.toString()
+    }.getOrDefault("[]")
 
     private fun normalizeSurritMasterUrl(url: String): String {
         val host = runCatching { Uri.parse(url).host.orEmpty() }.getOrDefault("")
@@ -596,6 +761,8 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
             putExtra(VideoDownloadService.EXTRA_COOKIE_SOURCE_URL, cookieSourceUrl)
             putExtra(VideoDownloadService.EXTRA_FILE_NAME, downloadName)
             putExtra(VideoDownloadService.EXTRA_DOWNLOAD_ID, downloadRecord.id)
+            putExtra(VideoDownloadService.EXTRA_SUBTITLE_SOURCES, subtitleTracks)
+            javrateLease?.let { putExtra(VideoDownloadService.EXTRA_JAVRATE_LEASE, it.id) }
         }
         ContextCompat.startForegroundService(this, serviceIntent)
         android.widget.Toast.makeText(this, "影片已加入下載", android.widget.Toast.LENGTH_SHORT).show()
@@ -628,7 +795,11 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         isLocalPlayback: Boolean,
         enableQualitySelector: Boolean,
         initialImmersiveMode: Boolean,
-        initialMaxPictureMode: Boolean
+        initialMaxPictureMode: Boolean,
+        rouEpisodes: List<VideoExtractor.RouVideoEpisode>,
+        currentRouEpisodeId: String?,
+        additionalEpisodes: List<VideoExtractor.AdditionalVideoEpisode>,
+        initialEpisodeUrl: String
     ): String {
         val videoUrlJson = JSONObject.quote(videoUrl)
         val initialOrientationModeJson = JSONObject.quote(orientationLockMode)
@@ -686,6 +857,40 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         } else {
             ""
         }
+        val playerEpisodesJson = JSONArray()
+        val episodeOptions = mutableListOf<String>()
+        var currentPlayerEpisodeIndex = -1
+        fun addEpisodeOption(entry: JSONObject, label: String, selected: Boolean) {
+            val index = playerEpisodesJson.length()
+            playerEpisodesJson.put(entry)
+            val selectedAttribute = if (selected) " selected" else ""
+            val escapedLabel = label.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;")
+            episodeOptions += "<option value=\"$index\"$selectedAttribute>$escapedLabel</option>"
+            if (selected) currentPlayerEpisodeIndex = index
+        }
+        rouEpisodes.forEach { episode ->
+            val label = if (uiEnglish) "Episode ${episode.number}" else "第 ${episode.number} 集"
+            addEpisodeOption(
+                JSONObject().put("kind", "rou").put("id", episode.id)
+                    .put("number", episode.number).put("title", label),
+                label,
+                episode.id == currentRouEpisodeId
+            )
+        }
+        additionalEpisodes.forEach { episode ->
+            addEpisodeOption(
+                JSONObject().put("kind", "additional").put("url", episode.url).put("title", episode.title),
+                episode.title,
+                episode.url == initialEpisodeUrl
+            )
+        }
+        val playerEpisodesJsonText = playerEpisodesJson.toString()
+        val currentPlayerEpisodeIndexJson = currentPlayerEpisodeIndex.toString()
+        val episodeSelectorHtml = if (playerEpisodesJson.length() > 1) {
+            val title = if (uiEnglish) "Episode" else "分集"
+            "<select id=\"episode\" title=\"$title\">${episodeOptions.joinToString("")}</select>"
+        } else ""
         return """
             <!doctype html>
             <html>
@@ -716,6 +921,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   right: 0;
                   top: 0;
                   display: flex;
+                  flex-wrap: wrap;
                   align-items: center;
                   justify-content: space-between;
                   gap: 8px;
@@ -733,6 +939,9 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                 }
                 #top-actions {
                   display: flex;
+                  flex-wrap: wrap;
+                  justify-content: flex-end;
+                  max-width: 100%;
                   gap: 6px;
                   flex: 0 0 auto;
                 }
@@ -1233,10 +1442,20 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   align-items: center;
                   gap: 8px;
                 }
+                #subtitles { max-width: 110px; min-width: 70px; padding: 0 6px; }
+                #subtitles[hidden] { display: none; }
+                #video::cue { color: #fff; background: rgba(0,0,0,.7); font-size: clamp(16px, 3vw, 24px); }
                 #quality {
                   min-width: 76px;
                   max-width: 104px;
                   padding: 0 10px;
+                  font-weight: 700;
+                }
+                #episode {
+                  min-width: 86px;
+                  max-width: 132px;
+                  padding: 0 9px;
+                  font-size: 13px;
                   font-weight: 700;
                 }
                 #mute {
@@ -1331,7 +1550,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   }
                   #controls {
                     display: grid;
-                    grid-template-columns: minmax(95px, 1fr) auto minmax(145px, 1fr);
+                    grid-template-columns: minmax(95px, 1fr) auto auto;
                     grid-template-rows: auto 42px;
                     gap: 3px 8px;
                     padding: 5px max(10px, env(safe-area-inset-right)) 6px max(10px, env(safe-area-inset-left));
@@ -1349,7 +1568,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     grid-column: 2;
                     grid-row: 2;
                     width: auto;
-                    grid-template-columns: repeat(5, 52px);
+                    grid-template-columns: repeat(5, 44px);
                     gap: 4px;
                   }
                   #secondary-controls {
@@ -1365,6 +1584,8 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     grid-row: 2;
                     justify-self: end;
                   }
+                  #time { font-size: 12px; }
+                  #subtitles { max-width: 90px; }
                   .seek-button {
                     height: 34px;
                     min-height: 34px;
@@ -1420,6 +1641,14 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   38% { opacity: .62; }
                   100% { opacity: 0; transform: scaleX(1.02); }
                 }
+                html.clean-view #video { height: 100%; }
+                html.clean-view #top, html.clean-view #controls,
+                html.clean-view #tip-message, html.clean-view #tip-list-toggle,
+                html.clean-view #tip-list-drawer, html.clean-view #tip-list-backdrop,
+                html.clean-view #press-hold-speed, html.clean-view .seek-zone-feedback {
+                  visibility: hidden;
+                  pointer-events: none;
+                }
               </style>
             </head>
             <body>
@@ -1438,6 +1667,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                         <button id="immersive-mode" type="button"></button>
                       </div>
                     </div>
+                    <button id="clean-view" type="button" title="${if (uiEnglish) "Hide controls; tap the picture to restore" else "隱藏控制介面，點畫面恢復"}">${if (uiEnglish) "Hide UI" else "純畫面"}</button>
                     <button id="close">$closeLabel</button>
                   </div>
                 </div>
@@ -1489,6 +1719,10 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     <span id="time">00:00 / --:--</span>
                     <div id="secondary-actions">
                       $qualitySelectorHtml
+                      <select id="subtitles" hidden title="${if (uiEnglish) "Subtitles" else "字幕"}"
+                        data-off="${if (uiEnglish) "Subtitles off" else "字幕關閉"}"
+                        data-error="${if (uiEnglish) "Subtitles unavailable" else "字幕載入失敗"}"></select>
+                      $episodeSelectorHtml
                       <button id="mute" title="開啟或關閉聲音">🔊</button>
                       <div id="speed-group">
                         <span>$speedLabel</span>
@@ -1504,12 +1738,14 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
               <script>
                 (function() {
                   var url = $videoUrlJson;
-                  var isHls = /\.m3u8($|\?)/i.test(url);
+                  var isHls = /\.(m3u8|m3u)($|\?)/i.test(url) || /\/hls\d*\/.*\/(master|index|playlist|iframes)(?:-[a-z0-9]+)*\.txt($|[?#])/i.test(url);
                   var initialOrientationMode = $initialOrientationModeJson;
                   var immersiveMode = $initialImmersiveMode;
                   var maxPictureMode = $initialMaxPictureMode;
                   var thumbnailConfig = $thumbnailConfigJson;
                   var previewVttUrl = $previewVttUrlJson;
+                  var playerEpisodes = $playerEpisodesJsonText;
+                  var currentPlayerEpisodeIndex = $currentPlayerEpisodeIndexJson;
                   var video = document.getElementById('video');
                   var pressHoldSpeed = document.getElementById('press-hold-speed');
                   var pressHoldSpeedMain = document.getElementById('press-hold-speed-main');
@@ -1549,6 +1785,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   var pictureModeButton = document.getElementById('picture-mode');
                   var immersiveModeButton = document.getElementById('immersive-mode');
                   var quality = document.getElementById('quality');
+                  var episodeSelector = document.getElementById('episode');
                   var loopAButton = document.getElementById('loop-a');
                   var loopBButton = document.getElementById('loop-b');
                   var doubleTapSeekSeconds = $doubleTapSeekSeconds;
@@ -1638,7 +1875,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                       window._hlsPlayer = null;
                     }
 
-                    if (/\.m3u8($|\?)/i.test(targetUrl) && window.Hls && window.Hls.isSupported()) {
+                    if ((isHls || /\.m3u8($|\?)/i.test(targetUrl)) && window.Hls && window.Hls.isSupported()) {
                       try {
                         var hls = new Hls({
                           enableWorker: true,
@@ -2431,6 +2668,16 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   video.addEventListener('loadedmetadata', function(){ setStatus('已載入 metadata'); });
                   video.addEventListener('canplay', function(){ setStatus('可播放'); });
                   video.addEventListener('playing', function(){ setStatus('播放中'); updatePlay(); });
+                  video.addEventListener('ended', function(){
+                    updatePlay();
+                    if (!episodeSelector || currentPlayerEpisodeIndex < 0) return;
+                    var nextIndex = currentPlayerEpisodeIndex + 1;
+                    if (!playerEpisodes[nextIndex]) {
+                      setStatus(uiEnglish ? 'Last episode finished' : '已播放完最後一集');
+                      return;
+                    }
+                    startPlayerEpisode(nextIndex, true);
+                  });
                   video.addEventListener('pause', updatePlay);
                   video.addEventListener('volumechange', updateMute);
                   video.addEventListener('waiting', function(){ setStatus('緩衝中'); });
@@ -2508,22 +2755,43 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     immersiveModeButton.classList.toggle('active', immersiveMode);
                   }
                   function showChrome() {
+                    document.documentElement.classList.remove('clean-view');
                     chromeVisible = true;
+                    controls.inert = false;
+                    topBar.inert = false;
                     controls.style.opacity = '1';
                     topBar.style.opacity = '1';
                     controls.style.pointerEvents = 'auto';
                     topBar.style.pointerEvents = 'auto';
+                    updatePlayerLayout();
                     if (hideTimer) clearTimeout(hideTimer);
                     hideTimer = setTimeout(function() {
                       if (!video.paused && !speedMenu.classList.contains('open') &&
                           !displayMenu.classList.contains('open') && !tipListDrawer.classList.contains('open')) {
-                        controls.style.opacity = '0';
-                        topBar.style.opacity = '0';
-                        controls.style.pointerEvents = 'none';
-                        topBar.style.pointerEvents = 'none';
-                        chromeVisible = false;
+                        hideChrome(false);
                       }
                     }, 3000);
+                  }
+                  function hideChrome(cleanView) {
+                    if (hideTimer) clearTimeout(hideTimer);
+                    if (singleTapTimer) clearTimeout(singleTapTimer);
+                    controls.style.opacity = '0';
+                    topBar.style.opacity = '0';
+                    controls.style.pointerEvents = 'none';
+                    topBar.style.pointerEvents = 'none';
+                    controls.inert = true;
+                    topBar.inert = true;
+                    chromeVisible = false;
+                    if (cleanView) {
+                      closeSpeedMenu();
+                      displayMenu.classList.remove('open');
+                      tipListDrawer.classList.remove('open');
+                      tipListDrawer.setAttribute('aria-hidden', 'true');
+                      tipListBackdrop.style.display = 'none';
+                      updateTipListToggle();
+                      document.documentElement.classList.add('clean-view');
+                      updatePlayerLayout();
+                    }
                   }
                   controls.style.transition = 'opacity .2s ease';
                   topBar.style.transition = 'opacity .2s ease';
@@ -2889,6 +3157,48 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                       showChrome();
                     };
                   }
+                  function startPlayerEpisode(index, automatic) {
+                    var selected = playerEpisodes[index];
+                    if (!selected || index === currentPlayerEpisodeIndex) return false;
+                    var nextUrl = selected.kind === 'rou'
+                      ? AndroidPlayer.resolveRouEpisode(selected.id, selected.number)
+                      : AndroidPlayer.resolveAdditionalEpisode(selected.url, selected.title);
+                    if (!nextUrl) {
+                      if (episodeSelector) episodeSelector.value = String(currentPlayerEpisodeIndex);
+                      setStatus(uiEnglish ? 'Unable to load this episode' : '無法載入所選分集');
+                      showChrome();
+                      return false;
+                    }
+                    currentPlayerEpisodeIndex = index;
+                    if (episodeSelector) episodeSelector.value = String(index);
+                    url = nextUrl;
+                    video.pause();
+                    loopPointA = null;
+                    loopPointB = null;
+                    abLoopActive = false;
+                    updateAbLoopButtons();
+                    updateAbLoopProgress();
+                    attachVideoSource(url);
+                    video.load();
+                    var promise = video.play();
+                    if (promise && promise.catch) {
+                      promise.catch(function(error) {
+                        setStatus('等待手動播放：' + (error && error.message ? error.message : 'play rejected'));
+                      });
+                    }
+                    setStatus(automatic
+                      ? (uiEnglish ? 'Auto-playing ' + selected.title : '自動播放 ' + selected.title)
+                      : (uiEnglish ? selected.title : '已切換至 ' + selected.title));
+                    if (!automatic || !document.documentElement.classList.contains('clean-view')) showChrome();
+                    return true;
+                  }
+                  if (episodeSelector) {
+                    episodeSelector.onchange = function() {
+                      var selectedIndex = parseInt(episodeSelector.value, 10);
+                      if (!isFinite(selectedIndex)) return;
+                      startPlayerEpisode(selectedIndex, false);
+                    };
+                  }
                   function closeSpeedMenu() {
                     speedMenu.classList.remove('open');
                   }
@@ -2932,6 +3242,11 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   progress.addEventListener('pointerup', hideSeekPreviewSoon);
                   progress.addEventListener('touchend', hideSeekPreviewSoon);
                   progress.addEventListener('change', hideSeekPreviewSoon);
+                  document.getElementById('clean-view').onclick = function(event) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    hideChrome(true);
+                  };
                   document.getElementById('close').onclick = function() {
                     video.pause();
                     AndroidPlayer.close();
@@ -2950,6 +3265,11 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   var p = video.play();
                   if (p && p.catch) p.catch(function(e){ setStatus('等待手動播放：' + (e && e.message ? e.message : 'play rejected')); });
                 })();
+              </script>
+              <script>
+                ${assets.open("internal-subtitles.js").bufferedReader(Charsets.UTF_8).use { it.readText() }}
+                window.setSubtitleTracks(${subtitlePlaybackJson()});
+                ${if (isLocalPlayback) "fetch('subtitles.json').then(r => r.json()).then(window.setSubtitleTracks).catch(() => {});" else ""}
               </script>
             </body>
             </html>

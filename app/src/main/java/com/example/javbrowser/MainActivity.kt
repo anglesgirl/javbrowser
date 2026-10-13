@@ -31,6 +31,25 @@ import java.util.Locale
 class MainActivity : LocalizedActivity() {
 
     private lateinit var webView: WebView
+    private var pendingFileChooser: android.webkit.ValueCallback<Array<Uri>>? = null
+    private var fileChooserInFlight = false
+    private val chooseWebFiles = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        fileChooserInFlight = false
+        val callback = pendingFileChooser
+        pendingFileChooser = null
+        val selected = android.webkit.WebChromeClient.FileChooserParams
+            .parseResult(result.resultCode, result.data)
+            ?.filter { it.scheme == "content" }?.toTypedArray()?.takeIf { it.isNotEmpty() }
+        callback?.onReceiveValue(selected)
+    }
+
+    private fun cancelPendingFileChooser() {
+        val callback = pendingFileChooser
+        pendingFileChooser = null
+        callback?.onReceiveValue(null)
+    }
     private lateinit var adFilterRules: AdFilterRules
     private lateinit var domainConfig: DomainConfig
     private lateinit var btnPlay: Button
@@ -46,7 +65,57 @@ class MainActivity : LocalizedActivity() {
     private lateinit var privacySettings: PrivacySettings
     private lateinit var biometricHelper: BiometricHelper
     private var currentVideoUrl: String? = null
+    private val supjavMediaResolver by lazy { SupjavMediaResolver(this) { webView.settings.userAgentString } }
+    private val supjavPlayerHook by lazy { assets.open("supjav-player-hook.js").bufferedReader(Charsets.UTF_8).use { it.readText() } }
+    private val javrateAdLayoutHook by lazy { assets.open("javrate-ad-layout.js").bufferedReader(Charsets.UTF_8).use { it.readText() } }
+    private var supjavSelectionGeneration = 0L
+
+    private fun clearSupjavSource() {
+        supjavSelectionGeneration++
+        supjavMediaResolver.close()
+        currentVideoUrl = null
+        currentVideoReferer = null
+        btnPlay.visibility = View.GONE
+        btnPlay.contentDescription = null
+        btnPlay.isEnabled = true
+        btnPlay.text = "▶"
+    }
+
+    private fun resolveSupjavSource(embed: String, label: String) {
+        val page = webView.url ?: currentPageUrl
+        if (!AdditionalSiteMedia.hostMatches(page, "supjav.com")) return
+        clearSupjavSource()
+        val generation = supjavSelectionGeneration
+        supjavMediaResolver.resolve(embed, page, { media, referer ->
+            if (generation == supjavSelectionGeneration && currentPageUrl == page) {
+                currentVideoUrl = media
+                currentVideoReferer = referer
+                btnPlay.contentDescription = LanguageManager.text(this, "播放：$label", "Play: $label")
+                showPlayButtonIfAllowed()
+            }
+        }, {
+            if (generation == supjavSelectionGeneration && currentPageUrl == page) {
+                Toast.makeText(this, LanguageManager.text(this,
+                    "$label 尚未取得影片，請先於網頁播放或完成驗證，也可切換其他 Server。",
+                    "$label has no detected video. Play or complete verification on the webpage, or choose another Server."), Toast.LENGTH_LONG).show()
+            }
+        })
+    }
+    private val blockedPopupViews = mutableSetOf<WebView>()
+
+    private fun clearBlockedPopupViews() {
+        blockedPopupViews.toList().forEach { it.destroy() }
+        blockedPopupViews.clear()
+    }
     private var currentVideoReferer: String? = null
+    private var currentRouEpisodes: List<VideoExtractor.RouVideoEpisode> = emptyList()
+    private var currentJavdayEpisodes: List<VideoExtractor.AdditionalVideoEpisode> = emptyList()
+    private var pendingHomeClipboardLink: HomeClipboardLink.Match? = null
+    private var lastHomeClipboardText = ""
+    private var dismissedHomeClipboardUrl: String? = null
+    private val homeClipboardListener = android.content.ClipboardManager.OnPrimaryClipChangedListener {
+        if (::webView.isInitialized) webView.post { refreshHomeClipboard() }
+    }
     private var currentMissAvThumbnailConfig: MissAvThumbnailConfig? = null
     private var currentJableVttUrl: String? = null
     private var isOnJavDbVideoPage = false
@@ -211,12 +280,14 @@ class MainActivity : LocalizedActivity() {
         // 載入初始封鎖清單（從 SharedPreferences 快取）
         cachedBlockList = adFilterRules.getCommonBlockList().toSet()
         cachedSiteRules = adFilterRules.getSiteRules()
+        adFilterRules.refreshRouVideoDomain()
 
         adFilterRules.updateRulesFromCloud(AdFilterRules.DEFAULT_CLOUD_URL) { success, msg ->
             if (success) {
                 // 雲端規則更新成功，刷新快取
                 cachedBlockList = adFilterRules.getCommonBlockList().toSet()
                 cachedSiteRules = adFilterRules.getSiteRules()
+                adFilterRules.refreshRouVideoDomain()
                 android.util.Log.d(
                     "AdBlock",
                     "Rules updated: $msg, common=${cachedBlockList.size}, sites=${cachedSiteRules.size}"
@@ -367,6 +438,8 @@ class MainActivity : LocalizedActivity() {
 
     override fun onResume() {
         super.onResume()
+        (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager)
+            .addPrimaryClipChangedListener(homeClipboardListener)
         android.util.Log.d("MAIN", "onResume: isUnlocked=$isUnlocked, isFreshStart=$isFreshStart")
         android.util.Log.d("NAV_DEBUG", "onResume currentUrl=${webView.url} intentUrl=${intent?.getStringExtra("url")}")
 
@@ -395,26 +468,51 @@ class MainActivity : LocalizedActivity() {
         }
         isFreshStart = false
 
-        // 若目前在首頁且已解鎖，重新偵測剪貼簿（每次從背景切回自動帶入）
-        if (!privacySettings.isLockEnabled || isUnlocked) {
-            val currentUrl = webView.url ?: ""
-            if (currentUrl.startsWith("https://javbrowser.app")) {
-                webView.post {
-                    val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE)
-                            as android.content.ClipboardManager
-                    val raw = cm.primaryClip?.getItemAt(0)
-                            ?.coerceToText(this)?.toString() ?: ""
-                    val safe = raw.replace("\\", "\\\\").replace("'", "\\'")
-                                  .replace("\n", " ").replace("\r", "").take(500)
-                    webView.evaluateJavascript(
-                        "if(typeof onClipboardResult==='function') onClipboardResult('$safe')", null)
-                }
-            }
+        webView.post { refreshHomeClipboard() }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && ::webView.isInitialized) webView.post { refreshHomeClipboard() }
+    }
+
+    private fun refreshHomeClipboard() {
+        if (!::webView.isInitialized || !::privacySettings.isInitialized || !::domainConfig.isInitialized) return
+        android.util.Log.d("HOME_CLIPBOARD", "homeUrl=${webView.url} focused=${hasWindowFocus()} locked=${privacySettings.isLockEnabled && !isUnlocked}")
+        if (!hasWindowFocus() || (privacySettings.isLockEnabled && !isUnlocked) ||
+            webView.url != "https://javbrowser.app/"
+        ) return
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        val clip = clipboard.primaryClip
+        val item = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)
+        val raw = (item?.text?.toString() ?: item?.uri?.takeIf {
+            it.scheme == "https" || it.scheme == "http"
+        }?.toString()).orEmpty().take(16000)
+        if (raw != lastHomeClipboardText) {
+            lastHomeClipboardText = raw
+            dismissedHomeClipboardUrl = null
         }
+        val configuredSites = mapOf(
+            domainConfig.getMissAvDomain() to "MissAV", domainConfig.getJableDomain() to "Jable",
+            domainConfig.getRouVideoDomain() to "Rou.Video", domainConfig.getAvJoyDomain() to "AvJoy",
+            domainConfig.getPigAvDomain() to "PigAV", domainConfig.get7MmTvDomain() to "7MMTV",
+            domainConfig.getAvpleDomain() to "Avple", domainConfig.getWhosDomain() to "Whos.tv"
+        )
+        val detectedLink = HomeClipboardLink.find(raw, configuredSites)
+        android.util.Log.d("HOME_CLIPBOARD", "items=${clip?.itemCount ?: 0} supported=${detectedLink != null}")
+        pendingHomeClipboardLink = detectedLink?.takeUnless { it.url == dismissedHomeClipboardUrl }
+        val linkJson = pendingHomeClipboardLink?.let {
+            org.json.JSONObject().put("url", it.url).put("site", it.site).toString()
+        } ?: "null"
+        webView.evaluateJavascript(
+            "if(typeof onClipboardResult==='function') onClipboardResult(${org.json.JSONObject.quote(if (detectedLink == null) raw else "")}, $linkJson)", null
+        )
     }
 
     override fun onPause() {
         super.onPause()
+        (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager)
+            .removePrimaryClipChangedListener(homeClipboardListener)
         // 注意：favUrlReceiver 在 onDestroy 才 unregister，
         // 這樣 FavoritesActivity 發廣播時（此時 MainActivity 已 pause）也能收到
     }
@@ -478,7 +576,9 @@ class MainActivity : LocalizedActivity() {
         if (host.isEmpty()) return null
         return cachedSiteRules.entries.firstOrNull { (ruleHost, _) ->
             host == ruleHost || host.endsWith(".$ruleHost")
-        }?.value
+        }?.value ?: if (isRouVideoUrl(pageUrl.orEmpty())) {
+            cachedSiteRules.entries.firstOrNull { RouVideoDomains.isHost(it.key) }?.value
+        } else null
     }
 
     private fun applySiteDomRules(view: WebView?, pageUrl: String?) {
@@ -553,9 +653,7 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun isRouVideoUrl(url: String): Boolean {
-        val host = runCatching { Uri.parse(url).host.orEmpty().lowercase() }.getOrDefault("")
-        return host == "rou.video" || host.endsWith(".rou.video") ||
-            Regex("^rouva\\d+\\.xyz$").matches(host)
+        return RouVideoDomains.isUrl(url, domainConfig.getRouVideoDomain())
     }
 
     /**
@@ -603,6 +701,18 @@ class MainActivity : LocalizedActivity() {
                 put("label", "Whos.tv")
                 put("template", "https://${domainConfig.getWhosDomain()}/result?search={code}")
             })
+            put(org.json.JSONObject().apply {
+                put("label", "JAVDAY")
+                put("template", "https://javday.app/search/wd/{code}/")
+            })
+            put(org.json.JSONObject().apply {
+                put("label", "SUPJAV")
+                put("template", "https://supjav.com/?s={code}")
+            })
+            put(org.json.JSONObject().apply {
+                put("label", "JavRate")
+                put("template", "https://www.javrate.com/search/{code}")
+            })
         }
         val panelTitle = org.json.JSONObject.quote(if (english) "Cross-site search" else "跨站搜尋")
         val searchPrefix = org.json.JSONObject.quote(if (english) "Search " else "在 ")
@@ -624,7 +734,8 @@ class MainActivity : LocalizedActivity() {
                     /(^|\.)7mmtv\.sx$/.test(host) ||
                     /(^|\.)7tv\d*\.com$/.test(host) ||
                     /(^|\.)avple\.tv$/.test(host) ||
-                    /(^|\.)whos\.tv$/.test(host);
+                    /(^|\.)whos\.tv$/.test(host) ||
+                    /(^|\.)javday\.app$/.test(host) || /(^|\.)supjav\.com$/.test(host) || /(^|\.)javrate\.com$/.test(host);
                 var panelId = 'jav-cross-site-search';
 
                 if (!supported) {
@@ -801,7 +912,8 @@ class MainActivity : LocalizedActivity() {
                     /(^|\.)7mmtv\.sx$/.test(host) ||
                     /(^|\.)7tv\d*\.com$/.test(host) ||
                     /(^|\.)avple\.tv$/.test(host) ||
-                    /(^|\.)whos\.tv$/.test(host);
+                    /(^|\.)whos\.tv$/.test(host) ||
+                    /(^|\.)javday\.app$/.test(host) || /(^|\.)supjav\.com$/.test(host) || /(^|\.)javrate\.com$/.test(host);
                 var stateKey = '__javCrossSiteDetectorState';
 
                 function notify(value) {
@@ -905,8 +1017,15 @@ class MainActivity : LocalizedActivity() {
             @android.webkit.JavascriptInterface
             fun onVideoFound(videoUrl: String) {
                 runOnUiThread {
-                    currentVideoUrl = videoUrl
+                    // The new sites use episode lists / nested players. Only their validated
+                    // network request may replace the selected stream.
+                    if (AdditionalSiteMedia.isPage(webView.url ?: currentPageUrl) || AvTodayMedia.isPage(webView.url ?: currentPageUrl)) return@runOnUiThread
                     val pageUrl = webView.url ?: currentPageUrl
+                    if (RouVideoStreams.playlistForPage(pageUrl) != null && !RouVideoStreams.accepts(pageUrl, videoUrl)) {
+                        android.util.Log.d("ROU_PLAYER", "ignored non-video or other-episode request=$videoUrl")
+                        return@runOnUiThread
+                    }
+                    currentVideoUrl = videoUrl
                     if (currentVideoReferer == null &&
                         (pageUrl.contains("missav", ignoreCase = true) ||
                          pageUrl.contains("pigav.ws", ignoreCase = true) ||
@@ -928,10 +1047,81 @@ class MainActivity : LocalizedActivity() {
             }
 
             @android.webkit.JavascriptInterface
+            fun onAvTodayMedia(media: String, player: String, sourcePage: String) {
+                runOnUiThread {
+                    val page = webView.url ?: currentPageUrl
+                    if (sourcePage == page && AvTodayMedia.accepts(page, player, media)) {
+                        currentVideoUrl = media
+                        currentVideoReferer = player
+                        showPlayButtonIfAllowed()
+                    }
+                }
+            }
+
+            @android.webkit.JavascriptInterface
             fun onCrossSiteCodeDetected(code: String) {
                 runOnUiThread {
                     updateCrossSiteCode(code)
                 }
+            }
+
+            @android.webkit.JavascriptInterface
+            fun onAdditionalEpisode(videoUrl: String) {
+                runOnUiThread {
+                    val page = webView.url ?: currentPageUrl
+                    if ((AdditionalSiteMedia.hostMatches(page, "javday.app") ||
+                            AdditionalSiteMedia.hostMatches(page, "javrate.com")) &&
+                        AdditionalSiteMedia.accepts(page, videoUrl, page)) {
+                        currentVideoUrl = videoUrl
+                        currentVideoReferer = originForUrl(page)
+                        showPlayButtonIfAllowed()
+                    }
+                }
+            }
+
+            @android.webkit.JavascriptInterface
+            fun onAdditionalEpisodes(html: String, sourcePage: String) {
+                val episodes = VideoExtractor.extractJavdayEpisodes(html, sourcePage)
+                runOnUiThread {
+                    val page = webView.url ?: currentPageUrl
+                    if (page == sourcePage && episodes.isNotEmpty()) {
+                        currentJavdayEpisodes = episodes
+                        if (currentVideoUrl !in episodes.map { it.url }) {
+                            currentVideoUrl = episodes.first().url
+                        }
+                        currentVideoReferer = originForUrl(page)
+                        showPlayButtonIfAllowed()
+                    }
+                }
+            }
+
+            @android.webkit.JavascriptInterface
+            fun onAdditionalPlayerFrame(embedUrl: String) {
+                runOnUiThread {
+                    val sourcePage = webView.url ?: currentPageUrl
+                    if (AdditionalSiteMedia.hostMatches(sourcePage, "javrate.com")) {
+                        if (JavrateStreams.isPlayer(embedUrl)) {
+                            currentVideoUrl = embedUrl
+                            currentVideoReferer = sourcePage
+                            showPlayButtonIfAllowed()
+                        }
+                        return@runOnUiThread
+                    }
+                    if (!AdditionalSiteMedia.hostMatches(sourcePage, "supjav.com")) return@runOnUiThread
+                    resolveSupjavSource(embedUrl, "")
+                }
+            }
+
+            @android.webkit.JavascriptInterface
+            fun onSupjavServerChanging() {
+                runOnUiThread {
+                    if (AdditionalSiteMedia.hostMatches(webView.url ?: currentPageUrl, "supjav.com")) clearSupjavSource()
+                }
+            }
+
+            @android.webkit.JavascriptInterface
+            fun onSupjavPlayerFrame(embedUrl: String, label: String) {
+                runOnUiThread { resolveSupjavSource(embedUrl, label.take(80)) }
             }
 
             @android.webkit.JavascriptInterface
@@ -1126,7 +1316,7 @@ class MainActivity : LocalizedActivity() {
                     Toast.makeText(this@MainActivity, "Connecting...", Toast.LENGTH_SHORT).show()
                     progressBar.visibility = View.VISIBLE
                     progressBar.progress = 10
-                    webView.loadUrl(url)
+                    webView.loadUrl(domainConfig.updateUrlIfNeeded(url))
                     startLoadTimeout()
                 }
             }
@@ -1221,13 +1411,26 @@ class MainActivity : LocalizedActivity() {
 
             @android.webkit.JavascriptInterface
             fun checkClipboard() {
+                runOnUiThread { refreshHomeClipboard() }
+            }
+
+            @android.webkit.JavascriptInterface
+            fun openClipboardLink() {
                 runOnUiThread {
-                    val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE)
-                            as android.content.ClipboardManager
-                    val raw = cm.primaryClip?.getItemAt(0)?.coerceToText(this@MainActivity)?.toString() ?: ""
-                    val safe = raw.replace("\\", "\\\\").replace("'", "\\'")
-                                  .replace("\n", " ").replace("\r", "").take(500)
-                    webView.evaluateJavascript("onClipboardResult('$safe')", null)
+                    val link = pendingHomeClipboardLink ?: return@runOnUiThread
+                    if (webView.url == "https://javbrowser.app/" && (!privacySettings.isLockEnabled || isUnlocked)) {
+                        webView.loadUrl(link.url)
+                    }
+                }
+            }
+
+            @android.webkit.JavascriptInterface
+            fun dismissClipboardLink() {
+                runOnUiThread {
+                    if (webView.url == "https://javbrowser.app/") {
+                        dismissedHomeClipboardUrl = pendingHomeClipboardLink?.url
+                        pendingHomeClipboardLink = null
+                    }
                 }
             }
             @android.webkit.JavascriptInterface
@@ -1235,6 +1438,11 @@ class MainActivity : LocalizedActivity() {
                 runOnUiThread {
                     startActivity(Intent(this@MainActivity, TodayNewActivity::class.java))
                 }
+            }
+
+            @android.webkit.JavascriptInterface
+            fun openPlaybackHistory() {
+                runOnUiThread { startActivity(Intent(this@MainActivity, PlaybackHistoryActivity::class.java)) }
             }
             @android.webkit.JavascriptInterface
             fun openSalesRankings() {
@@ -1416,6 +1624,11 @@ class MainActivity : LocalizedActivity() {
                 val url = request?.url?.toString() ?: return false
                 val lowerUrl = url.lowercase()
 
+                if (SupjavNavigation.blocks(currentPageUrl, url, request.isForMainFrame)) {
+                    android.util.Log.d("AdBlock", "SUPJAV main-frame advertisement blocked")
+                    return true
+                }
+
                 if (isRouVideoUrl(currentPageUrl) &&
                     request.url.path.orEmpty().startsWith("/api/hop/", ignoreCase = true)
                 ) {
@@ -1489,7 +1702,7 @@ class MainActivity : LocalizedActivity() {
                 }
                 val isStreamtapeUrl = url.contains("streamtape") && (url.contains("get_video") || url.contains("/e/") || url.contains(".mp4"))
                 val isTapecontentUrl = url.contains("tapecontent") && (url.contains(".mp4") || url.contains(".ts") || url.contains("m3u8"))
-                if (isStreamtapeUrl || isTapecontentUrl) {
+                if ((isStreamtapeUrl || isTapecontentUrl) && !AdditionalSiteMedia.isPage(currentPageUrl)) {
                     val sniffedUrl = url
                     view?.post {
                         if (currentVideoUrl != sniffedUrl) {
@@ -1536,10 +1749,25 @@ class MainActivity : LocalizedActivity() {
                     if (!isAvpleGrowMedia) return super.shouldInterceptRequest(view, request)
                 }
 
+                val additionalSite = AdditionalSiteMedia.isPage(currentPageUrl)
+                val mediaReferer = request?.requestHeaders.orEmpty().entries
+                    .firstOrNull { it.key.equals("Referer", ignoreCase = true) }?.value.orEmpty()
+                if (additionalSite && !AdditionalSiteMedia.hostMatches(currentPageUrl, "supjav.com") &&
+                    AdditionalSiteMedia.accepts(currentPageUrl, url, mediaReferer)) {
+                    val sourcePage = currentPageUrl
+                    view?.post {
+                        if (currentPageUrl == sourcePage) {
+                            currentVideoUrl = url
+                            currentVideoReferer = mediaReferer.ifBlank { originForUrl(sourcePage).orEmpty() }
+                            showPlayButtonIfAllowed()
+                        }
+                    }
+                }
                 // Video Sniffing: Check if request is for an m3u8 playlist
                 // javhdporn.net 的廣告 CDN（如 streamhls.click）也會出 m3u8，跳過避免誤判
                 if ((isAvpleMainHls || isAvpleGrowMedia || (url.contains(".m3u8") && !url.contains("minisite") &&
-                    !currentPageUrl.contains("javhdporn.net") && !isAvplePage))) {
+                    !currentPageUrl.contains("javhdporn.net") && !AvTodayMedia.isPage(currentPageUrl) &&
+                    RouVideoStreams.playlistForPage(currentPageUrl) == null && !isAvplePage && !additionalSite))) {
                     // If URL is a resolution-specific variant (e.g. /640x360/video.m3u8),
                     // reconstruct the master playlist URL instead so we can select best quality later.
                     val normalizedUrl = normalizeMissavM3u8Url(url)
@@ -1573,8 +1801,13 @@ class MainActivity : LocalizedActivity() {
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
+                cancelPendingFileChooser()
+                supjavSelectionGeneration++
+                supjavMediaResolver.close()
+                clearBlockedPopupViews()
                 android.util.Log.d("NAV_DEBUG", "onPageStarted url=$url")
                 currentPageUrl = url ?: ""   // 在 main thread 更新，供 shouldInterceptRequest 安全讀取
+                if (url != null && isRouVideoUrl(url)) adFilterRules.rememberRouVideoDomain(url)
                 rememberStripchatModelUrl(url)
                 btnPlay.visibility = View.GONE
                 btnPlay.text = "▶"
@@ -1583,6 +1816,8 @@ class MainActivity : LocalizedActivity() {
                 isOnJavTrailersVideoPage = false
                 currentVideoUrl = null
                 currentVideoReferer = null
+                currentRouEpisodes = emptyList()
+                currentJavdayEpisodes = emptyList()
                 currentMissAvThumbnailConfig = null
                 currentJableVttUrl = null
                 videoFoundToastShown = false
@@ -1654,6 +1889,9 @@ class MainActivity : LocalizedActivity() {
             override fun onPageCommitVisible(view: WebView?, url: String?) {
                 super.onPageCommitVisible(view, url)
                 applySiteDomRules(view, url)
+                if (url != null && AdditionalSiteMedia.hostMatches(url, "javrate.com")) {
+                    view?.evaluateJavascript(javrateAdLayoutHook, null)
+                }
                 injectCrossSiteSearchButtons(view, url)
             }
 
@@ -1667,10 +1905,49 @@ class MainActivity : LocalizedActivity() {
                     btnAddFavorite.text = "♡"
                     updateFavoriteIcon(url)
                 }
+                if (url != null && isRouVideoUrl(url) && url != currentPageUrl) {
+                    currentPageUrl = url
+                    currentRouEpisodes = emptyList()
+                    currentVideoUrl = null
+                    currentVideoReferer = originForUrl(url)
+                    if (Uri.parse(url).path.orEmpty().startsWith("/v/")) checkForVideo()
+                }
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
+                if (url != null && AdditionalSiteMedia.isPage(url)) {
+                    view?.evaluateJavascript("""
+                        (function() {
+                            var poster = document.getElementById('player-wrap');
+                            if (poster) {
+                                var match = getComputedStyle(poster).backgroundImage.match(/url\(["']?(.*?)["']?\)/);
+                                if (match) window.__javMainPoster = match[1];
+                            }
+                            if (/(^|\.)javrate\.com${'$'}/i.test(location.hostname)) {
+                                var frame = document.querySelector('#v2-player');
+                                if (frame && frame.src) Android.onAdditionalPlayerFrame(frame.src);
+                                return;
+                            }
+                            if (/(^|\.)supjav\.com${'$'}/i.test(location.hostname)) {
+                                $supjavPlayerHook
+                                return;
+                            }
+                            if (!/(^|\.)javday\.app${'$'}/i.test(location.hostname) || window.__javdayEpisodeHook) return;
+                            window.__javdayEpisodeHook = true;
+                            var episodePanel = document.getElementById('episodePanel');
+                            if (episodePanel) Android.onAdditionalEpisodes(episodePanel.outerHTML, location.href);
+                            document.addEventListener('click', function(event) {
+                                var episode = event.target.closest('.episode-btn[data-url]');
+                                if (episode) Android.onAdditionalEpisode(episode.getAttribute('data-url'));
+                            }, true);
+                            var first = document.querySelector('.episode-btn[data-url]');
+                            var source = document.querySelector('video source[src], source[type="application/x-mpegURL"]');
+                            var candidate = first ? first.getAttribute('data-url') : (source ? source.getAttribute('src') : '');
+                            if (candidate && candidate.indexOf('${'$'}') < 0) Android.onAdditionalEpisode(candidate);
+                        })();
+                    """.trimIndent(), null)
+                }
                 android.util.Log.d("NAV_DEBUG", "onPageFinished url=$url")
                 updateCopyPageUrlVisibility()
                 
@@ -1892,7 +2169,7 @@ class MainActivity : LocalizedActivity() {
                 // view?.evaluateJavascript(removeAdsJs, null) // DISABLED FOR TESTING
 
                 // New MISSAV Ad Blocking Logic
-                if (url?.contains("missav") == true || url?.contains("jable") == true || url?.contains("rou.video") == true || url?.contains("rouva") == true || url?.contains("avjoy.me") == true || url?.contains("javhdporn.net") == true || url?.contains("7mmtv", ignoreCase = true) == true || url?.contains("7tv", ignoreCase = true) == true || url?.contains("avple.tv", ignoreCase = true) == true || url?.contains("whos.tv", ignoreCase = true) == true) {
+                if (url?.contains("missav") == true || url?.contains("jable") == true || url?.let(::isRouVideoUrl) == true || url?.contains("avjoy.me") == true || url?.contains("javhdporn.net") == true || url?.contains("7mmtv", ignoreCase = true) == true || url?.contains("7tv", ignoreCase = true) == true || url?.contains("avple.tv", ignoreCase = true) == true || url?.contains("whos.tv", ignoreCase = true) == true) {
                     val missavAdBlockJs = """
                         (function() {
                             'use strict';
@@ -2193,6 +2470,34 @@ class MainActivity : LocalizedActivity() {
         }
 
         webView.webChromeClient = object : android.webkit.WebChromeClient() {
+            override fun onShowFileChooser(
+                view: WebView?,
+                filePathCallback: android.webkit.ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                if (filePathCallback == null) return false
+                if (fileChooserInFlight || fileChooserParams == null) {
+                    filePathCallback.onReceiveValue(null)
+                    return true
+                }
+                pendingFileChooser = filePathCallback
+                try {
+                    val pickerIntent = fileChooserParams.createIntent().apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    fileChooserInFlight = true
+                    chooseWebFiles.launch(pickerIntent)
+                } catch (_: Exception) {
+                    fileChooserInFlight = false
+                    cancelPendingFileChooser()
+                    Toast.makeText(this@MainActivity,
+                        LanguageManager.text(this@MainActivity, "無法開啟檔案選擇器", "Unable to open the file picker"),
+                        Toast.LENGTH_SHORT).show()
+                }
+                return true
+            }
+
 
             override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage?): Boolean {
                 consoleMessage?.let {
@@ -2266,6 +2571,35 @@ class MainActivity : LocalizedActivity() {
                 view: android.webkit.WebView?, isDialog: Boolean,
                 isUserGesture: Boolean, resultMsg: android.os.Message?
             ): Boolean {
+                if ((AdditionalSiteMedia.hostMatches(currentPageUrl, "supjav.com") ||
+                        AdditionalSiteMedia.hostMatches(currentPageUrl, "javrate.com")) && resultMsg != null) {
+                    val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
+                    // A rejected window.open() may trigger the site's same-tab fallback.
+                    // Accept an isolated, script-free window and discard its navigation instead.
+                    val popup = WebView(this@MainActivity)
+                    blockedPopupViews.add(popup)
+                    fun discard() {
+                        popup.post {
+                            if (blockedPopupViews.remove(popup)) popup.destroy()
+                        }
+                    }
+                    popup.webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                            discard()
+                            return true
+                        }
+
+                        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse =
+                            WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                    }
+                    popup.webChromeClient = object : android.webkit.WebChromeClient() {
+                        override fun onCloseWindow(window: WebView?) { discard() }
+                    }
+                    transport.webView = popup
+                    resultMsg.sendToTarget()
+                    popup.postDelayed({ discard() }, 15_000)
+                    return true
+                }
                 return false
             }
         }
@@ -2328,7 +2662,8 @@ class MainActivity : LocalizedActivity() {
                     function reportRouVideo(value) {
                         try {
                             var resolved = new URL(String(value || ''), location.href);
-                            if (/\/api\/hls\//i.test(resolved.pathname) || /\.m3u8(?:$|[?#])/i.test(resolved.href)) {
+                            if (!resolved.searchParams.has('kind') &&
+                                (/\/api\/hls\//i.test(resolved.pathname) || /\.m3u8(?:$|[?#])/i.test(resolved.href))) {
                                 Android.onVideoFound(resolved.href);
                                 return true;
                             }
@@ -2482,43 +2817,42 @@ class MainActivity : LocalizedActivity() {
                         });
                     }
 
-                    function report(value) {
+                    function report(value, playerUrl) {
                         var candidate = normalizeUrl(value);
-                        if (/^https?:\/\/[^"'\s<>]+\.m3u8(?:[?#][^"'\s<>]*)?$/i.test(candidate)) {
-                            Android.onVideoFound(candidate);
+                        if (/^https?:\/\/[^"'\s<>]+\.(?:m3u8|mp4)(?:[?#][^"'\s<>]*)?$/i.test(candidate)) {
+                            Android.onAvTodayMedia(candidate, playerUrl, location.href);
                             return true;
                         }
                         return false;
                     }
 
-                    function reportFromText(text) {
+                    function reportFromText(text, playerUrl) {
                         if (!text) return false;
                         var match = String(text)
                             .replace(/\\u0026/g, '&')
                             .replace(/&amp;/g, '&')
-                            .match(/https?:\/\/[^"'\s<>]+\.m3u8(?:[?#][^"'\s<>]*)?/i);
-                        return !!(match && report(match[0]));
+                            .match(/(?:var|let|const)\s+(?:video_link|m3u8_url)\s*=\s*['"](https?:\/\/[^"'\s<>]+\.(?:m3u8|mp4)(?:[?#][^"'\s<>]*)?)['"]/i);
+                        return !!(match && report(match[1], playerUrl));
                     }
 
                     function inspectPlayerFrame() {
                         var frame = document.querySelector('iframe.video-frame, iframe[src*="/player?s="]');
                         if (!frame) return;
-                        try {
-                            var doc = frame.contentDocument;
-                            if (doc && reportFromText(doc.documentElement.innerHTML || '')) return;
-                        } catch (e) {}
-
                         var src = normalizeUrl(frame.getAttribute('src') || frame.src || '');
                         if (!src) return;
+                        try {
+                            var player = frame.contentWindow;
+                            if (player && (report(player.video_link, src) || report(player.m3u8_url, src))) return;
+                            var doc = frame.contentDocument;
+                            if (doc && reportFromText(doc.documentElement.innerHTML || '', src)) return;
+                        } catch (e) {}
+
                         fetch(src, { credentials: 'include' })
                             .then(function(response) { return response.text(); })
-                            .then(reportFromText)
+                            .then(function(text) { if (frame.src === src) reportFromText(text, src); })
                             .catch(function() {});
                     }
 
-                    document.querySelectorAll('video[src], video source[src]').forEach(function(node) {
-                        report(node.currentSrc || node.src || node.getAttribute('src') || '');
-                    });
                     applyPreviewPosters(document);
                     try {
                         new MutationObserver(function(mutations) {
@@ -2534,8 +2868,10 @@ class MainActivity : LocalizedActivity() {
                             });
                         }).observe(document.documentElement, { childList: true, subtree: true });
                     } catch (e) {}
-                    reportFromText(document.documentElement.innerHTML || '');
                     inspectPlayerFrame();
+                    document.addEventListener('load', function(e) {
+                        if (e.target && e.target.matches && e.target.matches('iframe.video-frame')) inspectPlayerFrame();
+                    }, true);
                     setTimeout(function() { applyPreviewPosters(document); }, 500);
                     setTimeout(function() { applyPreviewPosters(document); }, 1800);
                     setTimeout(inspectPlayerFrame, 1200);
@@ -2730,10 +3066,15 @@ class MainActivity : LocalizedActivity() {
                 }
             } else if (isRouVideoUrl(url)) {
                 extractedUrl = VideoExtractor.extractRouVideo(rawHtml, url)
+                currentRouEpisodes = VideoExtractor.extractRouEpisodes(rawHtml)
                 if (extractedUrl != null) {
                     currentVideoReferer = originForUrl(url)
                     android.util.Log.d("ROU_PLAYER", "page=$url extracted=$extractedUrl")
                 }
+            } else if (AdditionalSiteMedia.hostMatches(url, "javday.app")) {
+                currentJavdayEpisodes = VideoExtractor.extractJavdayEpisodes(rawHtml, url)
+                extractedUrl = currentJavdayEpisodes.firstOrNull()?.url
+                if (extractedUrl != null) currentVideoReferer = originForUrl(url)
             } else if (url.contains("avjoy.me")) {
                 extractedUrl = VideoExtractor.extractAvJoy(rawHtml)
                 if (extractedUrl != null) {
@@ -2745,12 +3086,8 @@ class MainActivity : LocalizedActivity() {
                     currentVideoReferer = originForUrl(url) ?: "https://pigav.ws/"
                 }
             } else if (url.contains("avtoday.io", ignoreCase = true)) {
-                val match = Regex("""https?://[^\"'\\s<>]+\.m3u8(?:[?#][^\"'\\s<>]*)?""", RegexOption.IGNORE_CASE)
-                    .find(rawHtml)
-                extractedUrl = match?.value?.replace("&amp;", "&")
-                if (extractedUrl != null) {
-                    currentVideoReferer = originForUrl(url) ?: "https://avtoday.io/"
-                }
+                // The selected player supplies signed MP4 or HLS; page HTML also contains previews.
+                extractedUrl = null
             } else if (url.contains("7mmtv", ignoreCase = true) ||
                 url.contains("7tv", ignoreCase = true)) {
                 // 7MMTV 詳情頁的 JSON-LD 會提供 Playmogo embed；頁面內其他卡片
@@ -3177,6 +3514,13 @@ class MainActivity : LocalizedActivity() {
                 return@setOnClickListener
             }
             // ── 原有播放邏輯 ──────────────────────────────────────
+            val pageUrl = webView.url ?: currentPageUrl
+            RouVideoStreams.playlistForPage(pageUrl)?.let { playlist ->
+                currentVideoUrl = playlist
+                currentVideoReferer = originForUrl(pageUrl)
+                playVideo(playlist)
+                return@setOnClickListener
+            }
             currentVideoUrl?.let { url ->
                 if ((url.contains("playmogo.com", ignoreCase = true) ||
                         url.contains("dood", ignoreCase = true)) &&
@@ -3785,6 +4129,14 @@ class MainActivity : LocalizedActivity() {
                                     if (twitterImage) thumbnail = twitterImage.content;
                                 }
                                 if (!thumbnail) {
+                                    thumbnail = window.__javMainPoster || '';
+                                    var playerPoster = document.getElementById('player-wrap');
+                                    if (!thumbnail && playerPoster) {
+                                        var background = getComputedStyle(playerPoster).backgroundImage.match(/url\(["']?(.*?)["']?\)/);
+                                        if (background) thumbnail = background[1];
+                                    }
+                                }
+                                if (!thumbnail) {
                                     var img = document.querySelector('img');
                                     if (img) thumbnail = img.src;
                                 }
@@ -3885,11 +4237,34 @@ class MainActivity : LocalizedActivity() {
         return "stripchat:${path.lowercase()}"
     }
     private fun playVideo(url: String) {
+        val page = webView.url ?: currentPageUrl
+        if (AdditionalSiteMedia.hostMatches(page, "javrate.com")) {
+            webView.evaluateJavascript("document.querySelector('#v2-player')?.src || ''") { raw ->
+                val embed = runCatching { org.json.JSONTokener(raw).nextValue() as? String }.getOrNull().orEmpty()
+                if (JavrateStreams.isPlayer(embed)) {
+                    recordPlaybackPage(page, webView.title.orEmpty())
+                    startActivity(Intent(this, FullscreenInternalPlayerActivity::class.java).apply {
+                        putExtra(FullscreenInternalPlayerActivity.EXTRA_JAVRATE_PLAYER, embed)
+                        putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, webView.title ?: "video")
+                        putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, page)
+                    })
+                } else {
+                    Toast.makeText(this, "請先開啟網站播放器", Toast.LENGTH_SHORT).show()
+                }
+            }
+            return
+        }
+        playResolvedVideo(url)
+    }
+
+    private fun playResolvedVideo(url: String) {
         val referer = currentVideoReferer
         val cookieManager = android.webkit.CookieManager.getInstance()
         val currentPageUrl = webView.url ?: referer ?: ""
         // javhdporn.net：cookie 需要從主頁和 video1 子域都取
-        val cookies = if (referer?.contains("javhdporn.net") == true) {
+        val cookies = if (AdditionalSiteMedia.hostMatches(currentPageUrl, "supjav.com")) {
+            cookieManager.getCookie(url).orEmpty().ifEmpty { cookieManager.getCookie(referer.orEmpty()).orEmpty() }
+        } else if (referer?.contains("javhdporn.net") == true) {
             listOf(
                 cookieManager.getCookie("https://www.javhdporn.net/"),
                 cookieManager.getCookie("https://video1.javhdporn.net/")
@@ -3921,7 +4296,7 @@ class MainActivity : LocalizedActivity() {
         clipboard.setPrimaryClip(clip)
         Toast.makeText(this, "Video URL copied to clipboard", Toast.LENGTH_SHORT).show()
 
-        if (referer != null && url.contains(".m3u8")) {
+        if (referer != null && MediaStreamFormats.isHls(url)) {
             // For HLS with referer protection: fetch master m3u8 via proxy to pick highest quality,
             // then pass the best-quality proxy URL to the external player.
             btnPlay.isEnabled = false
@@ -3971,6 +4346,7 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun launchFullscreenInternalPlayer(videoUrl: String, referer: String) {
+        recordPlaybackPage(webView.url ?: currentPageUrl, webView.title.orEmpty())
         val isMissAv = referer.contains("missav", ignoreCase = true) ||
             currentPageUrl.contains("missav", ignoreCase = true)
         val internalVideoUrl = if (isMissAv) normalizeMissavM3u8Url(videoUrl) else videoUrl
@@ -3985,8 +4361,29 @@ class MainActivity : LocalizedActivity() {
         val intent = Intent(this, FullscreenInternalPlayerActivity::class.java).apply {
             putExtra(FullscreenInternalPlayerActivity.EXTRA_VIDEO_URL, internalVideoUrl)
             putExtra(FullscreenInternalPlayerActivity.EXTRA_REFERER, referer)
-            putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, webView.url ?: currentPageUrl)
+            val playerPageUrl = webView.url ?: currentPageUrl
+            putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, playerPageUrl)
             putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, webView.title ?: "video")
+            if (AdditionalSiteMedia.hostMatches(playerPageUrl, "javday.app") && currentJavdayEpisodes.size > 1) {
+                val episodesJson = org.json.JSONArray()
+                currentJavdayEpisodes.forEach { episode ->
+                    episodesJson.put(org.json.JSONObject().apply {
+                        put("url", episode.url)
+                        put("title", episode.title)
+                    })
+                }
+                putExtra(FullscreenInternalPlayerActivity.EXTRA_ADDITIONAL_EPISODES_JSON, episodesJson.toString())
+            }
+            if (isRouVideoUrl(playerPageUrl) && currentRouEpisodes.size > 1) {
+                val episodesJson = org.json.JSONArray()
+                currentRouEpisodes.forEach { episode ->
+                    episodesJson.put(org.json.JSONObject().apply {
+                        put("id", episode.id)
+                        put("number", episode.number)
+                    })
+                }
+                putExtra(FullscreenInternalPlayerActivity.EXTRA_ROU_EPISODES_JSON, episodesJson.toString())
+            }
             thumbnailConfig?.let {
                 putExtra(FullscreenInternalPlayerActivity.EXTRA_THUMB_PIC_NUM, it.picNum)
                 putExtra(FullscreenInternalPlayerActivity.EXTRA_THUMB_WIDTH, it.width)
@@ -4002,7 +4399,51 @@ class MainActivity : LocalizedActivity() {
         startActivity(intent)
     }
 
+    private fun recordPlaybackPage(pageUrl: String, title: String) {
+        PlaybackHistoryRepository.record(this, pageUrl, title)
+        webView.evaluateJavascript("""
+            (function() {
+                var video = document.querySelector('video[poster]');
+                var meta = document.querySelector('meta[property="og:image"], meta[name="twitter:image"]');
+                var cover = (video && video.poster) || window.__javMainPoster || (meta && meta.content) || '';
+                if (!cover) {
+                    var poster = document.querySelector('.art-poster, #player-wrap');
+                    var match = poster && getComputedStyle(poster).backgroundImage.match(/url\(["']?(.*?)["']?\)/);
+                    if (match) cover = match[1];
+                }
+                var icon = document.querySelector('link[rel="icon"], link[rel="shortcut icon"], link[rel="apple-touch-icon"]');
+                function absolute(value) { try { return value ? new URL(value, location.href).href : ''; } catch(e) { return ''; } }
+                var metadata = [];
+                var actorLabel = /^(女優|女优|演員|演员|主演|Actress(es)?|Actor(s|\(s\))?|Cast|出演)[：:\s]*$/i;
+                document.querySelectorAll('strong,b,span,dt,th,label,div,p').forEach(function(el) {
+                    var own = Array.from(el.childNodes).filter(function(n) { return n.nodeType === 3; })
+                        .map(function(n) { return n.textContent; }).join('').trim();
+                    if (actorLabel.test(own) && el.parentElement && el.parentElement.outerHTML.length < 100000) {
+                        metadata.push(el.parentElement.outerHTML);
+                    }
+                });
+                document.querySelectorAll('a[href*="/actress/"],a[href*="/actresses/"],a[href*="/actor/"],a[href*="/star/"],a[href*="/models/"],.actor-name,.actress-name,script[type="application/ld+json"]').forEach(function(el) {
+                    for (var p = el.parentElement; p; p = p.parentElement) {
+                        if (/recommend|related|sidebar|footer|header|nav/i.test(p.className + ' ' + p.id) || /^(NAV|FOOTER|HEADER)$/.test(p.tagName)) return;
+                    }
+                    metadata.push(el.outerHTML);
+                });
+                return JSON.stringify({ cover: absolute(cover), icon: icon ? icon.href : absolute('/favicon.ico'),
+                    actorsHtml: metadata.join('\n').slice(0, 300000) });
+            })();
+        """.trimIndent()) { raw ->
+            if (webView.url != pageUrl) return@evaluateJavascript
+            runCatching {
+                val json = org.json.JSONTokener(raw).nextValue() as? String ?: return@runCatching
+                val images = org.json.JSONObject(json)
+                PlaybackHistoryRepository.updateArtwork(this, pageUrl, images.optString("cover"), images.optString("icon"),
+                    PlaybackHistoryArtwork.actresses(images.optString("actorsHtml")))
+            }
+        }
+    }
+
     private fun playInsideCurrentWebView(videoUrl: String, reusePageVideo: Boolean = false) {
+        recordPlaybackPage(webView.url ?: currentPageUrl, webView.title.orEmpty())
         val videoUrlJson = org.json.JSONObject.quote(videoUrl)
         val reusePageVideoJs = if (reusePageVideo) "true" else "false"
         val shortSeekSeconds = privacySettings.playerShortSeekSeconds
@@ -5479,7 +5920,8 @@ class MainActivity : LocalizedActivity() {
                 // 寫完後立刻執行返回
                 webView.goBack()
             }
-        } else if (intent.getBooleanExtra(BrowserNavigator.EXTRA_RETURN_TO_SEARCH, false)) {
+        } else if (intent.getBooleanExtra(BrowserNavigator.EXTRA_RETURN_TO_SEARCH, false) ||
+            intent.getBooleanExtra(BrowserNavigator.EXTRA_RETURN_TO_HISTORY, false)) {
             // 搜尋結果開啟的瀏覽頁已沒有上一頁，返回搜尋結果。
             finish()
         } else if (returnToSalesRanking) {
@@ -5512,7 +5954,11 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun updateHomeButtonForNavigationContext() {
-        if (intent.getBooleanExtra(BrowserNavigator.EXTRA_RETURN_TO_SEARCH, false)) {
+        if (intent.getBooleanExtra(BrowserNavigator.EXTRA_RETURN_TO_HISTORY, false)) {
+            btnHome.text = "×"
+            btnHome.contentDescription = LanguageManager.text(this, "關閉並返回播放紀錄", "Close and return to playback history")
+            btnHome.setOnClickListener { finish() }
+        } else if (intent.getBooleanExtra(BrowserNavigator.EXTRA_RETURN_TO_SEARCH, false)) {
             btnHome.text = "×"
             btnHome.contentDescription = LanguageManager.text(
                 this,
@@ -5537,7 +5983,7 @@ class MainActivity : LocalizedActivity() {
     
     private fun isOnLandingPage(): Boolean {
         val url = webView.url
-        return url == null || url == "about:blank" || url.startsWith("data:")
+        return url == null || url == "about:blank" || url.startsWith("data:") || url == "https://javbrowser.app/"
     }
     
     // ── JAV code bookmark helpers ─────────────────────────────────────────────
@@ -5861,6 +6307,12 @@ class MainActivity : LocalizedActivity() {
                         grid-template-columns: repeat(2, minmax(0, 1fr));
                         gap: 8px;
                     }
+                    #playback-history-link {
+                        display: block; width: 100%; box-sizing: border-box; margin-top: 14px;
+                        padding: 16px; min-height: 54px; border-radius: 12px; background: #776014;
+                        color: #FFF4C4; font-size: 16px; font-weight: 800; text-align: center;
+                    }
+                    #playback-history-link:active { background: #967B22; }
                     .help-button {
                         width: 32px;
                         height: 32px;
@@ -5876,6 +6328,14 @@ class MainActivity : LocalizedActivity() {
                         border: 1px solid #666;
                     }
                     #jav-hint { margin-top: 8px !important; }
+                    #clipboard-link { margin: 0 0 14px; padding: 14px; border: 1px solid #BB86FC; border-radius: 12px; background: #251b32; }
+                    #clipboard-link[hidden] { display: none; }
+                    #clipboard-link p { margin: 6px 0 12px; }
+                    #clipboard-link-url { display: block; color: #ccc; font-size: 13px; overflow-wrap: anywhere; margin-bottom: 12px; }
+                    .clipboard-actions { display: flex; gap: 8px; }
+                    .clipboard-actions button { min-height: 44px; padding: 10px 16px; border: 0; border-radius: 8px; font-weight: bold; }
+                    #clipboard-link-open { background: #BB86FC; color: #24152B; }
+                    #clipboard-link-dismiss { background: #3b3345; color: #fff; }
                     #btn-save-jav {
                         min-height: 44px;
                         padding: 8px 12px !important;
@@ -5927,6 +6387,16 @@ class MainActivity : LocalizedActivity() {
                     <h1>JAV Browser</h1>
                     <div class="help-button" onclick="showHelp()">?</div>
                 </div>
+
+                <section id="clipboard-link" hidden aria-live="polite">
+                    <strong>${if (english) "Copied link from " else "剪貼簿網址："}<span id="clipboard-link-site"></span></strong>
+                    <p>${if (english) "Open this page?" else "要前往這個頁面嗎？"}</p>
+                    <span id="clipboard-link-url"></span>
+                    <div class="clipboard-actions">
+                        <button id="clipboard-link-open" onclick="Android.openClipboardLink()">${if (english) "Open page" else "前往此頁面"}</button>
+                        <button id="clipboard-link-dismiss" onclick="document.getElementById('clipboard-link').hidden=true;Android.dismissClipboardLink()">${if (english) "Not now" else "暫時不要"}</button>
+                    </div>
+                </section>
                 
                 <div class="search-container">
                     <input type="text" id="searchInput" class="search-box" placeholder="$searchPlaceholder" />
@@ -5947,6 +6417,9 @@ class MainActivity : LocalizedActivity() {
                             <a href="#" id="search7MMTV">7MMTV</a>
                             <a href="#" id="searchAvple">Avple</a>
                             <a href="#" id="searchWhos">Whos.tv</a>
+                            <a href="#" id="searchJavday">JAVDAY</a>
+                            <a href="#" id="searchRouVideos">${if (english) "ROU · Videos" else "ROU · 影片"}</a>
+                            <a href="#" id="searchRouSeries">${if (english) "ROU · Series" else "ROU · 影集"}</a>
                         </div>
                     </details>
                 </div>
@@ -5969,12 +6442,16 @@ class MainActivity : LocalizedActivity() {
                     <a href="javascript:Android.navigateToUrl('${domainConfig.get7MmTvBaseUrl()}')">7MMTV</a>
                     <a href="javascript:Android.navigateToUrl('${domainConfig.getAvpleBaseUrl()}')">Avple</a>
                     <a href="javascript:Android.navigateToUrl('${domainConfig.getWhosBaseUrl()}')">Whos.tv</a>
+                    <a href="javascript:Android.navigateToUrl('https://javday.app/')">JAVDAY</a>
+                    <a href="javascript:Android.navigateToUrl('https://supjav.com/')">SUPJAV</a>
+                    <a href="javascript:Android.navigateToUrl('https://www.javrate.com/')">JavRate</a>
                     <a href="javascript:Android.navigateToUrl('https://javdb.com/')">JavDB</a>
                     <a href="javascript:Android.navigateToUrl('https://javtrailers.com/ja/videos')">JavTrailers</a>
                     <a href="javascript:Android.navigateToUrl('https://zt.stripchat.com/')">Stripchat</a>
                     <a href="javascript:Android.navigateToUrl('https://cn.pornhub.com/')">Pornhub CN</a>
                     <a href="javascript:Android.navigateToUrl('https://www.xvideos.com/')">XVideos</a>
                 </div>
+                <a id="playback-history-link" href="javascript:Android.openPlaybackHistory()">${if (english) "📜 Playback history" else "📜 播放紀錄"}</a>
 
                 <script>
                     const searchInput = document.getElementById('searchInput');
@@ -5988,6 +6465,9 @@ class MainActivity : LocalizedActivity() {
                     const search7MMTV = document.getElementById('search7MMTV');
                     const searchAvple = document.getElementById('searchAvple');
                     const searchWhos = document.getElementById('searchWhos');
+                    const searchJavday = document.getElementById('searchJavday');
+                    const searchRouVideos = document.getElementById('searchRouVideos');
+                    const searchRouSeries = document.getElementById('searchRouSeries');
 
                     // ── JAV code detection ──────────────────────────────────────
                     var _javCodes = [];
@@ -6042,7 +6522,12 @@ class MainActivity : LocalizedActivity() {
                         }
                     }
                     // 剪貼簿回呼：直接填入搜尋框，顯示紫色存入書籤按鈕
-                    function onClipboardResult(text) {
+                    function onClipboardResult(text, link) {
+                        var card = document.getElementById('clipboard-link');
+                        card.hidden = !link;
+                        document.getElementById('clipboard-link-site').textContent = link ? link.site : '';
+                        document.getElementById('clipboard-link-url').textContent = link ? link.url : '';
+                        if (link) return;
                         var codes = detectJavCodes(text);
                         if (codes.length > 0) {
                             searchInput.value = codes.join(' ');
@@ -6082,6 +6567,9 @@ class MainActivity : LocalizedActivity() {
                             search7MMTV.href = 'https://${domainConfig.get7MmTvDomain()}/zh/searchall_search/all/' + encodeURIComponent(keyword) + '/1.html';
                             searchAvple.href = 'https://${domainConfig.getAvpleDomain()}/search?key=' + encodeURIComponent(keyword);
                             searchWhos.href = 'https://${domainConfig.getWhosDomain()}/result?search=' + encodeURIComponent(keyword);
+                            searchJavday.href = 'https://javday.app/search/?wd=' + encodeURIComponent(keyword);
+                            searchRouVideos.href = 'https://${domainConfig.getRouVideoDomain()}/search?q=' + encodeURIComponent(keyword);
+                            searchRouSeries.href = searchRouVideos.href + '&tab=series';
                         } else {
                             searchResults.classList.remove('show');
                         }
@@ -6127,7 +6615,9 @@ class MainActivity : LocalizedActivity() {
             </body>
             </html>
         """.trimIndent()
-        webView.loadDataWithBaseURL("https://javbrowser.app/", landingHtml, "text/html", "utf-8", null)
+        // A null history URL makes WebView.getUrl() report about:blank on some devices.
+        // Keep the native home check consistent with the document's base URL.
+        webView.loadDataWithBaseURL("https://javbrowser.app/", landingHtml, "text/html", "utf-8", "https://javbrowser.app/")
     }
     
     private fun downloadAndInstallApk(url: String) {
@@ -6166,7 +6656,7 @@ class MainActivity : LocalizedActivity() {
             host == "7mmtv.sx" || host.endsWith(".7mmtv.sx") ||
             host.matches(Regex("7tv\\d*\\.com")) || host.endsWith(".7tv.com") ||
             host == "avple.tv" || host.endsWith(".avple.tv") ||
-            host == "whos.tv" || host.endsWith(".whos.tv")
+            host == "whos.tv" || host.endsWith(".whos.tv") || AdditionalSiteMedia.isPage(url)
     }
 
     private fun updateCopyPageUrlVisibility() {
@@ -6408,6 +6898,9 @@ class MainActivity : LocalizedActivity() {
     }
 
     override fun onDestroy() {
+        cancelPendingFileChooser()
+        supjavMediaResolver.close()
+        clearBlockedPopupViews()
         // 取消註冊書籤頁 URL 廣播接收器
         androidx.localbroadcastmanager.content.LocalBroadcastManager.getInstance(this)
             .unregisterReceiver(favUrlReceiver)

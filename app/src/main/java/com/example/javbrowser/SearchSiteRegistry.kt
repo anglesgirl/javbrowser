@@ -12,7 +12,12 @@ enum class SearchParserKind {
     JAVHD,
     SEVEN_MM_TV,
     AVPLE,
-    WHOS
+    WHOS,
+    JAVDAY,
+    SUPJAV,
+    JAVRATE,
+    ROU_VIDEO,
+    ROU_SERIES
 }
 
 data class SearchSite(
@@ -42,9 +47,14 @@ object SearchSiteIds {
     const val SEVEN_MM_TV = "7mmtv"
     const val AVPLE = "avple"
     const val WHOS = "whos"
+    const val JAVDAY = "javday"
+    const val SUPJAV = "supjav"
+    const val JAVRATE = "javrate"
+    const val ROU_VIDEO = "rou_video"
+    const val ROU_SERIES = "rou_series"
 }
 
-/** 九個搜尋網站的唯一登錄表；網址與可變網域集中在這裡。 */
+/** 搜尋網站的唯一登錄表；網址與可變網域集中在這裡。 */
 object SearchSiteRegistry {
     fun sites(context: Context): List<SearchSite> {
         val appContext = context.applicationContext
@@ -80,8 +90,23 @@ object SearchSiteRegistry {
             SearchSite(SearchSiteIds.AVPLE, "Avple", 7, SearchParserKind.AVPLE,
                 "avple:$avpleHost", { query, page -> page ?: "https://$avpleHost/search?key=${encodedQuery(query)}" }, setOf(avpleHost)),
             SearchSite(SearchSiteIds.WHOS, "Whos.tv", 8, SearchParserKind.WHOS,
-                "whos:$whosHost", { query, page -> page ?: "https://$whosHost/result?search=${encodedQuery(query)}" }, setOf(whosHost))
-        )
+                "whos:$whosHost", { query, page -> page ?: "https://$whosHost/result?search=${encodedQuery(query)}" }, setOf(whosHost)),
+            SearchSite(SearchSiteIds.JAVDAY, "JAVDAY", 9, SearchParserKind.JAVDAY,
+                "javday:javday.app", { query, page -> page ?: "https://javday.app/search/wd/${pathQuery(query)}/" }, setOf("javday.app")),
+            SearchSite(SearchSiteIds.SUPJAV, "SUPJAV", 10, SearchParserKind.SUPJAV,
+                "supjav:supjav.com", { query, page -> page ?: "https://supjav.com/?s=${encodedQuery(query)}" }, setOf("supjav.com")),
+            SearchSite(SearchSiteIds.JAVRATE, "JavRate", 11, SearchParserKind.JAVRATE,
+                "javrate:javrate.com", { query, page -> page ?: "https://www.javrate.com/search/a%E7%89%87/${pathQuery(query.lowercase(java.util.Locale.ROOT))}/?tab=movie" }, setOf("javrate.com"))
+        ) + rouSites(domain.getRouVideoDomain(), LanguageManager.isEnglish(context))
+    }
+
+    fun rouSites(host: String, english: Boolean = false): List<SearchSite> = listOf(false, true).map { series ->
+        val id = if (series) SearchSiteIds.ROU_SERIES else SearchSiteIds.ROU_VIDEO
+        val kind = if (series) SearchParserKind.ROU_SERIES else SearchParserKind.ROU_VIDEO
+        val label = if (english) { if (series) "Series" else "Videos" } else { if (series) "影集" else "影片" }
+        SearchSite(id, "ROU · $label", if (series) 13 else 12, kind, "$id:${host.lowercase()}",
+            { query, page -> page ?: "https://${host.lowercase()}/search?q=${URLEncoder.encode(query, "UTF-8")}" +
+                if (series) "&tab=series" else "" }, setOf(host.lowercase()))
     }
 
     fun find(context: Context, siteId: String): SearchSite? =
