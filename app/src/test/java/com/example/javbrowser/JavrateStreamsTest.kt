@@ -6,6 +6,47 @@ import org.junit.Test
 class JavrateStreamsTest {
     private val master = "https://videocdn.avking.xyz/movie/playlist.m3u8?token=sample&expires=9999999999&token_path=%2Fmovie%2F"
 
+    @Test fun authorizesDatePrefixedCdnObjectsUsingTheirActualDirectory() {
+        val dated = master.replace("/movie/playlist", "/20261015/movie/playlist")
+        val variant = JavrateStreams.resolve(dated, "720p/video.m3u8")
+        assertTrue(variant.contains("/20261015/movie/720p/video.m3u8?"))
+        assertTrue(variant.contains("token=sample"))
+        assertTrue(JavrateStreams.resolve(variant, "a.ts").contains("token_path=%2Fmovie%2F"))
+        val renewed = dated.replace("token=sample", "token=renewed")
+        assertTrue(JavrateStreams.sameAsset(dated, renewed))
+        assertTrue(JavrateStreams.authorize(renewed, variant).contains("token=renewed"))
+        assertFalse(JavrateStreams.belongsToAsset(dated, "https://videocdn.avking.xyz/20261015/other/a.ts"))
+        assertFalse(JavrateStreams.belongsToAsset(dated, "https://videocdn.avking.xyz/20261014/movie/a.ts"))
+        assertFalse(JavrateStreams.belongsToAsset(dated, "https://videocdn.avking.xyz/movie/a.ts"))
+        assertFalse(JavrateStreams.sameAsset(dated, dated.replace("20261015", "20261014")))
+        assertFalse(JavrateStreams.belongsToAsset(dated, "https://videocdn.avking.xyz/20261015/movie-other/a.ts"))
+    }
+
+    @Test fun acceptsNormalStorageWithoutApplyingBunnyCredentials() {
+        val direct = "https://videocdn.avking.xyz/movie/playlist.m3u8"
+        assertTrue(JavrateStreams.isDirect(direct))
+        assertFalse(JavrateStreams.isSigned(direct))
+        assertTrue(AdditionalSiteMedia.accepts("https://www.javrate.com/movie/detail/example.html",
+            direct, "https://www.javrate.com/player/v2"))
+        assertEquals("https://videocdn.avking.xyz/movie/720p/video.m3u8",
+            JavrateStreams.resolve(direct, "720p/video.m3u8"))
+        assertEquals("https://videocdn.avking.xyz/movie/a.ts",
+            JavrateStreams.authorize(direct, "https://videocdn.avking.xyz/movie/a.ts"))
+    }
+
+    @Test fun rejectsUntrustedOrPartiallySignedNormalStorage() {
+        listOf("http://videocdn.avking.xyz/movie/main.m3u8",
+            "https://avking.xyz.evil.invalid/movie/main.m3u8",
+            "https://user@videocdn.avking.xyz/movie/main.m3u8",
+            "https://videocdn.avking.xyz:8443/movie/main.m3u8",
+            "https://videocdn.avking.xyz/movie/main.m3u8?token=partial").forEach {
+            assertFalse(it, JavrateStreams.isDirect(it))
+        }
+        assertFalse(AdditionalSiteMedia.accepts("https://www.javrate.com/movie/detail/example.html",
+            "https://videocdn.avking.xyz/movie/main.m3u8", "https://ads.invalid/"))
+        assertFalse(JavrateStreams.isSigned(master.replace("https://", "http://")))
+    }
+
     @Test fun carriesAuthorizationAcrossMasterVariantAndSegment() {
         val variant = JavrateStreams.resolve(master, "720p/video.m3u8")
         assertTrue(variant.contains("token=sample"))

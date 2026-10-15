@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — 2026-10-15
+
+### JavRate Playback
+
+- Recognize date-prefixed CDN asset directories when the authorization token scope omits that date prefix. Propagate and refresh credentials for the matching variant playlists and segments without sharing them with other asset directories or dates.
+- Support normal-storage player configurations that provide a direct media URL without Bunny-style token fields.
+- Refresh nearly expired initial credentials immediately and retain HTTPS and trusted-host restrictions.
+- Reproduced repeated variant-playlist HTTP 403 responses on the development phone before the directory fix. After replacement installation, internal playback advanced from approximately 7 to 36 seconds at 1920 × 1080 with zero dropped decoded frames; the observed subsequent media requests and token refreshes returned HTTP 200. This does not establish playback for every title or completed downloads.
+- The targeted Kotlin tests and JavaScript session tests passed, and the debug APK compiled successfully. The app version remains 1.2.0.
+
 ## 1.2.0 Update — 2026-10-14
 
 The app version remains 1.2.0. These updates extend the existing 1.2.0 codebase.

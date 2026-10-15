@@ -12,17 +12,27 @@ object JavrateStreams {
         return path.takeIf { Regex("^/(?:[A-Za-z0-9_-]+/)+$").matches(it) }
     }
 
+    private fun assetRoot(url: String): String? {
+        val parsed = url.toHttpUrlOrNull() ?: return null
+        val scope = tokenPath(url) ?: return null
+        if (parsed.encodedPath.startsWith(scope)) return scope
+        // Newer CDN objects add a date directory that is absent from token_path.
+        val date = Regex("^/[0-9]{8}(?=/)").find(parsed.encodedPath)?.value ?: return null
+        return (date + scope).takeIf { parsed.encodedPath.startsWith(it) }
+    }
+
     fun sameAsset(first: String, second: String): Boolean {
         val a = first.toHttpUrlOrNull() ?: return false
         val b = second.toHttpUrlOrNull() ?: return false
         return isSigned(first) && isSigned(second) && a.host == b.host &&
-            tokenPath(first) != null && tokenPath(first) == tokenPath(second)
+            tokenPath(first) != null && tokenPath(first) == tokenPath(second) &&
+            assetRoot(first) != null && assetRoot(first) == assetRoot(second)
     }
 
     fun belongsToAsset(source: String, target: String): Boolean {
         val a = source.toHttpUrlOrNull() ?: return false
         val b = target.toHttpUrlOrNull() ?: return false
-        val path = tokenPath(source) ?: return false
+        val path = assetRoot(source) ?: return false
         return isSigned(source) && b.scheme == "https" && a.host == b.host &&
             path.startsWith('/') && path.endsWith('/') && b.encodedPath.startsWith(path)
     }
@@ -43,8 +53,18 @@ object JavrateStreams {
 
     fun isSigned(url: String): Boolean {
         val parsed = url.toHttpUrlOrNull() ?: return false
-        return AdditionalSiteMedia.hostMatches(url, "avking.xyz") &&
+        return parsed.scheme == "https" && parsed.username.isEmpty() && parsed.password.isEmpty() &&
+            parsed.port == 443 && AdditionalSiteMedia.hostMatches(url, "avking.xyz") &&
             listOf("token", "expires", "token_path").all { !parsed.queryParameter(it).isNullOrBlank() }
+    }
+
+    /** Normal-storage sources do not use the short-lived Bunny token protocol. */
+    fun isDirect(url: String): Boolean {
+        val parsed = url.toHttpUrlOrNull() ?: return false
+        return parsed.scheme == "https" && parsed.username.isEmpty() && parsed.password.isEmpty() &&
+            parsed.port == 443 && AdditionalSiteMedia.hostMatches(url, "avking.xyz") &&
+            AdditionalSiteMedia.isMedia(url) &&
+            listOf("token", "expires", "token_path").none { parsed.queryParameter(it) != null }
     }
 
     fun resolve(base: String, child: String): String {

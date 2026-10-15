@@ -49,3 +49,18 @@ test('captures site config, renews once for concurrent requests, keeps valid tok
     assert.equal(reports.length, 2);
     assert.equal(failures, 1);
 });
+
+test('normal-storage configuration starts without signed fields or token refresh', () => {
+    const reports = [];
+    const config = {cloudType: 1, m3u8Url: 'https://videocdn.avking.xyz/movie/playlist.m3u8'};
+    const scope = {URL, Date, location: {href: 'https://www.javrate.com/player/v2?payload=fixture'},
+        document: {documentElement: {}, querySelectorAll: () => []},
+        MutationObserver: class {observe() {}}, clearInterval: () => {},
+        setInterval: () => {throw new Error('Normal storage must not start a token refresh timer');},
+        fetch: () => {throw new Error('Normal storage must not request Bunny authorization');},
+        JavrateAuth: {onSource: (...args) => reports.push(args), onSubtitles: () => {}}};
+    scope.window = scope; scope.top = scope;
+    vm.runInNewContext(readFileSync(resolve(__dirname, '../app/src/main/assets/javrate-session.js'), 'utf8'), scope);
+    scope.createPlayer(config).init();
+    assert.deepEqual(reports, [[config.m3u8Url, 0]]);
+});

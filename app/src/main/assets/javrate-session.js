@@ -74,9 +74,14 @@
                     reportTracks();
                     new MutationObserver(reportTracks).observe(document.documentElement,
                         {childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'label', 'srclang']});
+                    clearInterval(timer);
+                    if (Number(config.cloudType) === 1) {
+                        JavrateAuth.onSource(new URL(config.m3u8Url, location.href).href, 0);
+                        return;
+                    }
                     report({token: config.initialToken, expires: config.initialExpires,
                         tokenPath: config.initialTokenPath});
-                    clearInterval(timer);
+                    if (Number(current.expires) * 1000 - now() < 12000) refresh();
                     timer = setInterval(function () {
                         if (!current || Number(current.expires) * 1000 - now() < 12000) refresh();
                     }, 3000);

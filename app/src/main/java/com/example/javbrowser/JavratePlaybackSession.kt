@@ -58,11 +58,12 @@ class JavratePlaybackSession(private val context: Context) {
                 handler.post { if (!closed) tracksChanged?.invoke(filtered) }
             }
             @JavascriptInterface fun onSource(url: String, remainingMs: Long) {
-                if (!JavrateStreams.isSigned(url) || remainingMs < 2000) return
+                val signed = JavrateStreams.isSigned(url)
+                if ((!signed && !JavrateStreams.isDirect(url)) || (signed && remainingMs < 2000)) return
                 synchronized(lock) {
-                    if (closed || (source != null && !JavrateStreams.sameAsset(source!!, url))) return
+                    if (closed || (source != null && source != url && !JavrateStreams.sameAsset(source!!, url))) return
                     source = url
-                    validUntil = System.nanoTime() + remainingMs.coerceAtMost(60_000) * 1_000_000
+                    validUntil = if (signed) System.nanoTime() + remainingMs.coerceAtMost(60_000) * 1_000_000 else Long.MAX_VALUE
                     lock.notifyAll()
                 }
                 handler.post {

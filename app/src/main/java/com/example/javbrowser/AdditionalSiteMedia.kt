@@ -23,7 +23,7 @@ object AdditionalSiteMedia {
             hostMatches(page, "javday.app") -> hostMatches(media, "javday.homes") || hostMatches(media, "javday.app")
             hostMatches(page, "supjav.com") -> hostMatches(referer, "fc2stream.tv") ||
                 hostMatches(referer, "supremejav.com")
-            hostMatches(page, "javrate.com") -> JavrateStreams.isSigned(media) &&
+            hostMatches(page, "javrate.com") -> (JavrateStreams.isSigned(media) || JavrateStreams.isDirect(media)) &&
                 hostMatches(referer, "javrate.com")
             else -> false
         }
