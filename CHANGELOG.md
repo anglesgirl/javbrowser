@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased — 2026-10-15
+## 1.2.0 Update — 2026-10-23
+
+### Usage Analytics and Crash Reporting
+
+- Integrate Firebase Analytics and Crashlytics, enabled automatically on startup without an in-app opt-out.
+- Count selected feature openings, internal-player attempts and actual playback starts, media errors, and download starts, completions, cancellations, and failures.
+- Restrict custom event parameters to fixed feature/outcome categories, online/offline mode, and bounded numeric media error codes. Exclude browsing content, titles, queries, cookies, and tokens.
+- Remove exception messages throughout cause and suppressed-error chains before passing Java/Kotlin fatal errors and download failures to Crashlytics, retaining exception type names and code locations.
+- Disable advertising consent, advertising ID collection, and automatic screen reporting, and disclose collection in Settings.
+- Keep the project-specific Firebase configuration local and document setup and measurement limits in `docs/telemetry.md`.
+
+## 1.2.0 Update — 2026-10-15
 
 ### JavRate Playback
 

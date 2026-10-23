@@ -64,10 +64,29 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
     private var orientationLockMode = "auto"
     @Volatile
     private var immersiveMode = false
+    private var telemetryLocal = false
+    private val telemetryStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val telemetryFailed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun beginPlaybackTelemetry() {
+        telemetryStarted.set(false)
+        telemetryFailed.set(false)
+        AppTelemetry.playerAttempt(telemetryLocal)
+    }
+
+    private fun reportPlaybackFailure(phase: AppTelemetry.PlaybackPhase, code: Int = 0) {
+        if (telemetryFailed.compareAndSet(false, true)) {
+            AppTelemetry.playerFailed(telemetryLocal, phase, code)
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val telemetryUrl = intent.getStringExtra(EXTRA_VIDEO_URL).orEmpty()
+        telemetryLocal = intent.getBooleanExtra(EXTRA_LOCAL_PLAYBACK, false) ||
+            telemetryUrl.startsWith("content://") || telemetryUrl.startsWith("file://")
+        beginPlaybackTelemetry()
 
         if (!intent.getBooleanExtra(EXTRA_LOCAL_PLAYBACK, false)) {
             PlaybackHistoryRepository.record(this, intent.getStringExtra(EXTRA_PAGE_URL).orEmpty(),
@@ -104,6 +123,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
             session.start(javratePlayer, intent.getStringExtra(EXTRA_PAGE_URL).orEmpty(), { source ->
                 if (!isFinishing && !isDestroyed) showPlayer(source, "https://www.javrate.com/", maxPictureMode)
             }, {
+                reportPlaybackFailure(AppTelemetry.PlaybackPhase.AUTHORIZATION)
                 loading.text = "無法取得播放授權，請返回網頁重新開啟影片"
             }, { tracks ->
                 subtitleTracks = tracks
@@ -113,6 +133,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
             return
         }
         val videoUrl = intent.getStringExtra(EXTRA_VIDEO_URL) ?: run {
+            reportPlaybackFailure(AppTelemetry.PlaybackPhase.STARTUP)
             finish()
             return
         }
@@ -148,6 +169,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     localVideoServer = it
                 }.playbackUrl()
             } catch (error: Exception) {
+                reportPlaybackFailure(AppTelemetry.PlaybackPhase.STARTUP)
                 android.widget.Toast.makeText(
                     this,
                     "無法啟動本地播放器：${error.message}",
@@ -320,6 +342,17 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         @Volatile private var activeDownloadName = downloadName
 
         @JavascriptInterface
+        fun playbackStarted() {
+            if (telemetryStarted.compareAndSet(false, true)) AppTelemetry.playerStarted(telemetryLocal)
+        }
+
+        @JavascriptInterface
+        fun playbackFailed(code: Int) {
+            reportPlaybackFailure(if (telemetryStarted.get()) AppTelemetry.PlaybackPhase.PLAYBACK
+                else AppTelemetry.PlaybackPhase.STARTUP, code)
+        }
+
+        @JavascriptInterface
         fun close() {
             runOnUiThread { finish() }
         }
@@ -390,6 +423,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                 .trim()
                 .ifBlank { "video" } + " - 第 $episodeNumber 集"
             PlaybackHistoryRepository.record(this@FullscreenInternalPlayerActivity, activePageUrl, activeDownloadName)
+            beginPlaybackTelemetry()
             return proxiedUrl
         }
 
@@ -407,6 +441,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
             activePageUrl = pageUrl
             activeDownloadName = downloadName.trim() + " - " + episodeTitle
             PlaybackHistoryRepository.record(this@FullscreenInternalPlayerActivity, activePageUrl, activeDownloadName)
+            beginPlaybackTelemetry()
             return proxiedUrl
         }
 
@@ -2667,7 +2702,10 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   video.addEventListener('loadstart', function(){ setStatus('開始載入'); });
                   video.addEventListener('loadedmetadata', function(){ setStatus('已載入 metadata'); });
                   video.addEventListener('canplay', function(){ setStatus('可播放'); });
-                  video.addEventListener('playing', function(){ setStatus('播放中'); updatePlay(); });
+                  video.addEventListener('playing', function(){
+                    setStatus('播放中'); updatePlay();
+                    try { AndroidPlayer.playbackStarted(); } catch (e) {}
+                  });
                   video.addEventListener('ended', function(){
                     updatePlay();
                     if (!episodeSelector || currentPlayerEpisodeIndex < 0) return;
@@ -2687,6 +2725,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   video.addEventListener('emptied', function(){ setStatus('來源清空 emptied'); });
                   video.addEventListener('error', function(){
                     var err = video.error;
+                    try { AndroidPlayer.playbackFailed(err ? err.code : 0); } catch (e) {}
                     try {
                       AndroidPlayer.log('videoError code=' + (err ? err.code : 'unknown') +
                         ' currentSrc=' + (video.currentSrc || '') +

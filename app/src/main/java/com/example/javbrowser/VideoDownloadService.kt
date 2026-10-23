@@ -149,6 +149,7 @@ class VideoDownloadService : Service() {
         if (!accepted) {
             return START_NOT_STICKY
         }
+        if (repairRecord == null) AppTelemetry.download(AppTelemetry.DownloadOutcome.STARTED)
         task.javrateLease.set(JavratePlaybackLease.acquire(intent.getStringExtra(EXTRA_JAVRATE_LEASE)))
         task.subtitleSources = intent.getStringExtra(EXTRA_SUBTITLE_SOURCES)
             ?: DownloadRepository.list(this).firstOrNull { it.id == downloadId }?.subtitleSources ?: "[]"
@@ -368,7 +369,9 @@ class VideoDownloadService : Service() {
                 currentDownloadTask().notificationId,
                 buildResultNotification("$completionMessage：${finalTarget.fileName}", finalUri)
             )
+            AppTelemetry.download(AppTelemetry.DownloadOutcome.COMPLETED)
         } catch (e: DownloadCanceledException) {
+            AppTelemetry.download(AppTelemetry.DownloadOutcome.CANCELED)
             target?.finish(false)
             DownloadRepository.update(this, downloadId) {
                 it.copy(
@@ -384,6 +387,7 @@ class VideoDownloadService : Service() {
                 buildResultNotification("下載已取消", null)
             )
         } catch (e: Exception) {
+            AppTelemetry.download(AppTelemetry.DownloadOutcome.FAILED, e)
             target?.finish(false)
             val message = e.message?.take(120) ?: "未知錯誤"
             DownloadRepository.update(this, downloadId) {

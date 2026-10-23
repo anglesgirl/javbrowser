@@ -56,6 +56,10 @@ class SettingsActivity : LocalizedActivity() {
             window.setFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE, android.view.WindowManager.LayoutParams.FLAG_SECURE)
         }
         setContentView(R.layout.activity_settings)
+        findViewById<android.widget.TextView>(R.id.tv_telemetry_notice).text = t(
+            "使用統計與閃退回報已啟用。此版本使用 Firebase 收集啟動、功能使用、播放與下載結果、裝置資訊及錯誤診斷；不傳送瀏覽網址、搜尋詞、影片名稱或播放紀錄。",
+            "Usage analytics and crash reporting are enabled. This build uses Firebase to collect launches, feature usage, playback and download results, device information, and error diagnostics. Browsing URLs, search terms, video titles, and playback history are not sent."
+        )
         findViewById<Button>(R.id.btn_playback_history).apply {
             text = t("播放紀錄", "Playback history")
             setOnClickListener { startActivity(android.content.Intent(this@SettingsActivity, PlaybackHistoryActivity::class.java)) }

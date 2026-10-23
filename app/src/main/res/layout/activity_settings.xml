@@ -713,6 +713,14 @@
         </androidx.cardview.widget.CardView>
 
         <!-- Back Button -->
+        <TextView
+            android:id="@+id/tv_telemetry_notice"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="20dp"
+            android:text="使用統計與閃退回報已啟用。此版本使用 Firebase 收集啟動、功能使用、播放與下載結果、裝置資訊及錯誤診斷；不傳送瀏覽網址、搜尋詞、影片名稱或播放紀錄。"
+            android:textColor="#AAAAAA"
+            android:textSize="13sp" />
         <Button
             android:id="@+id/btn_back"
             android:layout_width="match_parent"

@@ -160,7 +160,7 @@ The app records only the selected video references. Background execution and lon
 - Local storage for bookmarks, download records, settings, tags, and notes.
 - Traditional Chinese and English interface text based on the device language.
 
-The project does not require an analytics SDK for its core functions.
+This build includes Firebase Analytics and Crashlytics, enabled automatically at startup with no in-app opt-out. They report app engagement, feature counts, playback/download results, and crash diagnostics. Custom events exclude browsing URLs, search terms, video titles, actress names, playback history, cookies, and tokens. Advertising ID collection and advertising consent are disabled. See [Telemetry](docs/telemetry.md) for setup, event definitions, and measurement limits.
 
 ## Website Support
 
