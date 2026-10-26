@@ -158,9 +158,18 @@ class MainActivity : LocalizedActivity() {
     @Volatile private var stripchatWatchSessionActive = false
     @Volatile private var stripchatWatchSessionRecording = false
     @Volatile private var stripchatWatchSessionStarting = false
+    @Volatile private var stripchatWatchLiveState: Boolean? = null
+    @Volatile private var stripchatWatchStatusChecked = false
+    private val stripchatPlaybackProbeJs by lazy {
+        assets.open("stripchat-playback-probe.js").bufferedReader(Charsets.UTF_8).use { it.readText() }
+    }
+    private val stripchatWatchControlsJs by lazy {
+        assets.open("stripchat-watch-controls.js").bufferedReader(Charsets.UTF_8).use { it.readText() }
+    }
     private var stripchatWatchSessionUrl: String = ""
     private var stripchatWatchSessionModelKey: String = ""
     private var stripchatWatchStartRequestedAt = 0L
+    private var stripchatLastErrorToastAt = 0L
     // 只有使用者主動按 Home 鍵（真正離開 app）時才設為 true
     private var userLeftApp = false
     // 從銷售排行開啟網頁時，沒有 WebView 上一頁後返回排行頁。
@@ -1237,8 +1246,8 @@ class MainActivity : LocalizedActivity() {
                     notifyStripchatWatchState()
                     Toast.makeText(
                         this@MainActivity,
-                        if (stripchatWatchSessionRecording) "已啟用持續監錄"
-                        else "已開始等待主播公開直播",
+                        if (stripchatWatchSessionRecording) LanguageManager.text(this@MainActivity, "已啟用持續監錄", "Continuous recording enabled")
+                        else LanguageManager.text(this@MainActivity, "已啟用監錄，正在確認直播狀態", "Watch enabled; checking live status"),
                         Toast.LENGTH_SHORT,
                     ).show()
                 }
@@ -1254,6 +1263,24 @@ class MainActivity : LocalizedActivity() {
             fun isStripchatWatchSessionActive(sourceUrl: String): Boolean {
                 val modelKey = stripchatModelKey(sourceUrl) ?: return false
                 return stripchatWatchSessionActive && stripchatWatchSessionModelKey == modelKey
+            }
+
+            @android.webkit.JavascriptInterface
+            fun getStripchatWatchStateLabel(sourceUrl: String): String {
+                val active = stripchatWatchSessionActive &&
+                    stripchatModelKey(sourceUrl) == stripchatWatchSessionModelKey
+                return when (StripchatWatchState.resolve(active,
+                    stripchatWatchSessionRecording || stripchatStreamRecordingStore.isActive() ||
+                        StripchatRecordingService.isRecording,
+                    stripchatWatchSessionStarting, stripchatWatchLiveState, stripchatWatchStatusChecked)) {
+                    StripchatWatchState.INACTIVE -> LanguageManager.text(this@MainActivity, "◎ 監錄", "Watch and record")
+                    StripchatWatchState.RECORDING -> LanguageManager.text(this@MainActivity, "■ 停止監錄", "Stop recording")
+                    StripchatWatchState.STARTING -> LanguageManager.text(this@MainActivity, "◌ 正在啟動監錄", "Starting recording")
+                    StripchatWatchState.LIVE_RETRY -> LanguageManager.text(this@MainActivity, "◌ 直播中，重試錄製", "Live; retrying recording")
+                    StripchatWatchState.WAITING -> LanguageManager.text(this@MainActivity, "◌ 等待公開直播", "Waiting for public broadcast")
+                    StripchatWatchState.CHECKING -> LanguageManager.text(this@MainActivity, "◌ 正在確認直播狀態", "Checking live status")
+                    StripchatWatchState.UNKNOWN -> LanguageManager.text(this@MainActivity, "◌ 狀態無法確認，重試中", "Status unavailable; retrying")
+                }
             }
 
             @android.webkit.JavascriptInterface
@@ -1287,6 +1314,22 @@ class MainActivity : LocalizedActivity() {
             }
 
             @android.webkit.JavascriptInterface
+            fun onStripchatRecordingError(stage: String, detail: String) {
+                val safeStage = stage.takeIf { it in setOf("capability", "source", "canvas", "storage", "recorder", "start", "write", "overlay") }
+                    ?: "recording"
+                val safeDetail = detail.replace(Regex("https?://[^\\s\"<>]+"), "[URL]").take(240)
+                android.util.Log.e("STRIPCHAT_RECORD_ERROR", "stage=$safeStage detail=$safeDetail")
+                runOnUiThread {
+                    val now = System.currentTimeMillis()
+                    if (now - stripchatLastErrorToastAt >= 30_000L) {
+                        stripchatLastErrorToastAt = now
+                        Toast.makeText(this@MainActivity, LanguageManager.text(this@MainActivity,
+                            "錄製失敗：$safeDetail", "Recording failed: $safeDetail"), Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+
+            @android.webkit.JavascriptInterface
             fun onStripchatLocationChanged(url: String) {
                 runOnUiThread {
                     if (stripchatModelKey(url) == null) return@runOnUiThread
@@ -1295,6 +1338,7 @@ class MainActivity : LocalizedActivity() {
                     // Stripchat 是 SPA；先清空上一位主播的狀態，再查目前主播。
                     btnAddFavorite.text = "♡"
                     updateFavoriteIcon(url)
+                    injectStripchatWatchButton(webView, url)
                 }
             }
             
@@ -1893,6 +1937,7 @@ class MainActivity : LocalizedActivity() {
                     view?.evaluateJavascript(javrateAdLayoutHook, null)
                 }
                 injectCrossSiteSearchButtons(view, url)
+                injectStripchatWatchButton(view, url)
             }
 
             override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
@@ -1904,6 +1949,7 @@ class MainActivity : LocalizedActivity() {
                     rememberStripchatModelUrl(url)
                     btnAddFavorite.text = "♡"
                     updateFavoriteIcon(url)
+                    injectStripchatWatchButton(view, url)
                 }
                 if (url != null && isRouVideoUrl(url) && url != currentPageUrl) {
                     currentPageUrl = url
@@ -3423,70 +3469,9 @@ class MainActivity : LocalizedActivity() {
 
     private fun injectStripchatWatchButton(view: WebView?, pageUrl: String?) {
         if (view == null || stripchatModelKey(pageUrl.orEmpty()) == null) return
-        view.evaluateJavascript(
-            """
-            (function() {
-                var existing = document.getElementById('jav-stripchat-watch-button');
-                if (existing) return;
-                var button = document.createElement('button');
-                button.id = 'jav-stripchat-watch-button';
-                button.style.cssText = [
-                    'position:fixed',
-                    'right:12px',
-                    'top:92px',
-                    'z-index:2147483000',
-                    'border:1px solid rgba(255,255,255,.5)',
-                    'border-radius:18px',
-                    'padding:8px 13px',
-                    'font-size:13px',
-                    'font-weight:700',
-                    'color:#fff',
-                    'background:rgba(20,20,20,.92)',
-                    'box-shadow:0 2px 8px rgba(0,0,0,.45)'
-                ].join(';');
-                function refresh() {
-                    var active = false;
-                    var recording = false;
-                    try {
-                        active = Android.isStripchatWatchSessionActive(location.href);
-                        recording = Android.isStripchatStreamRecording() || Android.isStripchatRecording();
-                    } catch (e) {}
-                    button.textContent = active
-                        ? (recording ? '■ 停止監錄' : '◌ 等待開播')
-                        : '◎ 監錄';
-                    button.style.background = active
-                        ? (recording ? 'rgba(145,18,34,.94)' : 'rgba(176,108,0,.94)')
-                        : 'rgba(20,20,20,.92)';
-                }
-                button.onclick = function(event) {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    try {
-                        if (Android.isStripchatWatchSessionActive(location.href)) {
-                            Android.stopStripchatWatchSession();
-                        } else {
-                            Android.beginStripchatWatchSession(location.href);
-                        }
-                    } catch (e) {}
-                    setTimeout(refresh, 120);
-                };
-                document.body.appendChild(button);
-                var privacyButton = document.createElement('button');
-                privacyButton.id = 'jav-stripchat-watch-privacy-button';
-                privacyButton.textContent = '◼ 隱私';
-                privacyButton.style.cssText = button.style.cssText + ';top:136px;background:rgba(5,5,5,.94)';
-                privacyButton.onclick = function(event) {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    try { Android.enterStripchatPrivacyMode(); } catch (e) {}
-                };
-                document.body.appendChild(privacyButton);
-                window.__javRefreshStripchatWatchUi = refresh;
-                refresh();
-            })();
-            """.trimIndent(),
-            null,
-        )
+        view.evaluateJavascript(stripchatWatchControlsJs) { result ->
+            android.util.Log.i("STRIPCHAT_WATCH_UI", "control mount=$result")
+        }
     }
 
     private fun originForUrl(url: String): String? {
@@ -4228,7 +4213,8 @@ class MainActivity : LocalizedActivity() {
         if (!url.contains("stripchat.com", ignoreCase = true)) return null
         val parsed = runCatching { Uri.parse(url) }.getOrNull() ?: return null
         val host = parsed.host.orEmpty()
-        if (!host.endsWith("stripchat.com", ignoreCase = true)) return null
+        if (!host.equals("stripchat.com", ignoreCase = true) &&
+            !host.endsWith(".stripchat.com", ignoreCase = true)) return null
         val path = parsed.path.orEmpty().trim('/')
         if (path.isBlank() || path.contains('/')) return null
         if (path.lowercase() in setOf(
@@ -4455,14 +4441,18 @@ class MainActivity : LocalizedActivity() {
                 (function() {
                     var targetUrl = $videoUrlJson;
                     var reusePageVideo = $reusePageVideoJs;
+                    $stripchatPlaybackProbeJs
                     var shortSeekSeconds = $shortSeekSeconds;
                     var longSeekSeconds = $longSeekSeconds;
                     var speedOptions = $speedOptionsJson;
                     var oldPanel = document.getElementById('jav-internal-player-panel');
+                    if (reusePageVideo && oldPanel &&
+                        oldPanel.getAttribute('data-jav-model-url') === location.href &&
+                        typeof window.__javStartStripchatDirectRecording === 'function') return 'overlay-ready';
                     if (oldPanel) oldPanel.remove();
 
                     var video = reusePageVideo
-                        ? document.querySelector('video.video-element, video')
+                        ? window.__javStripchatPlaybackProbe.selectVideo()
                         : document.createElement('video');
                     if (!video) return 'stripchat-video-not-ready';
                     var originalParent = reusePageVideo ? video.parentNode : null;
@@ -4471,6 +4461,7 @@ class MainActivity : LocalizedActivity() {
 
                     var panel = document.createElement('div');
                     panel.id = 'jav-internal-player-panel';
+                    panel.setAttribute('data-jav-model-url', location.href);
                     panel.style.cssText = [
                         'position:fixed',
                         'left:0',
@@ -4569,9 +4560,8 @@ class MainActivity : LocalizedActivity() {
                     function setRecordingState(active) {
                         var watching = false;
                         try { watching = Android.isStripchatWatchSessionActive(location.href); } catch (e) {}
-                        record.textContent = active
-                            ? '■ 停止監錄'
-                            : (watching ? '◌ 等待開播' : '◎ 監錄');
+                        try { record.textContent = Android.getStripchatWatchStateLabel(location.href); }
+                        catch (e) { record.textContent = watching ? '◌ 正在確認直播狀態' : '◎ 監錄'; }
                         record.style.background = active
                             ? 'rgba(110,15,25,.94)'
                             : (watching ? 'rgba(176,108,0,.94)' : 'rgba(210,25,45,.92)');
@@ -4617,14 +4607,28 @@ class MainActivity : LocalizedActivity() {
                     };
 
                     function startDirectRecording() {
+                        var storeOpened = false;
+                        var recordingStage = 'capability';
+                        function reportRecordingError(stage, detail) {
+                            try { Android.onStripchatRecordingError(stage, detail); } catch (_) {}
+                        }
                         try {
                             var capture = video.captureStream || video.mozCaptureStream;
                             var canvas = document.createElement('canvas');
                             if (!capture || typeof canvas.captureStream !== 'function' ||
-                                typeof MediaRecorder === 'undefined') return false;
+                                typeof MediaRecorder === 'undefined') {
+                                reportRecordingError('capability', 'This WebView does not support live media capture');
+                                return false;
+                            }
 
+                            recordingStage = 'source';
                             directSourceStream = capture.call(video);
-                            if (!directSourceStream || directSourceStream.getVideoTracks().length === 0) return false;
+                            if (!directSourceStream || directSourceStream.getVideoTracks().length === 0) {
+                                if (directSourceStream) directSourceStream.getTracks().forEach(function(track){ track.stop(); });
+                                directSourceStream = null;
+                                reportRecordingError('source', 'No live video track is available; start the webpage video first');
+                                return false;
+                            }
                             var fixedWidth = Math.max(2, video.videoWidth || 720);
                             var fixedHeight = Math.max(2, video.videoHeight || 1280);
                             fixedWidth -= fixedWidth % 2;
@@ -4632,7 +4636,13 @@ class MainActivity : LocalizedActivity() {
                             canvas.width = fixedWidth;
                             canvas.height = fixedHeight;
                             var context2d = canvas.getContext('2d', { alpha: false });
-                            if (!context2d) return false;
+                            if (!context2d) {
+                                directSourceStream.getTracks().forEach(function(track){ track.stop(); });
+                                directSourceStream = null;
+                                reportRecordingError('canvas', 'Unable to create the recording canvas');
+                                return false;
+                            }
+                            recordingStage = 'canvas';
 
                             function scheduleNextVideoFrame() {
                                 if (typeof video.requestVideoFrameCallback === 'function') {
@@ -4710,9 +4720,11 @@ class MainActivity : LocalizedActivity() {
                                 audioBitsPerSecond: 128000
                             };
                             if (mime) options.mimeType = mime;
+                            recordingStage = 'recorder';
                             directRecorder = new MediaRecorder(mediaStream, options);
                             var actualMime = directRecorder.mimeType || mime || 'video/webm';
                             var sourceUrl = location.href;
+                            recordingStage = 'storage';
                             var accepted = Android.beginStripchatStreamRecording(
                                 actualMime,
                                 sourceUrl,
@@ -4725,8 +4737,10 @@ class MainActivity : LocalizedActivity() {
                                 stopDirectFramePump();
                                 directCanvasStream = null;
                                 directSourceStream = null;
+                                reportRecordingError('storage', 'Unable to create the recording file, or another recording is active');
                                 return false;
                             }
+                            storeOpened = true;
 
                             directRecordingFailed = false;
                             directChunkChain = Promise.resolve();
@@ -4737,15 +4751,21 @@ class MainActivity : LocalizedActivity() {
                                     return blob.arrayBuffer();
                                 }).then(function(buffer) {
                                     if (!Android.appendStripchatStreamRecordingChunk(arrayBufferToBase64(buffer))) {
+                                        if (!directRecordingFailed) reportRecordingError('write', 'Unable to write recorded media data');
                                         directRecordingFailed = true;
+                                        stopDirectRecording('Unable to write recorded media data');
                                     }
-                                }).catch(function() {
+                                }).catch(function(error) {
+                                    if (!directRecordingFailed) reportRecordingError('write', error && error.message ? error.message : 'Unable to prepare recorded media data');
                                     directRecordingFailed = true;
+                                    stopDirectRecording('Unable to prepare recorded media data');
                                 });
                             };
                             directRecorder.onerror = function(event) {
                                 directRecordingFailed = true;
                                 var error = event && event.error;
+                                directStopDetail = error && error.message ? error.message : 'Browser media recorder failed';
+                                reportRecordingError('recorder', directStopDetail);
                                 if (directRecorder && directRecorder.state !== 'inactive') {
                                     try { directRecorder.stop(); } catch (e) {}
                                 } else {
@@ -4763,6 +4783,7 @@ class MainActivity : LocalizedActivity() {
                                 directCanvasStream = null;
                                 directSourceStream = null;
                             };
+                            recordingStage = 'start';
                             directRecorder.start(2000);
                             video.addEventListener('ended', function() {
                                 try { Android.onStripchatRecordingHealth('source video ended'); } catch (e) {}
@@ -4770,12 +4791,18 @@ class MainActivity : LocalizedActivity() {
                             setRecordingState(true);
                             return true;
                         } catch (e) {
+                            var failure = (e && e.name ? e.name + ': ' : '') +
+                                (e && e.message ? e.message : 'Unable to start recording');
+                            reportRecordingError(recordingStage, failure);
                             stopDirectFramePump();
                             if (directCanvasStream) directCanvasStream.getTracks().forEach(function(track){ track.stop(); });
                             if (directSourceStream) directSourceStream.getTracks().forEach(function(track){ track.stop(); });
                             directCanvasStream = null;
                             directSourceStream = null;
                             directRecorder = null;
+                            if (storeOpened) {
+                                try { Android.finishStripchatStreamRecording(false, failure); } catch (_) {}
+                            }
                             return false;
                         }
                     }
@@ -5026,7 +5053,22 @@ class MainActivity : LocalizedActivity() {
                 """.trimIndent()
             ) { result ->
                 android.util.Log.d("InternalPlayback", "result=$result url=${webView.url}")
-                Toast.makeText(this, "內建播放嘗試：$result", Toast.LENGTH_SHORT).show()
+                val overlayResult = runCatching { org.json.JSONTokener(result).nextValue() as? String }.getOrNull().orEmpty()
+                if (overlayResult != "overlay-ready" && !overlayResult.startsWith("overlay-injected:")) {
+                    val detail = if (overlayResult == "stripchat-video-not-ready") {
+                        LanguageManager.text(this, "找不到可播放的直播畫面，請先啟動網頁影片", "No live player found; start the webpage video first")
+                    } else LanguageManager.text(this, "無法準備播放介面，請重新開啟影片", "Unable to prepare the player; reopen the video")
+                    android.util.Log.w("STRIPCHAT_RECORD_ERROR", "stage=overlay result=" +
+                        overlayResult.replace(Regex("https?://[^\\s\"<>]+"), "[URL]").take(200))
+                    Toast.makeText(this, detail, Toast.LENGTH_LONG).show()
+                    if (reusePageVideo && stripchatWatchSessionActive) {
+                        stripchatWatchSessionStarting = false
+                        stripchatWatchStartRequestedAt = 0L
+                        notifyStripchatWatchState()
+                        scheduleStripchatRecordingStatusCheck(20_000L)
+                    }
+                    return@evaluateJavascript
+                }
                 if (reusePageVideo && stripchatWatchSessionActive &&
                     !stripchatStreamRecordingStore.isActive()
                 ) {
@@ -5368,6 +5410,8 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun startStripchatRecordingStatusMonitor(sourceUrl: String) {
+        stripchatWatchLiveState = null
+        stripchatWatchStatusChecked = false
         stripchatRecordingStatusUrl = sourceUrl
         stripchatRecordingModelId = 0L
         stripchatOfflineConfirmations = 0
@@ -5380,6 +5424,8 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun stopStripchatRecordingStatusMonitor() {
+        stripchatWatchLiveState = null
+        stripchatWatchStatusChecked = false
         stripchatRecordingStatusGeneration.incrementAndGet()
         stripchatRecordingStatusRunnable?.let(stripchatRecordingStatusHandler::removeCallbacks)
         stripchatRecordingStatusRunnable = null
@@ -5423,7 +5469,16 @@ class MainActivity : LocalizedActivity() {
             val isLive = fetchStripchatRecordingLiveState(username, sourceUrl, cookie)
             runOnUiThread {
                 if (generation != stripchatRecordingStatusGeneration.get()) return@runOnUiThread
+                fun applyState(isLive: Boolean?, pageLive: Boolean = false) {
+                if (generation != stripchatRecordingStatusGeneration.get() || isDestroyed) return
                 stripchatRecordingStatusCheckInFlight.set(false)
+                stripchatWatchLiveState = isLive
+                stripchatWatchStatusChecked = true
+                if (stripchatWatchSessionStarting &&
+                    System.currentTimeMillis() - stripchatWatchStartRequestedAt >= 35_000L) {
+                    stripchatWatchSessionStarting = false
+                    stripchatWatchStartRequestedAt = 0L
+                }
                 val recordingActive = stripchatStreamRecordingStore.isActive() ||
                     StripchatRecordingService.isRecording
                 when (isLive) {
@@ -5438,7 +5493,7 @@ class MainActivity : LocalizedActivity() {
                                 stripchatWatchSessionStarting = false
                                 stripchatWatchStartRequestedAt = 0L
                             }
-                            startStripchatWatchRecordingIfReady()
+                            startStripchatWatchRecordingIfReady(pageLive)
                         }
                     }
                     false -> {
@@ -5462,23 +5517,45 @@ class MainActivity : LocalizedActivity() {
                             notifyStripchatWatchState()
                         }
                     }
-                    null -> android.util.Log.w(
-                        "STRIPCHAT_RECORD_STATUS",
-                        "$username status unknown; keeping recording",
-                    )
+                    null -> {
+                        stripchatOfflineConfirmations = 0
+                        stripchatLastOfflineConfirmationAt = 0L
+                        android.util.Log.w("STRIPCHAT_RECORD_STATUS", "$username status unknown; keeping recording")
+                    }
                 }
+                notifyStripchatWatchState()
                 if (recordingActive && stripchatOfflineConfirmations >= 3) {
                     autoStopStripchatRecording("公開直播已結束（下播或私人秀），自動停止錄製")
                 } else {
                     val nextDelay = when {
                         recordingActive -> 15_000L
                         stripchatWatchSessionActive && stripchatWatchSessionStarting -> 20_000L
+                        isLive == null -> 15_000L
                         stripchatWatchSessionActive -> 60_000L
                         else -> 15_000L
                     }
                     scheduleStripchatRecordingStatusCheck(nextDelay)
                 }
+                }
+                if (isLive == false) applyState(false)
+                else probeStripchatPagePlayback(sourceUrl) { pageLive ->
+                    applyState(isLive ?: true.takeIf { pageLive }, pageLive)
+                }
             }
+        }
+    }
+
+    private fun probeStripchatPagePlayback(sourceUrl: String, callback: (Boolean) -> Unit) {
+        val expectedKey = stripchatModelKey(sourceUrl)
+        fun samePage() = expectedKey != null && !isDestroyed &&
+            stripchatModelKey(webView.url.orEmpty()) == expectedKey
+        if (!samePage()) { callback(false); return }
+        val sample = "window.__javStripchatPlaybackProbe.sample(${org.json.JSONObject.quote(sourceUrl)})"
+        webView.evaluateJavascript(stripchatPlaybackProbeJs + "\n" + sample) {
+            webView.postDelayed({
+                if (!samePage()) { callback(false); return@postDelayed }
+                webView.evaluateJavascript(sample) { value -> callback(samePage() && value == "true") }
+            }, 1_250L)
         }
     }
 
@@ -5559,7 +5636,7 @@ class MainActivity : LocalizedActivity() {
         return parsed.buildUpon().clearQuery().fragment(null).build().toString().trimEnd('/')
     }
 
-    private fun startStripchatWatchRecordingIfReady() {
+    private fun startStripchatWatchRecordingIfReady(reusePlayingPage: Boolean = false) {
         if (!stripchatWatchSessionActive || stripchatWatchSessionRecording) return
         if (stripchatStreamRecordingStore.isActive() || StripchatRecordingService.isRecording) return
         if (stripchatWatchSessionStarting) return
@@ -5569,6 +5646,10 @@ class MainActivity : LocalizedActivity() {
 
         val currentUrl = webView.url ?: currentPageUrl
         val currentKey = stripchatModelKey(currentUrl)
+        if (reusePlayingPage && currentKey == stripchatWatchSessionModelKey) {
+            playInsideCurrentWebView(currentVideoUrl.orEmpty(), reusePageVideo = true)
+            return
+        }
         currentVideoUrl = null
         currentVideoReferer = originForUrl(stripchatWatchSessionUrl)
         if (currentKey == stripchatWatchSessionModelKey) {

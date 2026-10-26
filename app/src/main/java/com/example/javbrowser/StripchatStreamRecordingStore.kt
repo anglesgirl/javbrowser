@@ -64,6 +64,7 @@ class StripchatStreamRecordingStore(private val context: Context) {
                     )
                 }
             }
+            android.util.Log.i("StripchatRecorder", "recording storage ready mime=$normalizedMime width=$width height=$height")
             true
         } catch (e: Exception) {
             android.util.Log.e("StripchatRecorder", "direct recording begin failed", e)
@@ -78,6 +79,9 @@ class StripchatStreamRecordingStore(private val context: Context) {
         return try {
             val bytes = Base64.decode(base64, Base64.DEFAULT)
             stream.write(bytes)
+            if (bytesWritten == 0L && bytes.isNotEmpty()) {
+                android.util.Log.i("StripchatRecorder", "first media chunk written bytes=${bytes.size}")
+            }
             bytesWritten += bytes.size
             true
         } catch (e: Exception) {
@@ -158,6 +162,7 @@ class StripchatStreamRecordingStore(private val context: Context) {
             message = detail.ifBlank { "錄製失敗或沒有影音資料" }
         }
 
+        android.util.Log.i("StripchatRecorder", "recording finalized completed=$completed bytes=$bytesWritten durationMs=$recordedDurationMs")
         outputUri = null
         recordId = null
         fileName = ""

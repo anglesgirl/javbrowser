@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.0 Update - 2026-10-27
+
+### Stripchat Watch Status
+
+- Separate unavailable status checks from confirmed offline/public-broadcast waiting states in both watch controls. Show recording startup and retry states explicitly.
+- When the status API is unavailable, confirm an advancing, infinite-duration video in the current model's main player using two samples. Reject paused/stalled players, finite previews, other model pages, and stale model overlays.
+- Reuse an already playing model video when starting recording instead of reloading the page. Retain explicit offline/private API results as higher-priority restrictions.
+- Retry unknown status checks after 15 seconds, expire stuck recording-start attempts, and reset offline confirmations after unknown results.
+- Mount the floating watch controls when the page becomes visible and during SPA model navigation. Restore controls removed by a site rerender, including localized Stripchat domains and delayed body creation.
+- Remove the raw internal-player debug toast that displayed successful `overlay-ready`/`overlay-injected` responses as a confusing popup. Report actual capture, encoder, and file-write failures with explicit diagnostic stages instead.
+- Close native recording storage when encoder startup fails after creating the file, and stop recording after chunk-write failure instead of retaining a misleading active state.
+- Eight JavaScript playback/control/recorder-failure tests and two Kotlin watch-state tests passed. The debug APK compiled and was replacement-installed on the development phone.
+- Direct device inspection confirmed advancing playback and a growing recording file. A 149.12-second MP4 (74,342,660 bytes) contained H.264 video at 1280 x 720 and AAC audio, decoded successfully, and had strictly increasing packet decode timestamps in both tracks. The latest installation logged storage creation and the first written chunk, and its active recording file continued to grow. Automatic offline/reconnect transitions remain unverified.
+
 ## 1.2.0 Update — 2026-10-23
 
 ### Usage Analytics and Crash Reporting
