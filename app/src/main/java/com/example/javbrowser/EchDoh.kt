@@ -47,15 +47,15 @@ object EchDoh {
     private const val SVC_PARAM_ECH = 5
     private const val MAX_CHAIN_HOPS = 2
 
-    private data class DohEndpoint(val url: String, val pinnedIps: List<String>)
+    private data class DohEndpoint(val name: String, val url: String, val pinnedIps: List<String>)
 
     // Ali + 360 only. Pinned IPs are the providers' anycast / documented
     // addresses; OkHttp still verifies the certificate against the DoH
     // hostname, and SNI is the hostname (OkHttp passes the URL host to
     // createSocket), so dialing a pinned IP does not weaken TLS.
     private val ENDPOINTS = listOf(
-        DohEndpoint("https://dns.alidns.com/dns-query", listOf("223.5.5.5", "223.6.6.6")),
-        DohEndpoint("https://doh.360.cn/dns-query", listOf("101.198.193.29", "101.198.192.33")),
+        DohEndpoint("Ali", "https://dns.alidns.com/dns-query", listOf("223.5.5.5", "223.6.6.6")),
+        DohEndpoint("360", "https://doh.360.cn/dns-query", listOf("101.198.193.29", "101.198.192.33")),
     )
 
     private val pinnedByHost: Map<String, List<String>> = ENDPOINTS.associate { endpoint ->
@@ -82,6 +82,8 @@ object EchDoh {
         val addresses: List<InetAddress>,
         val echConfigList: ByteArray?,
         val resolvedViaDoh: Boolean,
+        /** DoH endpoint that provided this record: "Ali" / "360" / "Ali+360" (merged) / "" (not via DoH). */
+        val dohSource: String = "",
     )
 
     private class CacheEntry(val records: HostRecords, val expiresAtMs: Long)
@@ -92,59 +94,197 @@ object EchDoh {
     /** ECHConfigList bytes for [host], or null when the host publishes none. */
     fun configFor(host: String): ByteArray? = resolve(host).echConfigList
 
+    /**
+     * DoH endpoint that provided the cached record for [host] ("Ali" /
+     * "360" / "Ali+360"), or "" when nothing is cached. Cache-only read:
+     * never triggers network, so transport logging can use it freely.
+     */
+    fun sourceFor(host: String): String = cache[host.lowercase()]?.records?.dohSource ?: ""
+
     fun invalidate(host: String) {
         cache.remove(host.lowercase())
     }
 
+    /** Host whose HTTPS record carries the shared Cloudflare ECH config. */
+    private const val SHARED_ECH_HOST = "anglesya.win"
+
+    // Published Cloudflare edge ranges (cloudflare.com/ips). Only used
+    // to decide whether the shared Cloudflare ECH config may apply to a
+    // host whose own ech is unavailable from every resolver. Literals
+    // only: InetAddress.getByName parses them without touching DNS.
+    private val CLOUDFLARE_RANGES: List<Pair<ByteArray, Int>> =
+        listOf(
+            "173.245.48.0" to 20, "103.21.244.0" to 22, "103.22.200.0" to 22,
+            "103.31.4.0" to 22, "141.101.64.0" to 18, "108.162.192.0" to 18,
+            "190.93.240.0" to 20, "188.114.96.0" to 20, "197.234.240.0" to 22,
+            "198.41.128.0" to 17, "162.158.0.0" to 15, "104.16.0.0" to 13,
+            "104.24.0.0" to 14, "172.64.0.0" to 13, "131.0.72.0" to 22,
+            "2400:cb00::" to 32, "2606:4700::" to 32, "2803:f800::" to 32,
+            "2405:8100::" to 32, "2405:b500::" to 32, "2a06:98c0::" to 29,
+            "2c0f:f248::" to 32,
+        ).map { (network, bits) -> InetAddress.getByName(network).address to bits }
+
+    private fun isCloudflareIp(addr: InetAddress): Boolean {
+        val bytes = addr.address
+        return CLOUDFLARE_RANGES.any { (network, bits) ->
+            network.size == bytes.size && prefixMatches(bytes, network, bits)
+        }
+    }
+
+    private fun prefixMatches(addr: ByteArray, network: ByteArray, bits: Int): Boolean {
+        var remaining = bits
+        var i = 0
+        while (remaining > 0) {
+            val take = minOf(8, remaining)
+            val mask = (0xFF shl (8 - take)) and 0xFF
+            if ((addr[i].toInt() and mask) != (network[i].toInt() and mask)) return false
+            remaining -= take
+            i++
+        }
+        return true
+    }
+
+    /**
+     * Resolves [host] through Ali first, then 360. A valid answer is
+     * adopted immediately when it carries an ech config (the common
+     * case: no second query). When a valid answer has NO ech, the next
+     * endpoint's HTTPS record alone is asked before concluding "no
+     * config": resolvers can disagree on the ech SvcParam for the same
+     * host (missav.ws: Ali silent, 360 answers), and the first
+     * endpoint's silence must not veto the second's answer. The merge
+     * keeps the first endpoint's addresses and supplements only the
+     * ech: ECH configs are published per zone, not per resolver, so
+     * the site's own ech from the second endpoint is valid for the
+     * first endpoint's addresses. Only the missing-ech case pays the
+     * extra HTTPS query; the full A/AAAA round is never repeated.
+     *
+     * Last resort, after every endpoint's HTTPS record lacks ech: if
+     * the site's dial addresses are Cloudflare edge IPs, fetch the
+     * shared Cloudflare ECH config live from [SHARED_ECH_HOST]'s HTTPS
+     * record (verified identical across Cloudflare-fronted hosts; a
+     * differing key is a rotation generation, not a different model).
+     * The shared value is fetched on every cache miss, never hardcoded
+     * into the code, because keys rotate. A rejected handshake still
+     * fails closed; this never falls back to plaintext.
+     */
     fun resolve(host: String): HostRecords {
         val key = host.lowercase()
         cache[key]?.let { if (System.currentTimeMillis() < it.expiresAtMs) return it.records }
         for (endpoint in ENDPOINTS) {
             try {
                 val (records, minTtl) = resolveFromEndpoint(endpoint, host)
-                if (records.resolvedViaDoh) {
-                    val ttlMs = when {
-                        records.echConfigList == null && records.addresses.isEmpty() -> 60_000L
-                        else -> minTtl.coerceIn(30, 600) * 1000
-                    }
-                    cache[key] = CacheEntry(records, System.currentTimeMillis() + ttlMs)
-                    Log.d(
-                        TAG,
-                        "resolved $host via ${endpoint.url}: " +
-                            "addrs=${records.addresses.size} ech=${records.echConfigList?.size ?: 0}B",
-                    )
+                if (!records.resolvedViaDoh) continue
+                if (records.echConfigList != null) {
+                    cacheResolved(key, records, minTtl)
                     return records
                 }
+                for (next in ENDPOINTS) {
+                    if (next == endpoint) continue
+                    try {
+                        val (ech, echTtl, _) = echFromEndpoint(next, host)
+                        if (ech != null) {
+                            val merged = HostRecords(
+                                records.addresses, ech, true,
+                                "${records.dohSource}+${next.name}",
+                            )
+                            cacheResolved(key, merged, minOf(minTtl, echTtl))
+                            Log.d(
+                                TAG,
+                                "resolved $host: addresses via ${endpoint.name}, " +
+                                    "ech via ${next.name}",
+                            )
+                            return merged
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "DoH HTTPS ech lookup via ${next.url} failed for $host: ${e.message}")
+                    }
+                }
+                // Last resort: shared Cloudflare ECH config. Only when
+                // the site's own ech is missing from every endpoint AND
+                // its dial addresses are Cloudflare edge IPs. Fetched
+                // live from anglesya.win's HTTPS record on every cache
+                // miss — never hardcoded, because keys rotate. A
+                // rejected handshake still fails closed.
+                if (records.addresses.any { isCloudflareIp(it) }) {
+                    for (sharedEndpoint in ENDPOINTS) {
+                        try {
+                            val (sharedEch, sharedTtl, _) = echFromEndpoint(sharedEndpoint, SHARED_ECH_HOST)
+                            if (sharedEch != null) {
+                                val merged = HostRecords(
+                                    records.addresses, sharedEch, true,
+                                    "${records.dohSource}+共享",
+                                )
+                                cacheResolved(key, merged, minOf(minTtl, sharedTtl))
+                                Log.d(
+                                    TAG,
+                                    "resolved $host: no own ech, using shared Cloudflare ech " +
+                                        "via ${sharedEndpoint.name}",
+                                )
+                                return merged
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "shared ech lookup via ${sharedEndpoint.url} failed for $host: ${e.message}")
+                        }
+                    }
+                }
+                // No endpoint had ech and no shared config applied: the first valid record stands.
+                cacheResolved(key, records, minTtl)
+                return records
             } catch (e: Exception) {
                 Log.w(TAG, "DoH via ${endpoint.url} failed for $host: ${e.message}")
             }
         }
-        val empty = HostRecords(emptyList(), null, false)
+        val empty = HostRecords(emptyList(), null, false, "")
         cache[key] = CacheEntry(empty, System.currentTimeMillis() + 30_000L)
         return empty
     }
 
-    private fun resolveFromEndpoint(endpoint: DohEndpoint, host: String): Pair<HostRecords, Long> {
-        var ech: ByteArray? = null
-        val collected = mutableListOf<InetAddress>()
+    private fun cacheResolved(key: String, records: HostRecords, minTtl: Long) {
+        val ttlMs = when {
+            records.echConfigList == null && records.addresses.isEmpty() -> 60_000L
+            else -> minTtl.coerceIn(30, 600) * 1000
+        }
+        cache[key] = CacheEntry(records, System.currentTimeMillis() + ttlMs)
+        Log.d(
+            TAG,
+            "resolved $key via ${records.dohSource}: " +
+                "addrs=${records.addresses.size} ech=${records.echConfigList?.size ?: 0}B",
+        )
+    }
+
+    /**
+     * HTTPS-chain-only lookup: the ech SvcParam for [host] from one
+     * endpoint, following AliasMode/CNAME chains. Returns the ech
+     * bytes (or null), the smallest TTL seen, and whether any HTTPS
+     * query answered. Throws on transport/parse failure like [query].
+     */
+    private fun echFromEndpoint(endpoint: DohEndpoint, host: String): Triple<ByteArray?, Long, Boolean> {
+        var name = host
         var minTtl = 300L
         var dohOk = false
-        // HTTPS chain: ServiceMode records carry the ech param directly;
-        // AliasMode (priority 0) and plain CNAMEs point at the next name.
-        var name = host
         for (hop in 0..MAX_CHAIN_HOPS) {
             val msg = query(endpoint, name, TYPE_HTTPS) ?: break
             dohOk = true
             minTtl = minOf(minTtl, msg.minTtlSeconds)
-            if (msg.echConfigList != null) {
-                ech = msg.echConfigList
-                break
-            }
+            if (msg.echConfigList != null) return Triple(msg.echConfigList, minTtl, dohOk)
             val next = msg.aliasTarget ?: msg.cnameTarget ?: break
             if (next.equals(name, ignoreCase = true)) break
             name = next
         }
+        return Triple(null, minTtl, dohOk)
+    }
+
+    private fun resolveFromEndpoint(endpoint: DohEndpoint, host: String): Pair<HostRecords, Long> {
+        var minTtl = 300L
+        var dohOk = false
+        // HTTPS chain via the shared helper: ServiceMode records carry
+        // the ech param directly; AliasMode (priority 0) and plain
+        // CNAMEs point at the next name.
+        val (ech, httpsTtl, httpsOk) = echFromEndpoint(endpoint, host)
+        minTtl = minOf(minTtl, httpsTtl)
+        dohOk = dohOk || httpsOk
         // Address chains (A and AAAA are independent CNAME chains).
+        val collected = mutableListOf<InetAddress>()
         for (qtype in intArrayOf(TYPE_A, TYPE_AAAA)) {
             var addrName = host
             for (hop in 0..MAX_CHAIN_HOPS) {
@@ -164,6 +304,7 @@ object EchDoh {
             addresses = collected.sortedBy { it.address.size },
             echConfigList = ech,
             resolvedViaDoh = dohOk,
+            dohSource = endpoint.name,
         )
         return records to minTtl
     }

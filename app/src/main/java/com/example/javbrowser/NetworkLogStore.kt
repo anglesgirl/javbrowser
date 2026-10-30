@@ -25,6 +25,8 @@ data class NetworkLogEntry(
     val hasEchConfig: Boolean,
     val negotiated: String?, // Cronet negotiated protocol ("h3"/"h2"/"http/1.1"), null otherwise
     val error: String?, // null = success
+    /** DoH endpoint that provided the record ("Ali" / "360" / "Ali+360"), "" when unknown. */
+    val dohSource: String = "",
 )
 
 object NetworkLogStore {
@@ -68,9 +70,11 @@ object NetworkLogStore {
         SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(java.util.Date(timeMs))
 
     fun formatEntry(e: NetworkLogEntry): String {
+        val configPart = if (e.hasEchConfig) "有 ECH 設定" else "無 ECH 設定"
+        val sourcePart = e.dohSource.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""
         val base = "${formatTime(e.timeMs)} ${e.host} ${e.route}" +
             (e.negotiated?.let { " $it" } ?: "") +
-            if (e.hasEchConfig) "（有 ECH 設定）" else "（無 ECH 設定）"
+            "（$configPart$sourcePart）"
         return if (e.error == null) "$base 成功" else "$base 失敗：${e.error}"
     }
 

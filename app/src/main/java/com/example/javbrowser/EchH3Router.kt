@@ -98,12 +98,12 @@ object EchH3Router {
         }
         val records = EchDoh.resolve(host)
         return if (records.echConfigList != null) {
-            Log.d(TAG, "route $host -> ECH (${records.echConfigList.size}B config, ${records.addresses.size} addrs)")
+            Log.d(TAG, "route $host -> ECH (${records.echConfigList.size}B config, ${records.addresses.size} addrs, src=${records.dohSource})")
             Route.Ech
         } else {
             Log.d(
                 TAG,
-                "route $host -> Cronet (no ECH config, resolvedViaDoh=${records.resolvedViaDoh})",
+                "route $host -> Cronet (no ECH config, resolvedViaDoh=${records.resolvedViaDoh}, src=${records.dohSource})",
             )
             Route.Cronet
         }
@@ -140,9 +140,24 @@ object EchH3Router {
         }
     }
 
-    /** SearchHttpFetcher's old baseClient timeouts, routed through ECH. */
+    /**
+     * SearchHttpFetcher's old baseClient timeouts, routed through ECH.
+     *
+     * retryOnConnectionFailure = true (unlike the plain baseClient):
+     * this client is used ONLY by SearchHttpFetcher.fetchEch, which
+     * builds header-only GET requests (SalesRanking uses
+     * [newOkHttpClient] directly, also GET-only, and already retries).
+     * GET retries are safe, and OkHttp's RouteSelector then walks every
+     * address [EchDns] returned instead of dying on the first one: a
+     * single dead first IP (pigav.com: 69.171.234.48 timing out after
+     * 10s while the browser, which tries each address, connects fine)
+     * must not kill the whole request. Retries stay inside this ECH
+     * client — same host, same ECH config on every attempt — so a
+     * failed ECH handshake still ends as ECH_FAILED, never as a
+     * plaintext fallback. The 15s call timeout bounds the walk.
+     */
     fun searchEchClient(): OkHttpClient =
-        newOkHttpClient(10, 15, callSec = 15, followRedirects = true, retryOnConnectionFailure = false)
+        newOkHttpClient(10, 15, callSec = 15, followRedirects = true, retryOnConnectionFailure = true)
 
     /**
      * DNS for the ECH client: DoH-resolved addresses when present, system
@@ -299,11 +314,12 @@ object EchH3Router {
         }
 
         override fun onSucceeded(request: UrlRequest, info: UrlResponseInfo) {
+            val logHost = info.url.toHttpUrlOrNull()?.host ?: initialHost
             NetworkLogStore.add(
                 NetworkLogEntry(
                     System.currentTimeMillis(),
-                    info.url.toHttpUrlOrNull()?.host ?: initialHost,
-                    "Cronet", hasEchConfig, negotiated, null,
+                    logHost,
+                    "Cronet", hasEchConfig, negotiated, null, EchDoh.sourceFor(logHost),
                 ),
             )
             holder.response = buildResponse()
@@ -313,11 +329,12 @@ object EchH3Router {
         override fun onFailed(request: UrlRequest, info: UrlResponseInfo?, error: CronetException) {
             if (holder.error == null) {
                 holder.error = CronetFetchFailed("Cronet failed: ${error.message}", error)
+                val logHost = info?.url?.toHttpUrlOrNull()?.host ?: initialHost
                 NetworkLogStore.add(
                     NetworkLogEntry(
                         System.currentTimeMillis(),
-                        info?.url?.toHttpUrlOrNull()?.host ?: initialHost,
-                        "Cronet", hasEchConfig, negotiated, error.message,
+                        logHost,
+                        "Cronet", hasEchConfig, negotiated, error.message, EchDoh.sourceFor(logHost),
                     ),
                 )
             }
@@ -336,11 +353,12 @@ object EchH3Router {
                 // User cancellations are not failures and are not logged;
                 // our own timeout is, so the fallback chain stays visible.
                 if (!cancellation.isCancelled) {
+                    val logHost = info?.url?.toHttpUrlOrNull()?.host ?: initialHost
                     NetworkLogStore.add(
                         NetworkLogEntry(
                             System.currentTimeMillis(),
-                            info?.url?.toHttpUrlOrNull()?.host ?: initialHost,
-                            "Cronet", hasEchConfig, negotiated, "Cronet canceled (timeout)",
+                            logHost,
+                            "Cronet", hasEchConfig, negotiated, "Cronet canceled (timeout)", EchDoh.sourceFor(logHost),
                         ),
                     )
                 }

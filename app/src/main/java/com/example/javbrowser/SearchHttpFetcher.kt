@@ -65,7 +65,7 @@ class SearchHttpFetcher {
             .build()
         try {
             val response = executeOkHttp(client, url, cancellation, site)
-            NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, null))
+            NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, null, EchDoh.sourceFor(host)))
             return response
         } catch (e: IOException) {
             if (cancellation.isCancelled) throw e
@@ -80,12 +80,12 @@ class SearchHttpFetcher {
             EchDoh.invalidate(host)
             try {
                 val response = executeOkHttp(client, url, cancellation, site)
-                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, null))
+                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, null, EchDoh.sourceFor(host)))
                 return response
             } catch (e2: IOException) {
                 if (cancellation.isCancelled) throw e2
                 Log.w("EchH3", "ECH failed for $host (fail-closed, no plaintext fallback): ${e2.message}")
-                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, e2.message))
+                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, e2.message, EchDoh.sourceFor(host)))
                 return SearchHttpResponse(
                     statusCode = 0,
                     finalUrl = url,
@@ -111,11 +111,11 @@ class SearchHttpFetcher {
     ): SearchHttpResponse {
         return try {
             val response = fetchPlain(url, cancellation, site)
-            NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "OkHttp", hasEchConfig, null, null))
+            NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "OkHttp", hasEchConfig, null, null, EchDoh.sourceFor(host)))
             response
         } catch (e: IOException) {
             if (!cancellation.isCancelled) {
-                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "OkHttp", hasEchConfig, null, e.message))
+                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "OkHttp", hasEchConfig, null, e.message, EchDoh.sourceFor(host)))
             }
             throw e
         }
