@@ -131,6 +131,63 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             })
         }
         adapter.onListCommitted = { restoreReadAnchorIfNeeded() }
+
+        loadLocalMetadata()
+
+        setupSiteChooser()
+        setupSourceFilter()
+        findViewById<Button>(R.id.btn_unified_back).setOnClickListener { finish() }
+        findViewById<Button>(R.id.btn_unified_select_all).setOnClickListener {
+            siteChecks.values.forEach { it.isChecked = true }
+        }
+        findViewById<Button>(R.id.btn_unified_clear_sites).setOnClickListener {
+            siteChecks.values.forEach { it.isChecked = false }
+        }
+        searchButton.setOnClickListener { startSearch() }
+        findViewById<Button>(R.id.btn_unified_save_search).setOnClickListener { saveCurrentSearch() }
+        findViewById<Button>(R.id.btn_unified_saved_searches).setOnClickListener { showSavedSearches() }
+        stopButton.setOnClickListener { session?.cancel() }
+        findViewById<Button>(R.id.btn_unified_copy_diagnostics).setOnClickListener {
+            copyDiagnostics(lastSnapshot?.siteStates.orEmpty())
+        }
+        findViewById<Button>(R.id.btn_unified_view_log).setOnClickListener { openNetworkLog() }
+        findViewById<Button>(R.id.btn_unified_view_log_panel).setOnClickListener { openNetworkLog() }
+        findViewById<Button>(R.id.btn_unified_resume).setOnClickListener { session?.resume() }
+        findViewById<Button>(R.id.btn_unified_continue_pages).setOnClickListener {
+            session?.continuePages(selectedSource.takeIf { it.isNotBlank() })
+        }
+        queryEdit.setOnEditorActionListener { _, action, _ ->
+            if (action == EditorInfo.IME_ACTION_SEARCH) {
+                startSearch()
+                true
+            } else false
+        }
+
+        queryEdit.setText(savedInstanceState?.getString("query") ?: intent.getStringExtra(EXTRA_QUERY).orEmpty())
+        forceCodeForNextSearch = intent.getBooleanExtra(EXTRA_FORCE_CODE, false)
+        if (forceCodeForNextSearch) queryMode = SearchInputMode.CODE
+        if (savedInstanceState != null) {
+            val selected = savedInstanceState.getStringArrayList("sites").orEmpty()
+            siteChecks.forEach { (id, check) -> check.isChecked = id in selected }
+            sourceSpinner.setSelection(savedInstanceState.getInt("source", 0))
+            restoredListState = savedInstanceState.getParcelable("scroll")
+            restoredAnchor = savedInstanceState.getString("anchor_group")?.let {
+                SearchReadAnchor(it, savedInstanceState.getInt("anchor_offset", 0))
+            }
+            val previous = SearchSessionStore.get(savedInstanceState.getString("session"))
+            if (previous != null) {
+                activeRequestId = previous.request.requestId
+                session = repository.start(previous.request, this, restored = previous)
+            } else {
+                panelState = SearchPanelState()
+                renderPanel()
+                statusText.text = tr("搜尋狀態已清除，請重新搜尋", "Search state was cleared. Search again.")
+                openedSavedKey?.let { openSavedSearch(it) }
+            }
+        }
+        refreshSavedSearches {
+            if (savedInstanceState == null && queryEdit.text.toString().isNotBlank() && lastSnapshot == null) startSearch(false)
+        }
     }
 
     /**
@@ -214,63 +271,6 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             sawExtinf && total < 60.0
         } catch (e: Exception) {
             false
-        }
-    }
-        loadLocalMetadata()
-
-        setupSiteChooser()
-        setupSourceFilter()
-        findViewById<Button>(R.id.btn_unified_back).setOnClickListener { finish() }
-        findViewById<Button>(R.id.btn_unified_select_all).setOnClickListener {
-            siteChecks.values.forEach { it.isChecked = true }
-        }
-        findViewById<Button>(R.id.btn_unified_clear_sites).setOnClickListener {
-            siteChecks.values.forEach { it.isChecked = false }
-        }
-        searchButton.setOnClickListener { startSearch() }
-        findViewById<Button>(R.id.btn_unified_save_search).setOnClickListener { saveCurrentSearch() }
-        findViewById<Button>(R.id.btn_unified_saved_searches).setOnClickListener { showSavedSearches() }
-        stopButton.setOnClickListener { session?.cancel() }
-        findViewById<Button>(R.id.btn_unified_copy_diagnostics).setOnClickListener {
-            copyDiagnostics(lastSnapshot?.siteStates.orEmpty())
-        }
-        findViewById<Button>(R.id.btn_unified_view_log).setOnClickListener { openNetworkLog() }
-        findViewById<Button>(R.id.btn_unified_view_log_panel).setOnClickListener { openNetworkLog() }
-        findViewById<Button>(R.id.btn_unified_resume).setOnClickListener { session?.resume() }
-        findViewById<Button>(R.id.btn_unified_continue_pages).setOnClickListener {
-            session?.continuePages(selectedSource.takeIf { it.isNotBlank() })
-        }
-        queryEdit.setOnEditorActionListener { _, action, _ ->
-            if (action == EditorInfo.IME_ACTION_SEARCH) {
-                startSearch()
-                true
-            } else false
-        }
-
-        queryEdit.setText(savedInstanceState?.getString("query") ?: intent.getStringExtra(EXTRA_QUERY).orEmpty())
-        forceCodeForNextSearch = intent.getBooleanExtra(EXTRA_FORCE_CODE, false)
-        if (forceCodeForNextSearch) queryMode = SearchInputMode.CODE
-        if (savedInstanceState != null) {
-            val selected = savedInstanceState.getStringArrayList("sites").orEmpty()
-            siteChecks.forEach { (id, check) -> check.isChecked = id in selected }
-            sourceSpinner.setSelection(savedInstanceState.getInt("source", 0))
-            restoredListState = savedInstanceState.getParcelable("scroll")
-            restoredAnchor = savedInstanceState.getString("anchor_group")?.let {
-                SearchReadAnchor(it, savedInstanceState.getInt("anchor_offset", 0))
-            }
-            val previous = SearchSessionStore.get(savedInstanceState.getString("session"))
-            if (previous != null) {
-                activeRequestId = previous.request.requestId
-                session = repository.start(previous.request, this, restored = previous)
-            } else {
-                panelState = SearchPanelState()
-                renderPanel()
-                statusText.text = tr("搜尋狀態已清除，請重新搜尋", "Search state was cleared. Search again.")
-                openedSavedKey?.let { openSavedSearch(it) }
-            }
-        }
-        refreshSavedSearches {
-            if (savedInstanceState == null && queryEdit.text.toString().isNotBlank() && lastSnapshot == null) startSearch(false)
         }
     }
 
