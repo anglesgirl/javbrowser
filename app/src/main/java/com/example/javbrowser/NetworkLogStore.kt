@@ -12,7 +12,7 @@ import java.util.Locale
  * - route "ECH" + no error = ECH handshake succeeded (ECH effective).
  * - route "ECH" + source "共享" = the official shared Cloudflare
  *   config was used (rescue attempt), not the host's own config;
- *   source "Gateway+共享"/"360+共享" = resolve-time merge (addresses from
+ *   source "Gateway+共享" = resolve-time merge (addresses from
  *   that endpoint, ech shared).
  * - route "Cronet" + negotiated "h3" = HTTP/3 negotiated (H3 effective).
  * - route "Cronet" with no ECH config = the site publishes no ECH config.
@@ -29,7 +29,7 @@ data class NetworkLogEntry(
     val hasEchConfig: Boolean,
     val negotiated: String?, // Cronet negotiated protocol ("h3"/"h2"/"http/1.1"), null otherwise
     val error: String?, // null = success
-    /** DoH endpoint that provided the record ("Gateway" / "360" / "Gateway+360"), "" when unknown. */
+    /** DoH endpoint that provided the record ("Gateway"), "" when unknown. */
     val dohSource: String = "",
 )
 

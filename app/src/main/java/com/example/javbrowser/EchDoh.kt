@@ -22,11 +22,11 @@ import java.util.concurrent.TimeUnit
  *  - A / AAAA: the addresses to dial, so an ECH handshake never depends on
  *    the system resolver for the target host.
  *
- * Endpoints are the user's private Cloudflare Gateway first, 360
- * as fallback only. Ali was dropped (2026-10-30): its answers for
- * blocked domains are polluted and indistinguishable from clean
- * ones, so a poisoned ech could be adopted before the Gateway ever
- * got a chance. All are reached by pinned IP + SNI (the DoH
+ * Endpoint is the user's private Cloudflare Gateway only. Ali and
+ * 360 were dropped (2026-10-30): both return polluted answers for
+ * blocked domains, and the multi-resolver chain added latency
+ * instead of speeding ECH acquisition up. It is reached by pinned
+ * IP + SNI (the DoH
  * hostname), never through the system resolver: the DoH client below
  * overrides DNS for exactly those hosts. The Gateway hostname must
  * never appear in logs — only the short name "Gateway".
@@ -54,9 +54,9 @@ object EchDoh {
 
     private data class DohEndpoint(val name: String, val url: String, val pinnedIps: List<String>)
 
-    // Private Cloudflare Gateway first, 360 as fallback only (Ali
-    // removed 2026-10-30: polluted answers, see header). Pinned IPs are
-    // the providers' anycast / documented addresses; OkHttp still
+    // Private Cloudflare Gateway only (Ali and 360 removed
+    // 2026-10-30: polluted answers and extra latency, see header).
+    // Pinned IP is the benign Cloudflare edge bootstrap IP; OkHttp still
     // verifies the certificate against the DoH hostname, and SNI is
     // the hostname (OkHttp passes the URL host to createSocket), so
     // dialing a pinned IP does not weaken TLS. The Gateway hostname
@@ -68,7 +68,6 @@ object EchDoh {
     // "Gateway", never its hostname. Never log endpoint.url.
     private val ENDPOINTS = listOf(
         DohEndpoint("Gateway", "https://0kbpekmcr1.cloudflare-gateway.com/dns-query", listOf("172.64.147.104")),
-        DohEndpoint("360", "https://doh.360.cn/dns-query", listOf("101.198.193.29", "101.198.192.33")),
     )
 
     private val pinnedByHost: Map<String, List<String>> = ENDPOINTS.associate { endpoint ->
@@ -95,7 +94,7 @@ object EchDoh {
         val addresses: List<InetAddress>,
         val echConfigList: ByteArray?,
         val resolvedViaDoh: Boolean,
-        /** DoH endpoint that provided this record: "Gateway" / "360" / "Gateway+360" (merged) / "Gateway+共享" / "" (not via DoH). */
+        /** DoH endpoint that provided this record: "Gateway" / "Gateway+共享" / "" (not via DoH). */
         val dohSource: String = "",
     )
 
@@ -108,8 +107,8 @@ object EchDoh {
     fun configFor(host: String): ByteArray? = resolve(host).echConfigList
 
     /**
-     * DoH endpoint that provided the cached record for [host] ("Gateway" /
-     * "360" / "Gateway+360"), or "" when nothing is cached. Cache-only read:
+     * DoH endpoint that provided the cached record for [host] ("Gateway"),
+     * or "" when nothing is cached. Cache-only read:
      * never triggers network, so transport logging can use it freely.
      */
     /**
@@ -178,22 +177,18 @@ object EchDoh {
     }
 
     /**
-     * Resolves [host] through the user's private Gateway first, then
-     * 360 as fallback (360 runs only when the Gateway cannot provide
-     * ech or fails). A valid answer is
+     * Resolves [host] through the user's private Gateway only (single
+     * endpoint: no multi-resolver chain). A valid answer is
      * adopted immediately when it carries an ech config (the common
-     * case: no second query). When a valid answer has NO ech, the next
-     * endpoint's HTTPS record alone is asked before concluding "no
-     * config": resolvers can disagree on the ech SvcParam for the same
-     * host, and the first endpoint's silence must not veto
-     * the second's answer. The merge
-     * keeps the first endpoint's addresses and supplements only the
-     * ech: ECH configs are published per zone, not per resolver, so
-     * the site's own ech from the second endpoint is valid for the
-     * first endpoint's addresses. Only the missing-ech case pays the
-     * extra HTTPS query; the full A/AAAA round is never repeated.
+     * case: no second query). When a valid answer has NO ech, there is
+     * no second resolver to ask (single endpoint): the merge loop
+     * below is a no-op and resolution proceeds directly to the
+     * shared-config last resort. (The loop is kept iterating ENDPOINTS
+     * so a future second endpoint would work unchanged: it would keep
+     * the first endpoint's addresses and supplement only the ech,
+     * since ECH configs are published per zone, not per resolver.)
      *
-     * Last resort, after every endpoint's HTTPS record lacks ech: if
+     * Last resort, after the Gateway's HTTPS record lacks ech: if
      * the site's dial addresses are Cloudflare edge IPs, fetch the
      * shared Cloudflare ECH config live from [SHARED_ECH_HOST]'s HTTPS
      * record (verified identical across Cloudflare-fronted hosts; a
