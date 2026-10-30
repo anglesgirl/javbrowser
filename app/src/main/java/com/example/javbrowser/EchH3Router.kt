@@ -39,8 +39,9 @@ import java.util.concurrent.TimeUnit
  * network interceptor can, so cookies may be stale on the redirected
  * request.
  *
- * Verification is by logcat: tag "EchH3" logs every route decision, every
- * ECH setup, and every Cronet negotiated protocol.
+ * Verification is by the in-app transport log ([NetworkLogStore],
+ * shown in NetworkLogActivity) as well as logcat: tag "EchH3" logs every
+ * route decision, every ECH setup, and every Cronet negotiated protocol.
  */
 object EchH3Router {
 
@@ -186,6 +187,7 @@ object EchH3Router {
         site: SearchSite,
         cancellation: SearchCancellation,
         headers: List<Pair<String, String>>,
+        hasEchConfig: Boolean,
     ): SearchHttpResponse {
         cancellation.check()
         val parsed = url.toHttpUrlOrNull() ?: throw CronetFetchFailed("unparseable URL: $url")
@@ -199,7 +201,7 @@ object EchH3Router {
         }
         val holder = CronetHolder()
         val latch = CountDownLatch(1)
-        val callback = CronetCallback(site, cancellation, latch, holder, url)
+        val callback = CronetCallback(site, cancellation, latch, holder, url, hasEchConfig)
         val request = engine.newUrlRequestBuilder(url, callback, cronetCallbacks).apply {
             for ((name, value) in headers) addHeader(name, value)
             val cookie = CookieManager.getInstance().getCookie(url)
@@ -239,10 +241,13 @@ object EchH3Router {
         private val latch: CountDownLatch,
         private val holder: CronetHolder,
         initialUrl: String,
+        private val hasEchConfig: Boolean,
     ) : UrlRequest.Callback() {
 
+        private val initialHost: String = initialUrl.toHttpUrlOrNull()?.host ?: initialUrl
         private var finalUrl: String = initialUrl
         private var statusCode: Int = 0
+        private var negotiated: String? = null
         private var headers: Map<String, List<String>> = emptyMap()
         private val body = ByteArrayOutputStream()
 
@@ -266,6 +271,7 @@ object EchH3Router {
         override fun onResponseStarted(request: UrlRequest, info: UrlResponseInfo) {
             statusCode = info.httpStatusCode
             finalUrl = info.url
+            negotiated = info.negotiatedProtocol
             headers = info.allHeaders
             // Bidirectional cookie sync, mirroring the OkHttp interceptor.
             headerValues("set-cookie").forEach { value ->
@@ -293,6 +299,13 @@ object EchH3Router {
         }
 
         override fun onSucceeded(request: UrlRequest, info: UrlResponseInfo) {
+            NetworkLogStore.add(
+                NetworkLogEntry(
+                    System.currentTimeMillis(),
+                    info.url.toHttpUrlOrNull()?.host ?: initialHost,
+                    "Cronet", hasEchConfig, negotiated, null,
+                ),
+            )
             holder.response = buildResponse()
             latch.countDown()
         }
@@ -300,6 +313,13 @@ object EchH3Router {
         override fun onFailed(request: UrlRequest, info: UrlResponseInfo?, error: CronetException) {
             if (holder.error == null) {
                 holder.error = CronetFetchFailed("Cronet failed: ${error.message}", error)
+                NetworkLogStore.add(
+                    NetworkLogEntry(
+                        System.currentTimeMillis(),
+                        info?.url?.toHttpUrlOrNull()?.host ?: initialHost,
+                        "Cronet", hasEchConfig, negotiated, error.message,
+                    ),
+                )
             }
             latch.countDown()
         }
@@ -312,6 +332,17 @@ object EchH3Router {
                     // Our 15s timer fired: a transport failure, eligible for
                     // the plain-OkHttp fallback.
                     CronetFetchFailed("Cronet canceled (timeout)")
+                }
+                // User cancellations are not failures and are not logged;
+                // our own timeout is, so the fallback chain stays visible.
+                if (!cancellation.isCancelled) {
+                    NetworkLogStore.add(
+                        NetworkLogEntry(
+                            System.currentTimeMillis(),
+                            info?.url?.toHttpUrlOrNull()?.host ?: initialHost,
+                            "Cronet", hasEchConfig, negotiated, "Cronet canceled (timeout)",
+                        ),
+                    )
                 }
             }
             latch.countDown()

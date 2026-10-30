@@ -23,14 +23,18 @@ class SearchHttpFetcher {
         cancellation.check()
         val host = url.toHttpUrlOrNull()?.host
         if (host != null) {
+            // route() already resolved this host via DoH, so this read is
+            // cache-warm and adds no network round trip.
+            val hasEchConfig = EchDoh.resolve(host).echConfigList != null
             when (EchH3Router.route(host)) {
                 EchH3Router.Route.Ech -> return fetchEch(url, cancellation, site, host)
                 EchH3Router.Route.Cronet -> {
                     try {
-                        return EchH3Router.fetchViaCronet(url, site, cancellation, headerList(url, site))
+                        return EchH3Router.fetchViaCronet(url, site, cancellation, headerList(url, site), hasEchConfig)
                     } catch (e: EchH3Router.CronetFetchFailed) {
                         if (cancellation.isCancelled) throw IOException("Canceled")
                         Log.d("EchH3", "Cronet failed for $host, falling back to plain OkHttp: ${e.message}")
+                        return fetchPlainLogged(url, cancellation, site, host, hasEchConfig)
                     }
                     // SearchTransportException (allowlist / body cap) and
                     // IOException("Canceled") propagate: never fall back.
@@ -60,7 +64,9 @@ class SearchHttpFetcher {
             .addNetworkInterceptor(cookieInterceptor(site))
             .build()
         try {
-            return executeOkHttp(client, url, cancellation, site)
+            val response = executeOkHttp(client, url, cancellation, site)
+            NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, null))
+            return response
         } catch (e: IOException) {
             if (cancellation.isCancelled) throw e
             Log.d("EchH3", "ECH attempt failed for $host, retrying after 700ms: ${e.message}")
@@ -73,10 +79,13 @@ class SearchHttpFetcher {
             cancellation.check()
             EchDoh.invalidate(host)
             try {
-                return executeOkHttp(client, url, cancellation, site)
+                val response = executeOkHttp(client, url, cancellation, site)
+                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, null))
+                return response
             } catch (e2: IOException) {
                 if (cancellation.isCancelled) throw e2
                 Log.w("EchH3", "ECH failed for $host (fail-closed, no plaintext fallback): ${e2.message}")
+                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, e2.message))
                 return SearchHttpResponse(
                     statusCode = 0,
                     finalUrl = url,
@@ -85,6 +94,30 @@ class SearchHttpFetcher {
                     transportError = "ECH_FAILED",
                 )
             }
+        }
+    }
+
+    /**
+     * Plain-OkHttp path (Cronet fallback) with transport logging. The
+     * host==null edge at the end of [fetch] keeps using [fetchPlain]
+     * directly: an unparseable URL has no host worth logging.
+     */
+    private fun fetchPlainLogged(
+        url: String,
+        cancellation: SearchCancellation,
+        site: SearchSite,
+        host: String,
+        hasEchConfig: Boolean,
+    ): SearchHttpResponse {
+        return try {
+            val response = fetchPlain(url, cancellation, site)
+            NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "OkHttp", hasEchConfig, null, null))
+            response
+        } catch (e: IOException) {
+            if (!cancellation.isCancelled) {
+                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "OkHttp", hasEchConfig, null, e.message))
+            }
+            throw e
         }
     }
 

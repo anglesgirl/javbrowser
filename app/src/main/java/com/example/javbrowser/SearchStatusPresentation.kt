@@ -51,6 +51,8 @@ object SearchStatusPresentation {
     fun label(state: SiteSearchState, en: Boolean): String = when (state.errorCode.takeUnless { state.status == SearchStatus.SUCCESS }) {
         "CF_CHALLENGE" -> text(en, "CF 人機驗證", "CF verification")
         "CF_BLOCKED" -> text(en, "CF 防火牆封鎖", "CF firewall block")
+        "ECH_FAILED" -> text(en, "ECH 交握失敗", "ECH handshake failed")
+        "CONNECTION_RESET" -> text(en, "連線被重設", "Connection reset")
         "HTTP_FORBIDDEN" -> text(en, "網站拒絕存取（403）", "Access denied (403)")
         "LOGIN_REQUIRED" -> text(en, "需要登入", "Sign-in required")
         "HUMAN_VERIFICATION" -> text(en, "需要人機驗證", "Human verification")

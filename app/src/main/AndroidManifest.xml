@@ -90,6 +90,9 @@
             android:name=".UnifiedSearchActivity"
             android:exported="false" />
         <activity
+            android:name=".NetworkLogActivity"
+            android:exported="false" />
+        <activity
             android:name=".PlaybackHistoryActivity"
             android:exported="false" />
         <activity

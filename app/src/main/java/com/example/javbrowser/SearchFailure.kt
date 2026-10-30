@@ -3,6 +3,7 @@ package com.example.javbrowser
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.net.ConnectException
+import java.net.SocketException
 import java.net.UnknownHostException
 import javax.net.ssl.SSLException
 
@@ -16,6 +17,11 @@ object SearchFailure {
         is SSLException -> "TLS_FAILURE"
         is ConnectException -> "CONNECT_FAILURE"
         is InterruptedIOException -> "HTTP_TIMEOUT"
+        // SocketException sits below ConnectException (already handled above)
+        // and beside InterruptedIOException (SocketTimeoutException is one):
+        // a reset is the one transport failure users keep hitting, and it
+        // used to collapse into the generic IO_ERROR ("網路傳輸中斷").
+        is SocketException -> if (error.message?.contains("reset", ignoreCase = true) == true) "CONNECTION_RESET" else "IO_ERROR"
         is IOException -> "IO_ERROR"
         else -> "PARSER_EXCEPTION"
     }
@@ -30,7 +36,9 @@ object SearchFailure {
         "CODE_NOT_IDENTIFIED" -> "原站有卡片，但未能辨識番號；不能判定沒有結果"
         "DNS_FAILURE" -> "無法解析網站網域，請檢查網域或網路"
         "TLS_FAILURE" -> "安全連線驗證失敗，未略過憑證檢查"
+        "ECH_FAILED" -> "ECH 交握失敗；為保護 SNI 未回落明文連線"
         "CONNECT_FAILURE" -> "無法連上網站伺服器"
+        "CONNECTION_RESET" -> "連線被伺服器重設"
         "UNEXPECTED_REDIRECT_HOST" -> "網站轉向未核准網域，請確認網域設定"
         "RESPONSE_TOO_LARGE" -> "搜尋回應超出安全大小限制"
         "HTTP_TIMEOUT", "HTTP_DEADLINE" -> "網站回應逾時"
@@ -60,7 +68,9 @@ object SearchFailure {
         "CODE_NOT_IDENTIFIED" -> "Cards were found but their codes could not be identified; results remain unknown"
         "DNS_FAILURE" -> "Unable to resolve the site hostname"
         "TLS_FAILURE" -> "TLS validation failed; certificate checks remain enabled"
+        "ECH_FAILED" -> "ECH handshake failed; no plaintext fallback to protect SNI"
         "CONNECT_FAILURE" -> "Unable to connect to the site"
+        "CONNECTION_RESET" -> "Connection reset by server"
         "UNEXPECTED_REDIRECT_HOST" -> "Redirected to an unapproved hostname"
         "RESPONSE_TOO_LARGE" -> "Response exceeded the safety size limit"
         "HTTP_TIMEOUT", "HTTP_DEADLINE" -> "Site response timed out"

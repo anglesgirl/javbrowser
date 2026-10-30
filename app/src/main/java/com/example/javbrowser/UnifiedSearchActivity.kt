@@ -154,6 +154,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         findViewById<Button>(R.id.btn_unified_copy_diagnostics).setOnClickListener {
             copyDiagnostics(lastSnapshot?.siteStates.orEmpty())
         }
+        findViewById<Button>(R.id.btn_unified_view_log).setOnClickListener { openNetworkLog() }
+        findViewById<Button>(R.id.btn_unified_view_log_panel).setOnClickListener { openNetworkLog() }
         findViewById<Button>(R.id.btn_unified_resume).setOnClickListener { session?.resume() }
         findViewById<Button>(R.id.btn_unified_continue_pages).setOnClickListener {
             session?.continuePages(selectedSource.takeIf { it.isNotBlank() })
@@ -371,6 +373,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             R.id.btn_unified_saved_searches,
             R.id.tv_unified_saved_notice,
             R.id.btn_unified_copy_diagnostics,
+            R.id.btn_unified_view_log_panel,
             R.id.unified_site_status_scroll
         ).forEach { findViewById<android.view.View>(it).visibility = visibility }
         findViewById<Button>(R.id.btn_unified_resume).visibility =
@@ -397,6 +400,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             text = SearchStatusPresentation.emptyMessage(snapshot, selectedSource, LanguageManager.isEnglish(this@UnifiedSearchActivity))
             visibility = if (items.isEmpty()) android.view.View.VISIBLE else android.view.View.GONE
         }
+        // The log button rides with the empty state: when a search fails
+        // (0 results), the user is already on this page and needs one tap
+        // to the transport log — not a hunt through collapsed settings.
+        findViewById<Button>(R.id.btn_unified_view_log).visibility =
+            if (items.isEmpty()) android.view.View.VISIBLE else android.view.View.GONE
         if (items.isNotEmpty()) restoredListState?.let {
             resultsView.layoutManager?.onRestoreInstanceState(it)
             restoredListState = null
@@ -665,6 +673,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         preserveSessionOnStop = false
     }
     private fun tr(zh: String, en: String) = LanguageManager.text(this, zh, en)
+
+    private fun openNetworkLog() {
+        startActivity(android.content.Intent(this, NetworkLogActivity::class.java))
+    }
 
     private fun copyDiagnostics(states: List<SiteSearchState>) {
         val report = buildString {
