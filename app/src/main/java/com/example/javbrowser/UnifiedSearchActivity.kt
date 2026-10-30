@@ -193,70 +193,99 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     /**
      * Opens a search result. For hosts that publish an ECH config
      * (the app-layer fetch works while WebView is the blocked leg),
-     * first try sniffing the video URL from the detail page HTML
-     * fetched over ECH and play it in the internal player; any
-     * failure falls back to opening the page in WebView (current
-     * behavior). Non-ECH hosts go straight to WebView, no extra fetch.
+     * sniff the detail page HTML fetched over ECH and list the
+     * candidate video URLs for the user to pick (auto-pick proved
+     * unreliable: it kept landing on ads or unplayable URLs); the
+     * user taps one to play it in the internal player, or chooses
+     * the browser to fall back to WebView. No candidates, or a
+     * non-ECH host, goes straight to WebView (current behavior).
      */
     private fun openResult(item: SearchItem) {
         rememberReadAnchor()
         preserveSessionOnStop = true
         SearchScheduler.workers.execute {
-            val videoUrl = trySniffVideoUrl(item)
+            val candidates = trySniffVideoCandidates(item)
             runOnUiThread {
-                if (videoUrl != null) {
-                    startActivity(android.content.Intent(this, FullscreenInternalPlayerActivity::class.java).apply {
-                        putExtra(FullscreenInternalPlayerActivity.EXTRA_VIDEO_URL, videoUrl)
-                        putExtra(FullscreenInternalPlayerActivity.EXTRA_REFERER, item.detailUrl)
-                        putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, item.detailUrl)
-                        putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, item.title)
-                    })
-                } else {
+                if (candidates.isEmpty()) {
                     BrowserNavigator.open(this, item.detailUrl)
+                } else {
+                    showSniffPicker(item, candidates)
                 }
             }
         }
     }
 
-    /** Returns a sniffed video URL, or null to fall back to WebView. Never throws. */
-    private fun trySniffVideoUrl(item: SearchItem): String? {
+    private fun playSniffed(item: SearchItem, videoUrl: String) {
+        startActivity(android.content.Intent(this, FullscreenInternalPlayerActivity::class.java).apply {
+            putExtra(FullscreenInternalPlayerActivity.EXTRA_VIDEO_URL, videoUrl)
+            putExtra(FullscreenInternalPlayerActivity.EXTRA_REFERER, item.detailUrl)
+            putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, item.detailUrl)
+            putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, item.title)
+        })
+    }
+
+    /** Lists sniffed candidates with their m3u8 duration (null when unknown). Never throws. */
+    private fun showSniffPicker(item: SearchItem, candidates: List<Pair<String, Double?>>) {
+        val labels = candidates.map { (url, duration) -> candidateLabel(url, duration) }.toTypedArray()
+        android.app.AlertDialog.Builder(this)
+            .setTitle(LanguageManager.text(this, "选择播放地址", "Choose video URL"))
+            .setItems(labels) { _, which ->
+                playSniffed(item, candidates[which].first)
+            }
+            .setNegativeButton(LanguageManager.text(this, "用浏览器打开", "Open in browser")) { _, _ ->
+                BrowserNavigator.open(this, item.detailUrl)
+            }
+            .show()
+    }
+
+    /** One line per candidate: type, duration (longest is usually the main video), host. */
+    private fun candidateLabel(url: String, duration: Double?): String {
+        val host = try { java.net.URL(url).host } catch (e: Exception) { "" }
+        val type = if (url.lowercase().contains(".m3u8")) "m3u8" else "mp4"
+        val dur = duration?.let {
+            "${(it / 60).toInt()}:${(it % 60).toInt().toString().padStart(2, '0')}"
+        } ?: "—"
+        return "$type · $dur · $host"
+    }
+
+    /** Returns sniffed candidates (proven <60s m3u8 ads excluded), or empty to fall back to WebView. Never throws. */
+    private fun trySniffVideoCandidates(item: SearchItem): List<Pair<String, Double?>> {
         return try {
-            val host = try { java.net.URL(item.detailUrl).host } catch (e: Exception) { return null }
-            if (EchDoh.configFor(host) == null) return null
-            val site = sites.firstOrNull { it.id == item.siteId } ?: return null
+            val host = try { java.net.URL(item.detailUrl).host } catch (e: Exception) { return emptyList() }
+            if (EchDoh.configFor(host) == null) return emptyList()
+            val site = sites.firstOrNull { it.id == item.siteId } ?: return emptyList()
             runOnUiThread {
                 android.widget.Toast.makeText(this,
                     LanguageManager.text(this, "正在嗅探播放地址…", "Sniffing video URL…"),
                     android.widget.Toast.LENGTH_SHORT).show()
             }
             val response = SearchHttpFetcher().fetch(item.detailUrl, SearchCancellation(), site)
-            if (response.transportError != null) return null
-            if (response.statusCode !in 200..299) return null
-            if (response.body.isBlank()) return null
-            val candidates = VideoPageSniffer.sniffCandidates(response.body, item.detailUrl, item.code)
-            for (candidate in candidates) {
-                if (!isAdByDuration(candidate, site)) return candidate
+            if (response.transportError != null) return emptyList()
+            if (response.statusCode !in 200..299) return emptyList()
+            if (response.body.isBlank()) return emptyList()
+            val out = mutableListOf<Pair<String, Double?>>()
+            for (candidate in VideoPageSniffer.sniffCandidates(response.body, item.detailUrl, item.code)) {
+                val duration = m3u8Duration(candidate, site)
+                if (duration == null || duration >= 60.0) out += candidate to duration
             }
-            null
+            out
         } catch (e: Exception) {
-            null
+            emptyList()
         }
     }
 
     /**
-     * True only when the candidate is proven to be an ad: an m3u8
-     * media playlist whose summed #EXTINF duration is under 60s.
-     * Anything else (master playlists with no EXTINF, mp4, fetch
-     * failures) is kept — only positive ad evidence excludes, never
-     * uncertainty, so a short main video at worst falls back to
-     * WebView instead of breaking playback.
+     * Summed #EXTINF duration of an m3u8 media playlist, or null when
+     * it cannot be determined (not m3u8, master playlist with no
+     * EXTINF, fetch failure). Null never excludes a candidate — only
+     * a proven <60s total marks an ad.
      */
-    private fun isAdByDuration(candidate: String, site: SearchSite): Boolean {
-        if (!candidate.lowercase().contains(".m3u8")) return false
+    private fun m3u8Duration(candidate: String, site: SearchSite): Double? {
+        if (!candidate.lowercase().contains(".m3u8")) return null
         return try {
             val playlist = SearchHttpFetcher().fetch(candidate, SearchCancellation(), site)
-            if (playlist.transportError != null) return false
-            if (playlist.statusCode !in 200..299) return false
+            if (playlist.transportError != null) return null
+            if (playlist.statusCode !in 200..299) return null
             var total = 0.0
             var sawExtinf = false
             for (line in playlist.body.lines()) {
@@ -268,9 +297,9 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     }
                 }
             }
-            sawExtinf && total < 60.0
+            if (sawExtinf) total else null
         } catch (e: Exception) {
-            false
+            null
         }
     }
 
