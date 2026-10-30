@@ -33,6 +33,28 @@ class SearchHttpFetcher {
                         return EchH3Router.fetchViaCronet(url, site, cancellation, headerList(url, site), hasEchConfig)
                     } catch (e: EchH3Router.CronetFetchFailed) {
                         if (cancellation.isCancelled) throw IOException("Canceled")
+                        // Rescue attempt: this host has no trusted own
+                        // ech, but it may still be Cloudflare-fronted
+                        // behind a polluted or ech-silent DoH answer
+                        // (the Cloudflare-IP gate in EchDoh cannot see
+                        // through pollution). Try the official shared
+                        // Cloudflare config once; on any failure, fall
+                        // through to the original plain-OkHttp fallback
+                        // below — never ECH_FAILED, and working paths
+                        // pay nothing because this only runs after
+                        // Cronet already failed.
+                        val sharedEch = EchDoh.sharedEchConfig()
+                        if (sharedEch != null) {
+                            try {
+                                return fetchEchShared(url, cancellation, site, host, sharedEch)
+                            } catch (ste: SearchTransportException) {
+                                // Allowlist / body cap: propagates, never falls back.
+                                throw ste
+                            } catch (re: IOException) {
+                                if (cancellation.isCancelled) throw IOException("Canceled")
+                                Log.d("EchH3", "shared ECH rescue failed for $host, falling back to plain OkHttp: ${re.message}")
+                            }
+                        }
                         Log.d("EchH3", "Cronet failed for $host, falling back to plain OkHttp: ${e.message}")
                         return fetchPlainLogged(url, cancellation, site, host, hasEchConfig)
                     }
@@ -94,6 +116,42 @@ class SearchHttpFetcher {
                     transportError = "ECH_FAILED",
                 )
             }
+        }
+    }
+
+    /**
+     * Single-attempt shared-ECH fetch for hosts with no trusted own ech
+     * (rescue after a Cronet failure). Uses the official shared
+     * Cloudflare config, not the host's own. No retry loop: one attempt,
+     * bounded by the rescue client's timeouts. Throws IOException on
+     * any transport failure — the caller falls back to the original
+     * route; this never returns ECH_FAILED. SearchTransportException
+     * (allowlist / body cap) propagates. Logged with source "共享" so
+     * a rescue success is distinguishable from an own-ech success.
+     */
+    private fun fetchEchShared(
+        url: String,
+        cancellation: SearchCancellation,
+        site: SearchSite,
+        host: String,
+        sharedEch: ByteArray,
+    ): SearchHttpResponse {
+        val client = EchH3Router.sharedEchClient(sharedEch)
+            .newBuilder()
+            .addNetworkInterceptor(cookieInterceptor(site))
+            .build()
+        try {
+            val response = executeOkHttp(client, url, cancellation, site)
+            NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, null, "共享"))
+            return response
+        } catch (e: SearchTransportException) {
+            // Allowlist / body cap: not a transport failure, not logged, propagates.
+            throw e
+        } catch (e: IOException) {
+            if (!cancellation.isCancelled) {
+                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, e.message, "共享"))
+            }
+            throw e
         }
     }
 

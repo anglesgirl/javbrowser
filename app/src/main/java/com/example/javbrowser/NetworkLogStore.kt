@@ -10,6 +10,10 @@ import java.util.Locale
  * EchH3Router's Cronet path) append one entry per transport attempt.
  *
  * - route "ECH" + no error = ECH handshake succeeded (ECH effective).
+ * - route "ECH" + source "共享" = the official shared Cloudflare
+ *   config was used (rescue attempt), not the host's own config;
+ *   source "Ali+共享"/"360+共享" = resolve-time merge (addresses from
+ *   that endpoint, ech shared).
  * - route "Cronet" + negotiated "h3" = HTTP/3 negotiated (H3 effective).
  * - route "Cronet" with no ECH config = the site publishes no ECH config.
  * - any entry with an error = that attempt failed; the error text is the

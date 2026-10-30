@@ -217,19 +217,21 @@ object ConscryptEch {
 
     /**
      * The (socket factory, trust manager) pair OkHttp's
-     * sslSocketFactory(factory, trustManager) needs. The policy and the
-     * socket factory both resolve the ECH config through [EchDoh], so a
-     * host that published a config gets REQUIRED + the config bytes, and a
-     * host that did not gets DISABLED + plain TLS 1.3.
+     * sslSocketFactory(factory, trustManager) needs. By default the
+     * policy and the socket factory both resolve the ECH config
+     * through [EchDoh], so a host that published a config gets
+     * REQUIRED + the config bytes, and a host that did not gets
+     * DISABLED + plain TLS 1.3. Callers may inject a fixed config
+     * provider instead (the shared-ECH rescue client injects the
+     * official shared config for every host).
      *
      * "TLS" (not TLSv1.3-only) on purpose: hosts without an ECH config
      * must still connect over TLS 1.2 when that is all they offer. ECH
      * itself requires TLS 1.3, and a REQUIRED policy fails closed when a
      * configured host cannot negotiate it.
      */
-    fun newSslPair(): Pair<SSLSocketFactory, X509TrustManager> {
+    fun newSslPair(configForHost: (String) -> ByteArray? = { host -> EchDoh.configFor(host) }): Pair<SSLSocketFactory, X509TrustManager> {
         if (!ensureProvider()) throw IllegalStateException("Conscrypt provider unavailable")
-        val configForHost: (String) -> ByteArray? = { host -> EchDoh.configFor(host) }
         val trustManager = PolicyTrustManager(systemTrustManager(), configForHost)
         val context = SSLContext.getInstance("TLS", "Conscrypt")
         context.init(null, arrayOf(trustManager), null)

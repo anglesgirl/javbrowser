@@ -31,6 +31,14 @@ import java.util.concurrent.TimeUnit
  * plain OkHttp on failure; the ECH path is not — a failed ECH handshake
  * must never silently degrade to plaintext SNI (see SearchHttpFetcher).
  *
+ * One exception to "no ECH without own config": hosts without a
+ * trusted own config get one opportunistic shared-ECH attempt in
+ * SearchHttpFetcher AFTER a Cronet failure (official cloudflare-ech.com
+ * config). That attempt is speculative, so unlike the ECH route it
+ * falls back to the original route on failure and never produces
+ * ECH_FAILED — it only runs on an already-failing path, so working
+ * paths pay nothing for it.
+ *
  * Cronet preserves the exact semantics SearchHttpFetcher's OkHttp path
  * has: host allowlist (including on cross-host redirects), CookieManager
  * bidirectional sync, 15s timeout, [SearchCancellation], and the 2MB
@@ -158,6 +166,32 @@ object EchH3Router {
      */
     fun searchEchClient(): OkHttpClient =
         newOkHttpClient(10, 15, callSec = 15, followRedirects = true, retryOnConnectionFailure = true)
+
+    /**
+     * Rescue-attempt client for the shared Cloudflare ECH config: same
+     * shape as [searchEchClient] but the SSL pair injects the given
+     * shared config for every host instead of the host's own config
+     * (so the policy answers REQUIRED for the target host). Bounded
+     * timeouts: a rescue attempt must fail fast so the caller can
+     * fall back to the original route. Unlike [newOkHttpClient], a
+     * missing Conscrypt pair throws instead of degrading to plaintext:
+     * a rescue that "succeeds" without ECH would be a lie in the log.
+     */
+    fun sharedEchClient(sharedEch: ByteArray): OkHttpClient {
+        val builder = OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .retryOnConnectionFailure(true)
+        return try {
+            val (factory, trustManager) = ConscryptEch.newSslPair { _ -> sharedEch }
+            builder.sslSocketFactory(factory, trustManager).dns(EchDns).build()
+        } catch (e: Exception) {
+            throw IOException("shared ECH client unavailable", e)
+        }
+    }
 
     /**
      * DNS for the ECH client: DoH-resolved addresses when present, system

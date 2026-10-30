@@ -99,6 +99,20 @@ object EchDoh {
      * "360" / "Ali+360"), or "" when nothing is cached. Cache-only read:
      * never triggers network, so transport logging can use it freely.
      */
+    /**
+     * Official shared Cloudflare ECH config, fetched live from
+     * [SHARED_ECH_HOST]'s HTTPS record. Goes through [resolve], so it
+     * is cached under the normal TTL and re-fetched live on a cache
+     * miss — never a hardcoded constant, because keys rotate. Null
+     * when unavailable. Used only for the opportunistic rescue
+     * attempt in SearchHttpFetcher; the resolve-time shared fallback
+     * keeps its own Cloudflare-IP gate and fail-closed semantics.
+     * No recursion risk: [resolve] for the shared host itself returns
+     * at stage 1 when its own ech is present, and its shared-fallback
+     * block queries [echFromEndpoint] directly, never [resolve].
+     */
+    fun sharedEchConfig(): ByteArray? = resolve(SHARED_ECH_HOST).echConfigList
+
     fun sourceFor(host: String): String = cache[host.lowercase()]?.records?.dohSource ?: ""
 
     fun invalidate(host: String) {
