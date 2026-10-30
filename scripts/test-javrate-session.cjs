@@ -5,13 +5,13 @@ const {webcrypto, createHmac} = require('node:crypto');
 const assert = require('node:assert/strict');
 const {test} = require('node:test');
 
-test('captures site config, renews once for concurrent requests, keeps valid token on failure', async () => {
+test('forwards secret issue time, renews once for concurrent requests, keeps valid token on failure', async () => {
     const reports = [], calls = [], subtitles = [];
     let failures = 0, fail = false, timer;
     const config = {initialSignedUrl: 'https://videocdn.avking.xyz/movie/playlist.m3u8',
         initialToken: 'initial', initialExpires: Math.floor(Date.now()/1000)+30,
         initialTokenPath: '/movie/', movieId: 'movie', sessionId: 'session', guidId: 'guid',
-        apiSecret: 'fixture-secret', timeDiff: 0};
+        apiSecret: 'fixture-secret', apiSecretIssuedAt: 1793295000, timeDiff: 0};
     const scope = {URL, TextEncoder, crypto: webcrypto, AbortController, Date,
         location: {href: 'https://www.javrate.com/player/v2?payload=fixture'},
         btoa: x => Buffer.from(x, 'binary').toString('base64'),
@@ -23,6 +23,10 @@ test('captures site config, renews once for concurrent requests, keeps valid tok
             calls.push(JSON.parse(options.body));
             assert.equal(url, '/api/token/generate');
             const body = calls.at(-1);
+            // Current JavRate rejects an otherwise correctly signed request without this field.
+            if (body.apiSecretIssuedAt !== config.apiSecretIssuedAt) {
+                return {ok: false, status: 400, json: async () => ({error: 'Token generation failed'})};
+            }
             assert.equal(body.signature, createHmac('sha256', config.apiSecret)
                 .update(`movie|${body.timestamp}|session`).digest('base64'));
             await new Promise(resolve => setImmediate(resolve));

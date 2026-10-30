@@ -32,7 +32,8 @@
                 const response = await fetch('/api/token/generate', {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({sessionId: config.sessionId, movieId: config.movieId,
-                        guidId: config.guidId, timestamp: timestamp, url: location.href, signature: signature}),
+                        guidId: config.guidId, apiSecretIssuedAt: config.apiSecretIssuedAt,
+                        timestamp: timestamp, url: location.href, signature: signature}),
                     signal: controller.signal
                 });
                 if (!response.ok) {

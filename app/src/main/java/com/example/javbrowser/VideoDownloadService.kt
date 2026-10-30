@@ -8,10 +8,8 @@ import android.content.ClipData
 import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Bitmap
-import android.media.MediaCodec
 import android.media.MediaExtractor
-import android.media.MediaFormat
-import android.media.MediaMuxer
+import android.media.MediaDataSource
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -34,7 +32,6 @@ import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
-import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import org.json.JSONArray
 import java.security.MessageDigest
@@ -304,22 +301,18 @@ class VideoDownloadService : Service() {
                         )
                     }
                     checkCanceled()
-                    val downloadTarget = createDownloadTarget(baseName, extension, mimeType)
+                    val downloadTarget = packageHlsParts(partsDirectory, parts.size, baseName, extension, mimeType, downloadId)
                     target = downloadTarget
-                    updateTargetRecord(downloadId, downloadTarget, mimeType)
-                    mergeHlsParts(partsDirectory, parts.size, downloadTarget.output, downloadId)
                     partsDirectory.deleteRecursively()
-                    DownloadResult(downloadTarget.uri, extension == "ts")
+                    DownloadResult(downloadTarget.uri, downloadTarget.fileName.endsWith(".ts"))
                 } else {
                     val partsDirectory = prepareHlsCache(url, parts)
                     downloadHlsParts(parts, partsDirectory, referer, cookies, cookieSourceUrl, downloadId)
                     checkCanceled()
-                    val downloadTarget = createDownloadTarget(baseName, extension, mimeType)
+                    val downloadTarget = packageHlsParts(partsDirectory, parts.size, baseName, extension, mimeType, downloadId)
                     target = downloadTarget
-                    updateTargetRecord(downloadId, downloadTarget, mimeType)
-                    mergeHlsParts(partsDirectory, parts.size, downloadTarget.output, downloadId)
                     partsDirectory.deleteRecursively()
-                    DownloadResult(downloadTarget.uri, extension == "ts")
+                    DownloadResult(downloadTarget.uri, downloadTarget.fileName.endsWith(".ts"))
                 }
             } else {
                 val downloadTarget = createDownloadTarget(baseName, "mp4", "video/mp4")
@@ -698,6 +691,44 @@ class VideoDownloadService : Service() {
         }
     }
 
+    private fun packageHlsParts(partsDirectory: File, partCount: Int, baseName: String,
+        extension: String, mimeType: String, downloadId: String): DownloadTarget {
+        // Keep all cached parts until success. Unsupported sources/providers retain
+        // the existing merged-file path, and cancellation never starts a fallback.
+        if (extension == "ts" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            var direct: DownloadTarget? = null
+            try {
+                checkCanceled()
+                direct = createDownloadTarget(baseName, "mp4", "video/mp4")
+                updateTargetRecord(downloadId, direct, "video/mp4")
+                reportPackagingProgress(downloadId, 0)
+                direct.closeOutput()
+                withPackagingWakeLock {
+                    HlsPartsMediaDataSource(List(partCount) { hlsPartFile(partsDirectory, it) }).use { source ->
+                        remuxToFile(source, direct.uri, downloadId)
+                    }
+                }
+                checkCanceled()
+                return direct
+            } catch (error: DownloadCanceledException) {
+                direct?.finish(false)
+                throw error
+            } catch (error: Exception) {
+                direct?.finish(false)
+                android.util.Log.w("VIDEO_DOWNLOAD_REMUX", "Direct part remux failed; using merged TS fallback", error)
+            }
+        }
+        val target = createDownloadTarget(baseName, extension, mimeType)
+        try {
+            updateTargetRecord(downloadId, target, mimeType)
+            mergeHlsParts(partsDirectory, partCount, target.output, downloadId)
+            return target
+        } catch (error: Exception) {
+            target.finish(false)
+            throw error
+        }
+    }
+
     private fun mergeHlsParts(
         partsDirectory: File,
         partCount: Int,
@@ -709,12 +740,20 @@ class VideoDownloadService : Service() {
             currentDownloadTask().notificationId,
             buildProgressNotification("正在合併影片", 99, false, downloadId)
         )
-        output.buffered().use { target ->
+        output.buffered(256 * 1024).use { target ->
+            val buffer = ByteArray(256 * 1024)
             repeat(partCount) { index ->
                 checkCanceled()
                 val partFile = hlsPartFile(partsDirectory, index)
                 if (!partFile.exists()) throw IOException("HLS 暫存分段遺失：${index + 1}")
-                partFile.inputStream().buffered().use { it.copyTo(target) }
+                partFile.inputStream().use { input ->
+                    while (true) {
+                        checkCanceled()
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        target.write(buffer, 0, count)
+                    }
+                }
             }
         }
     }
@@ -834,6 +873,9 @@ class VideoDownloadService : Service() {
             updateTargetRecord(downloadId, mp4Target, "video/mp4")
             deleteDownloadUri(sourceUri)
             mp4Target
+        } catch (error: DownloadCanceledException) {
+            mp4Target?.finish(false)
+            throw error
         } catch (error: Exception) {
             mp4Target?.finish(false)
             android.util.Log.w(
@@ -853,119 +895,67 @@ class VideoDownloadService : Service() {
     private fun remuxTsToMp4(sourceUri: Uri, outputUri: Uri, downloadId: String) {
         val inputDescriptor = openDownloadFileDescriptor(sourceUri, write = false)
             ?: throw IOException("無法開啟 TS 來源檔")
-        val outputDescriptor = openDownloadFileDescriptor(outputUri, write = true)
-            ?: run {
-                inputDescriptor.close()
-                throw IOException("無法建立 MP4 輸出檔")
-            }
-        inputDescriptor.use { input ->
-            outputDescriptor.use { output ->
-                val extractor = MediaExtractor()
-                var muxer: MediaMuxer? = null
-                var muxerStarted = false
-                try {
-                    extractor.setDataSource(input.fileDescriptor)
-                    val trackMap = IntArray(extractor.trackCount) { -1 }
-                    val aacSampleRates = IntArray(extractor.trackCount)
-                    var videoTrackFound = false
-                    var maxInputSize = 4 * 1024 * 1024
-                    val activeMuxer = MediaMuxer(
-                        output.fileDescriptor,
-                        MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
-                    )
-                    muxer = activeMuxer
-
-                    for (trackIndex in 0 until extractor.trackCount) {
-                        val format = extractor.getTrackFormat(trackIndex)
-                        val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
-                        if (!mime.startsWith("video/") && !mime.startsWith("audio/")) continue
-                        if (mime == "audio/mp4a-latm") {
-                            aacSampleRates[trackIndex] = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                            format.setInteger(MediaFormat.KEY_IS_ADTS, 0)
-                        }
-                        trackMap[trackIndex] = activeMuxer.addTrack(format)
-                        extractor.selectTrack(trackIndex)
-                        if (mime.startsWith("video/")) {
-                            videoTrackFound = true
-                            if (format.containsKey(MediaFormat.KEY_ROTATION)) {
-                                activeMuxer.setOrientationHint(format.getInteger(MediaFormat.KEY_ROTATION))
-                            }
-                        }
-                        if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
-                            maxInputSize = maxOf(maxInputSize, format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
-                        }
-                    }
-                    if (!videoTrackFound) throw IOException("TS 中找不到可封裝的影片軌")
-
-                    activeMuxer.start()
-                    muxerStarted = true
-                    val buffer = ByteBuffer.allocateDirect(maxInputSize.coerceAtMost(32 * 1024 * 1024))
-                    val info = MediaCodec.BufferInfo()
-                    val sourceSize = input.statSize.coerceAtLeast(0L)
-                    var processedBytes = 0L
-                    var lastReportTime = android.os.SystemClock.elapsedRealtime()
-
-                    while (true) {
-                        checkCanceled()
-                        buffer.clear()
-                        val sampleSize = extractor.readSampleData(buffer, 0)
-                        if (sampleSize < 0) break
-                        val sourceTrack = extractor.sampleTrackIndex
-                        val destinationTrack = trackMap.getOrElse(sourceTrack) { -1 }
-                        if (destinationTrack >= 0) {
-                            // Keep the source presentation timestamp. Forcing it to be strictly
-                            // increasing destroys B-frame composition timing; the old 1 us nudge
-                            // was also rounded away at the MP4 track timescale, creating many
-                            // duplicate timestamps and visible dropped frames.
-                            buffer.position(0)
-                            buffer.limit(sampleSize)
-                            val sampleRate = aacSampleRates.getOrElse(sourceTrack) { 0 }
-                            val frames = if (sampleRate > 0) AdtsMp4Audio.frames(buffer) else null
-                            if (frames == null) {
-                                info.set(0, sampleSize, extractor.sampleTime, extractor.sampleFlags)
-                                activeMuxer.writeSampleData(destinationTrack, buffer, info)
-                            } else {
-                                var elapsedSamples = 0L
-                                frames.forEach { frame ->
-                                    info.set(frame.offset, frame.length,
-                                        extractor.sampleTime + elapsedSamples * 1_000_000L / sampleRate, extractor.sampleFlags)
-                                    activeMuxer.writeSampleData(destinationTrack, buffer, info)
-                                    elapsedSamples += frame.duration
-                                }
-                            }
-                            processedBytes += sampleSize
-                        }
-                        extractor.advance()
-
-                        val now = android.os.SystemClock.elapsedRealtime()
-                        if (now - lastReportTime >= 1000L) {
-                            val remuxPercent = if (sourceSize > 0L) {
-                                (processedBytes * 100L / sourceSize).toInt().coerceIn(0, 99)
-                            } else {
-                                0
-                            }
-                            val message = if (remuxPercent > 0) {
-                                "正在封裝 MP4 $remuxPercent%"
-                            } else {
-                                "正在封裝 MP4"
-                            }
-                            updateProgress(downloadId, 99, message, 0L)
-                            notificationManager.notify(
-                                currentDownloadTask().notificationId,
-                                buildProgressNotification(message, 99, false, downloadId)
-                            )
-                            lastReportTime = now
-                        }
-                    }
-                    activeMuxer.stop()
-                    muxerStarted = false
-                } finally {
-                    if (muxerStarted) runCatching { muxer?.stop() }
-                    runCatching { muxer?.release() }
-                    extractor.release()
-                }
+        ParcelFileDescriptor.AutoCloseInputStream(inputDescriptor).use { stream ->
+            BufferedFileMediaDataSource(stream.channel).use { source ->
+                remuxToFile(source, outputUri, downloadId)
             }
         }
+    }
+
+    private fun reportPackagingProgress(downloadId: String, percent: Int) {
+        val message = if (percent > 0) "正在封裝 MP4 $percent%" else "正在封裝 MP4"
+        updateProgress(downloadId, 99, message, 0L)
+        notificationManager.notify(currentDownloadTask().notificationId,
+            buildProgressNotification(message, 99, false, downloadId))
+    }
+
+    private fun remuxToFile(source: MediaDataSource, outputUri: Uri, downloadId: String) {
+        val outputDescriptor = openDownloadFileDescriptor(outputUri, write = true)
+            ?: throw IOException("無法建立 MP4 輸出檔")
+        val started = android.os.SystemClock.elapsedRealtime()
+        outputDescriptor.use { output ->
+            // MediaMuxer emits many small writes. On shared/document storage these
+            // can be much slower than private-cache writes plus one buffered copy.
+            // Reserve space for both the scratch MP4 and its final copy; low-space
+            // devices keep the direct-output path without an extra scratch file.
+            val scratch = if (outputUri.scheme == "content" && source.size > 0 &&
+                cacheDir.usableSpace > source.size * 2 + 64L * 1024 * 1024) {
+                runCatching { File.createTempFile("download-remux-", ".mp4", cacheDir) }.getOrNull()
+            } else null
+            fun remux(descriptor: java.io.FileDescriptor) {
+                val extractor = MediaExtractor()
+                try {
+                    extractor.setDataSource(source)
+                    TsMp4Remuxer.remux(extractor, descriptor, source.size, ::checkCanceled) { percent ->
+                        reportPackagingProgress(downloadId, percent)
+                    }
+                } finally { extractor.release() }
+            }
+            try {
+                if (scratch == null) remux(output.fileDescriptor)
+                else {
+                    scratch.outputStream().use { remux(it.fd) }
+                    checkCanceled()
+                    val message = "正在儲存 MP4"
+                    updateProgress(downloadId, 99, message, 0L)
+                    notificationManager.notify(currentDownloadTask().notificationId,
+                        buildProgressNotification(message, 99, false, downloadId))
+                    scratch.inputStream().use { input ->
+                        ParcelFileDescriptor.AutoCloseOutputStream(ParcelFileDescriptor.dup(output.fileDescriptor)).use { destination ->
+                            val buffer = ByteArray(256 * 1024)
+                            while (true) {
+                                checkCanceled()
+                                val count = input.read(buffer)
+                                if (count < 0) break
+                                destination.write(buffer, 0, count)
+                            }
+                        }
+                    }
+                }
+            } finally { scratch?.delete() }
+        }
+        android.util.Log.i("VIDEO_DOWNLOAD_REMUX",
+            "MP4 packaging completed bytes=${source.size} elapsedMs=${android.os.SystemClock.elapsedRealtime() - started}")
     }
 
     private fun openDownloadFileDescriptor(uri: Uri, write: Boolean): ParcelFileDescriptor? {
@@ -1360,6 +1350,8 @@ class VideoDownloadService : Service() {
 
     private fun cleanupOldHlsCaches() {
         val expiry = System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000
+        cacheDir.listFiles { file -> file.name.startsWith("download-remux-") && file.extension == "mp4" }
+            ?.filter { it.lastModified() < expiry }?.forEach { it.delete() }
         File(cacheDir, "hls_download_parts").listFiles()?.forEach { directory ->
             if (directory.lastModified() < expiry) directory.deleteRecursively()
         }

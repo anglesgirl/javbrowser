@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.1 - 2026-10-30
+
+### Faster MP4 Packaging
+
+- Remux downloaded TS parts directly through a buffered, seekable source, removing the intermediate TS merge on the normal path.
+- Cache extractor packet metadata, stage MP4 writes in app-private storage when space permits, and copy to the destination in large blocks. Keep direct output for low-space devices and the merged-file fallback for unsupported sources.
+- Buffer subtitle output, preserve encoded samples and their timing, and propagate packaging cancellation without starting a fallback.
+- On the development phone, post-download processing for a 96 MB synthetic HLS fixture fell from 10.485 to 3.088 seconds, approximately 71%. The result's packet hashes and timestamps matched the baseline, and full video/audio decoding passed. See `docs/mp4-packaging-performance.md` for scope and reproduction.
+- A 30-minute synthetic fixture reduced processing from 66.669 to 24.273 seconds, approximately 64%, with matching encoded packets and timestamps and successful full decoding. Nine JVM tests, six Android checks, and both JavRate session tests passed.
+
+### JavRate Download Authorization
+
+- Forward the player's `apiSecretIssuedAt` value in token-refresh requests, matching the current website request format. Missing this field caused HTTP 400 responses when the initial download authorization needed renewal.
+- Extend the session regression test with a server fixture that rejects missing or altered secret issue times, while retaining concurrent-refresh and transient-failure coverage.
+- On the development phone, otherwise identical signed refresh requests returned HTTP 400 without this field and HTTP 200 with a valid replacement token when it was included. Debug compilation and replacement installation succeeded.
+- The user's full 1,688-segment download completed at 100 percent, including MP4 packaging and embedded subtitles. Verified the final MP4 header and actual file size of 2,058,099,147 bytes against the completed download record; no subtitle error was recorded. Multiple ordinary refresh cycles returned HTTP 200 while downloading after the player was closed.
+
 ## 1.2.0 Update - 2026-10-27
 
 ### Stripchat Watch Status

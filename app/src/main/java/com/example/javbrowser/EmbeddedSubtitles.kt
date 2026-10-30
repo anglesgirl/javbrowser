@@ -14,9 +14,11 @@ import org.mp4parser.muxer.builder.DefaultMp4Builder
 import org.mp4parser.muxer.container.mp4.MovieCreator
 import org.mp4parser.muxer.tracks.TextTrackImpl
 import java.io.IOException
+import java.io.BufferedOutputStream
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.channels.WritableByteChannel
+import java.nio.channels.Channels
 import java.util.TreeSet
 import java.util.Properties
 
@@ -106,10 +108,14 @@ object EmbeddedSubtitles {
                 track.subs.addAll(cues.map { TextTrackImpl.Line(it.start, it.end, it.text) })
                 movie.addTrack(track)
             }
+            // Group small audio/text sample writes into large sequential writes. The
+            // caller still owns output; flush only after a successful, uncanceled mux.
+            val buffered = BufferedOutputStream(Channels.newOutputStream(output), 256 * 1024)
+            val bufferedChannel = Channels.newChannel(buffered)
             val destination = object : WritableByteChannel {
                 override fun isOpen() = output.isOpen
                 override fun close() = Unit
-                override fun write(buffer: ByteBuffer): Int { checkCanceled(); return output.write(buffer) }
+                override fun write(buffer: ByteBuffer): Int { checkCanceled(); return bufferedChannel.write(buffer) }
             }
             // The stock builder writes mvhd/tkhd using the LCM of track timescales,
             // but elst using Movie.timescale (GCD). Use the same scale everywhere.
@@ -117,6 +123,7 @@ object EmbeddedSubtitles {
                 override fun getTimescale(movie: Movie): Long = movie.timescale
             }.build(movie).writeContainer(destination)
             checkCanceled()
+            buffered.flush()
         } finally {
             movie.tracks.forEach { runCatching { it.close() } }
         }

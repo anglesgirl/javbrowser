@@ -8,9 +8,15 @@
 
 JAV Browser combines a site-aware WebView browser with stream detection, an internal fullscreen player, external-player handoff, direct MP4/HLS downloads, a searchable bookmark library, local-video management, and cloud-updatable ad-filter rules.
 
-## Latest Development Updates
+## Version 1.2.1
 
-These updates build on version **1.2.0**. See the [Changelog](CHANGELOG.md) for the full update notes.
+Download the latest APK from [Releases](https://github.com/fekilooo/javbrowser/releases/latest). See the [Changelog](CHANGELOG.md) for the full update notes.
+
+- **Faster MP4 packaging:** read downloaded HLS parts directly, reduce repeated extractor calls, and use buffered storage writes. On the development phone, synthetic post-download processing benchmarks improved from 10.5 to 3.1 seconds for a 96 MB fixture and from 66.7 to 24 seconds for a 30-minute fixture. Results vary by media and storage; see [benchmark details](docs/mp4-packaging-performance.md).
+- **JavRate download renewal:** include the player's secret issue time when refreshing authorization, fixing downloads that stopped after the initial token expired.
+- **Verified output:** preserve encoded audio/video samples, B-frame timing, and embedded subtitles; retain cancellation and compatibility fallbacks.
+
+## Existing Features
 
 - **Visual playback history:** retain the latest 200 pages with covers, website icons, actress names when available, and playback dates. Search by title, actress, or URL; swipe left to delete. The full-width dark yellow HOME button appears below the website shortcuts.
 - **Episode playback:** choose ROU and JAVDAY episodes directly in the internal player and automatically advance to the next episode. ROU can resolve its primary video without first starting the webpage player.
