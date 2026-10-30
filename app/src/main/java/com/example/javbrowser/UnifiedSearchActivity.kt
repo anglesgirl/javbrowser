@@ -279,7 +279,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             val check = CheckBox(this).apply {
                 text = site.displayName
                 tag = site.id
-                isChecked = true
+                // avjoy 自建服务器且三条路全 RST，默认不选（用户仍可手动勾选）。
+                isChecked = site.id != SearchSiteIds.AVJOY
                 textSize = 11f
                 setTextColor(android.graphics.Color.WHITE)
                 buttonTintList = android.content.res.ColorStateList.valueOf(
