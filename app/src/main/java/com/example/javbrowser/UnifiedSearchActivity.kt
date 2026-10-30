@@ -131,6 +131,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             })
         }
         adapter.onListCommitted = { restoreReadAnchorIfNeeded() }
+    }
 
     /**
      * Opens a search result. For hosts that publish an ECH config
