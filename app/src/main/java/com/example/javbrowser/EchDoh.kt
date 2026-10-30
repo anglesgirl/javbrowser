@@ -105,8 +105,14 @@ object EchDoh {
         cache.remove(host.lowercase())
     }
 
-    /** Host whose HTTPS record carries the shared Cloudflare ECH config. */
-    private const val SHARED_ECH_HOST = "anglesya.win"
+    /**
+     * Host whose HTTPS record carries the shared Cloudflare ECH config:
+     * Cloudflare's own ECH hostname (the public_name itself), the
+     * canonical source — it does not depend on any personal site
+     * keeping ECH enabled, and its generation is the official current
+     * one. Fetched live on every cache miss, never hardcoded.
+     */
+    private const val SHARED_ECH_HOST = "cloudflare-ech.com"
 
     // Published Cloudflare edge ranges (cloudflare.com/ips). Only used
     // to decide whether the shared Cloudflare ECH config may apply to a
@@ -165,7 +171,10 @@ object EchDoh {
      * differing key is a rotation generation, not a different model).
      * The shared value is fetched on every cache miss, never hardcoded
      * into the code, because keys rotate. A rejected handshake still
-     * fails closed; this never falls back to plaintext.
+     * fails closed; this never falls back to plaintext. Note: a host
+     * on a different key generation (e.g. config_id 249 vs the shared
+     * 82) may reject the shared config; that fails closed and is left
+     * to real-device verification — no further fallback is added for it.
      */
     fun resolve(host: String): HostRecords {
         val key = host.lowercase()
@@ -202,7 +211,7 @@ object EchDoh {
                 // Last resort: shared Cloudflare ECH config. Only when
                 // the site's own ech is missing from every endpoint AND
                 // its dial addresses are Cloudflare edge IPs. Fetched
-                // live from anglesya.win's HTTPS record on every cache
+                // live from cloudflare-ech.com's HTTPS record on every cache
                 // miss — never hardcoded, because keys rotate. A
                 // rejected handshake still fails closed.
                 if (records.addresses.any { isCloudflareIp(it) }) {
