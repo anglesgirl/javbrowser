@@ -175,9 +175,44 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             if (response.transportError != null) return null
             if (response.statusCode !in 200..299) return null
             if (response.body.isBlank()) return null
-            VideoPageSniffer.sniff(response.body, item.detailUrl)
+            val candidates = VideoPageSniffer.sniffCandidates(response.body, item.detailUrl, item.code)
+            for (candidate in candidates) {
+                if (!isAdByDuration(candidate, site)) return candidate
+            }
+            null
         } catch (e: Exception) {
             null
+        }
+    }
+
+    /**
+     * True only when the candidate is proven to be an ad: an m3u8
+     * media playlist whose summed #EXTINF duration is under 60s.
+     * Anything else (master playlists with no EXTINF, mp4, fetch
+     * failures) is kept — only positive ad evidence excludes, never
+     * uncertainty, so a short main video at worst falls back to
+     * WebView instead of breaking playback.
+     */
+    private fun isAdByDuration(candidate: String, site: SearchSite): Boolean {
+        if (!candidate.lowercase().contains(".m3u8")) return false
+        return try {
+            val playlist = SearchHttpFetcher().fetch(candidate, SearchCancellation(), site)
+            if (playlist.transportError != null) return false
+            if (playlist.statusCode !in 200..299) return false
+            var total = 0.0
+            var sawExtinf = false
+            for (line in playlist.body.lines()) {
+                if (line.startsWith("#EXTINF:")) {
+                    val duration = line.removePrefix("#EXTINF:").substringBefore(",").toDoubleOrNull()
+                    if (duration != null) {
+                        total += duration
+                        sawExtinf = true
+                    }
+                }
+            }
+            sawExtinf && total < 60.0
+        } catch (e: Exception) {
+            false
         }
     }
         loadLocalMetadata()
