@@ -84,6 +84,19 @@ object ConscryptEch {
      * Delegating trust manager whose [getNetworkSecurityPolicy] Conscrypt
      * reflects on during the handshake. Do NOT rename this method or the
      * class: Conscrypt finds it by name, and R8 will happily strip it.
+     *
+     * The 3-arg [checkServerTrusted] below is equally reflection-only and
+     * equally mandatory: for a host with domain encryption enabled,
+     * Conscrypt's handshake reflectively looks up
+     * checkServerTrusted(X509Certificate[], String, String) and, not
+     * finding it, fails the handshake with "Domain specific
+     * configurations require that hostname aware checkServerTrusted...
+     * is used" — before any network-dependent step. That is exactly how
+     * every ECH host failed on 2026-10-30 (co3 hit the same failure on
+     * 2026-09-27 and fixed it with this same method). The 2-arg
+     * implementation alone is not enough: the wrapper hides the
+     * delegate's hostname-aware overloads from Conscrypt's reflective
+     * dispatch, so the wrapper must re-expose one.
      */
     class PolicyTrustManager(
         private val delegate: X509TrustManager,
@@ -114,6 +127,40 @@ object ConscryptEch {
 
         override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
             delegate.checkServerTrusted(chain, authType)
+        }
+
+        /**
+         * Conscrypt ECH handshake's reflective hostname-aware check
+         * (ported from co3's proven PolicyTrustManager). Only called via
+         * reflection, hence @Suppress("unused") — and covered by the
+         * ConscryptEch** keep in proguard-rules.pro, so R8 cannot strip
+         * or rename it.
+         */
+        @Suppress("unused")
+        fun checkServerTrusted(
+            chain: Array<out X509Certificate>?,
+            authType: String?,
+            hostname: String?,
+        ) {
+            if (hostname == null) {
+                delegate.checkServerTrusted(chain, authType)
+                return
+            }
+            try {
+                // System TrustManagerImpl's 3-arg overload (hidden API, reflective call).
+                val m = delegate.javaClass.getMethod(
+                    "checkServerTrusted",
+                    Array<X509Certificate>::class.java,
+                    String::class.java,
+                    String::class.java,
+                )
+                m.invoke(delegate, chain, authType, hostname)
+            } catch (_: NoSuchMethodException) {
+                // Delegate has no hostname-aware overload: fall back to 2-arg (chain check only).
+                delegate.checkServerTrusted(chain, authType)
+            } catch (e: java.lang.reflect.InvocationTargetException) {
+                throw (e.cause ?: e)
+            }
         }
 
         override fun getAcceptedIssuers(): Array<X509Certificate> = delegate.acceptedIssuers
