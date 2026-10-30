@@ -22,9 +22,12 @@ import java.util.concurrent.TimeUnit
  *  - A / AAAA: the addresses to dial, so an ECH handshake never depends on
  *    the system resolver for the target host.
  *
- * Endpoints are Ali + 360 only (the user's standing DoH choice). Both are
- * reached by pinned IP + SNI (the DoH hostname), never through the system
- * resolver: the DoH client below overrides DNS for exactly those two hosts.
+ * Endpoints are Ali + 360 first, the user's private Cloudflare
+ * Gateway last (the user's standing DoH base plus a clean resolver
+ * for blocked domains). All are reached by pinned IP + SNI (the DoH
+ * hostname), never through the system resolver: the DoH client below
+ * overrides DNS for exactly those hosts. The Gateway hostname must
+ * never appear in logs — only the short name "Gateway".
  * Results are cached per host with the records' TTL, clamped to [30s, 10min];
  * failures and empty answers are cached briefly so a dead DoH endpoint
  * cannot stall every request.
@@ -49,13 +52,21 @@ object EchDoh {
 
     private data class DohEndpoint(val name: String, val url: String, val pinnedIps: List<String>)
 
-    // Ali + 360 only. Pinned IPs are the providers' anycast / documented
-    // addresses; OkHttp still verifies the certificate against the DoH
-    // hostname, and SNI is the hostname (OkHttp passes the URL host to
-    // createSocket), so dialing a pinned IP does not weaken TLS.
+    // Ali + 360 first, private Cloudflare Gateway last. Pinned IPs are
+    // the providers' anycast / documented addresses; OkHttp still
+    // verifies the certificate against the DoH hostname, and SNI is
+    // the hostname (OkHttp passes the URL host to createSocket), so
+    // dialing a pinned IP does not weaken TLS. The Gateway hostname
+    // must NEVER go through system DNS (it would be polluted): its
+    // entry pins the benign Cloudflare edge bootstrap IP below, so
+    // the Gateway DoH is reached by direct IP + SNI like the others.
+    // PRIVACY: the Gateway is the user's private resolver — logs
+    // (logcat and the in-app transport log) use only the short name
+    // "Gateway", never its hostname. Never log endpoint.url.
     private val ENDPOINTS = listOf(
         DohEndpoint("Ali", "https://dns.alidns.com/dns-query", listOf("223.5.5.5", "223.6.6.6")),
         DohEndpoint("360", "https://doh.360.cn/dns-query", listOf("101.198.193.29", "101.198.192.33")),
+        DohEndpoint("Gateway", "https://0kbpekmcr1.cloudflare-gateway.com/dns-query", listOf("172.64.147.104")),
     )
 
     private val pinnedByHost: Map<String, List<String>> = ENDPOINTS.associate { endpoint ->
@@ -165,7 +176,10 @@ object EchDoh {
     }
 
     /**
-     * Resolves [host] through Ali first, then 360. A valid answer is
+     * Resolves [host] through Ali, then 360, then the private Gateway
+     * (in that order; the Gateway is a clean resolver that answers
+     * truly for blocked domains, and only runs when the first two
+     * cannot provide ech or fail). A valid answer is
      * adopted immediately when it carries an ech config (the common
      * case: no second query). When a valid answer has NO ech, the next
      * endpoint's HTTPS record alone is asked before concluding "no
@@ -219,7 +233,7 @@ object EchDoh {
                             return merged
                         }
                     } catch (e: Exception) {
-                        Log.w(TAG, "DoH HTTPS ech lookup via ${next.url} failed for $host: ${e.message}")
+                        Log.w(TAG, "DoH HTTPS ech lookup via ${next.name} failed for $host: ${e.message}")
                     }
                 }
                 // Last resort: shared Cloudflare ECH config. Only when
@@ -246,7 +260,7 @@ object EchDoh {
                                 return merged
                             }
                         } catch (e: Exception) {
-                            Log.w(TAG, "shared ech lookup via ${sharedEndpoint.url} failed for $host: ${e.message}")
+                            Log.w(TAG, "shared ech lookup via ${sharedEndpoint.name} failed for $host: ${e.message}")
                         }
                     }
                 }
@@ -254,7 +268,7 @@ object EchDoh {
                 cacheResolved(key, records, minTtl)
                 return records
             } catch (e: Exception) {
-                Log.w(TAG, "DoH via ${endpoint.url} failed for $host: ${e.message}")
+                Log.w(TAG, "DoH via ${endpoint.name} failed for $host: ${e.message}")
             }
         }
         val empty = HostRecords(emptyList(), null, false, "")
