@@ -1,11 +1,15 @@
 package com.example.javbrowser
 
+import android.util.Log
 import android.webkit.CookieManager
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.util.concurrent.TimeUnit
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 data class SearchHttpResponse(val statusCode: Int, val finalUrl: String, val body: String,
                               val contentType: String?, val retryAfterUntil: Long = 0L,
@@ -16,16 +20,92 @@ data class SearchHttpResponse(val statusCode: Int, val finalUrl: String, val bod
 
 class SearchHttpFetcher {
     fun fetch(url: String, cancellation: SearchCancellation, site: SearchSite): SearchHttpResponse {
-        val client = baseClient.newBuilder().addNetworkInterceptor { chain ->
-            val target = chain.request().url
-            if (!site.isAllowedHost(target.host)) throw SearchTransportException("UNEXPECTED_REDIRECT_HOST")
-            val cookies = CookieManager.getInstance().getCookie(target.toString())
-            val request = chain.request().newBuilder().removeHeader("Cookie")
-            if (!cookies.isNullOrBlank()) request.header("Cookie", cookies)
-            val response = chain.proceed(request.build())
-            response.headers("Set-Cookie").forEach { CookieManager.getInstance().setCookie(target.toString(), it) }
-            response
-        }.build()
+        cancellation.check()
+        val host = url.toHttpUrlOrNull()?.host
+        if (host != null) {
+            when (EchH3Router.route(host)) {
+                EchH3Router.Route.Ech -> return fetchEch(url, cancellation, site, host)
+                EchH3Router.Route.Cronet -> {
+                    try {
+                        return EchH3Router.fetchViaCronet(url, site, cancellation, headerList(url, site))
+                    } catch (e: EchH3Router.CronetFetchFailed) {
+                        if (cancellation.isCancelled) throw IOException("Canceled")
+                        Log.d("EchH3", "Cronet failed for $host, falling back to plain OkHttp: ${e.message}")
+                    }
+                    // SearchTransportException (allowlist / body cap) and
+                    // IOException("Canceled") propagate: never fall back.
+                }
+            }
+        }
+        return fetchPlain(url, cancellation, site)
+    }
+
+    /**
+     * ECH path: the ECH-capable client, fail-closed. A first-attempt
+     * failure (DoH/ECH config may not have been ready on the first
+     * request) → sleep 700ms, invalidate the cached config, retry once.
+     * A second failure becomes transportError "ECH_FAILED" — never a
+     * silent plaintext retry (that would leak the SNI ECH exists to
+     * hide). The search layer already handles transportError by
+     * degrading that provider while others still return results.
+     */
+    private fun fetchEch(
+        url: String,
+        cancellation: SearchCancellation,
+        site: SearchSite,
+        host: String,
+    ): SearchHttpResponse {
+        val client = EchH3Router.searchEchClient()
+            .newBuilder()
+            .addNetworkInterceptor(cookieInterceptor(site))
+            .build()
+        try {
+            return executeOkHttp(client, url, cancellation, site)
+        } catch (e: IOException) {
+            if (cancellation.isCancelled) throw e
+            Log.d("EchH3", "ECH attempt failed for $host, retrying after 700ms: ${e.message}")
+            try {
+                Thread.sleep(700)
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IOException("Canceled", ie)
+            }
+            cancellation.check()
+            EchDoh.invalidate(host)
+            try {
+                return executeOkHttp(client, url, cancellation, site)
+            } catch (e2: IOException) {
+                if (cancellation.isCancelled) throw e2
+                Log.w("EchH3", "ECH failed for $host (fail-closed, no plaintext fallback): ${e2.message}")
+                return SearchHttpResponse(
+                    statusCode = 0,
+                    finalUrl = url,
+                    body = "",
+                    contentType = null,
+                    transportError = "ECH_FAILED",
+                )
+            }
+        }
+    }
+
+    private fun fetchPlain(
+        url: String,
+        cancellation: SearchCancellation,
+        site: SearchSite,
+    ): SearchHttpResponse {
+        val client = baseClient.newBuilder()
+            .addNetworkInterceptor(cookieInterceptor(site))
+            .build()
+        return executeOkHttp(client, url, cancellation, site)
+    }
+
+    /** The original fetch body, unchanged: request, call, 2MB cap, response mapping. */
+    private fun executeOkHttp(
+        client: OkHttpClient,
+        url: String,
+        cancellation: SearchCancellation,
+        site: SearchSite,
+    ): SearchHttpResponse {
         cancellation.check()
         val request = Request.Builder().url(url)
             .header("User-Agent", USER_AGENT)
@@ -49,6 +129,31 @@ class SearchHttpFetcher {
             }
         } finally { detach() }
     }
+
+    /** The original network interceptor, factored out so both OkHttp paths share it. */
+    private fun cookieInterceptor(site: SearchSite): Interceptor = Interceptor { chain ->
+        val target = chain.request().url
+        if (!site.isAllowedHost(target.host)) throw SearchTransportException("UNEXPECTED_REDIRECT_HOST")
+        val cookies = CookieManager.getInstance().getCookie(target.toString())
+        val request = chain.request().newBuilder().removeHeader("Cookie")
+        if (!cookies.isNullOrBlank()) request.header("Cookie", cookies)
+        val response = chain.proceed(request.build())
+        response.headers("Set-Cookie").forEach { CookieManager.getInstance().setCookie(target.toString(), it) }
+        response
+    }
+
+    private fun headerList(url: String, site: SearchSite): List<Pair<String, String>> {
+        val headers = mutableListOf(
+            "User-Agent" to USER_AGENT,
+            "Accept" to "text/html,application/xhtml+xml",
+            "Accept-Language" to "zh-TW,zh;q=0.9,en;q=0.8",
+        )
+        if (site.parserKind == SearchParserKind.JABLE && url.contains("function=get_block")) {
+            headers += "X-Requested-With" to "XMLHttpRequest"
+        }
+        return headers
+    }
+
     companion object {
         private const val MAX_BODY = 2L * 1024 * 1024
         private val baseClient = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS)

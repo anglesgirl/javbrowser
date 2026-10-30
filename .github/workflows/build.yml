@@ -1,0 +1,75 @@
+name: Build APK
+
+on:
+  push:
+    branches:
+      - feat/ech-h3-applayer
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # The repo has no Unix gradlew (only gradlew.bat), so Gradle is
+      # installed by the action instead of running a wrapper script.
+      - name: Set up Gradle 8.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.2"
+
+      # The repo gitignores google-services.json (upstream never shipped
+      # one), and the google-services plugin fails without it. Write a
+      # dummy placeholder at build time only — never commit it, so a real
+      # config can never leak through this file by accident.
+      - name: Write placeholder google-services.json
+        run: |
+          cat > app/google-services.json <<'EOF'
+          {"client":[{"api_key":[{"current_key":"AIzaSyPlaceholderPlaceholderPlaceholder00"}],"client_info":{"android_client_info":{"package_name":"com.example.javbrowser"},"mobilesdk_app_id":"1:000000000000:android:0000000000000000"},"oauth_client":[],"services":{"appinvite_service":{"other_platform_oauth_client":[]}}},{"api_key":[{"current_key":"AIzaSyPlaceholderPlaceholderPlaceholder00"}],"client_info":{"android_client_info":{"package_name":"com.example.javbrowser.ech"},"mobilesdk_app_id":"1:000000000000:android:0000000000000001"},"oauth_client":[],"services":{"appinvite_service":{"other_platform_oauth_client":[]}}}],"configuration_version":"1","project_info":{"project_id":"javbrowser-placeholder","project_number":"000000000000","storage_bucket":"javbrowser-placeholder.appspot.com"}}
+          EOF
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: javbrowser-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: javbrowser-debug
+          path: apks
+
+      - name: Publish to Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="build-$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
+          SUBJECT="$(git log -1 --pretty=%s)"
+          gh release create "$TAG" apks/app-debug.apk \
+            --title "构建版 $TAG" \
+            --notes "feat/ech-h3-applayer 自动构建：$SUBJECT" \
+            --target "$GITHUB_SHA"

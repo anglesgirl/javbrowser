@@ -13,13 +13,19 @@ android {
         applicationId = "com.example.javbrowser"
         minSdk = 24
         targetSdk = 34
-        versionCode = 121
+        versionCode = 122
         versionName = "1.2.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
+        debug {
+            // Upstream 1.2.1 is author-release-signed; the same package
+            // name would not install over it. The suffix lets this
+            // build install side-by-side with upstream.
+            applicationIdSuffix = ".ech"
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -68,6 +74,11 @@ dependencies {
     implementation("androidx.webkit:webkit:1.10.0")
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // App-layer ECH (Conscrypt) + HTTP/3 (Cronet) for search/page fetch.
+    // OkHttp, AGP, Kotlin and the SDK levels are deliberately NOT upgraded.
+    implementation("org.conscrypt:conscrypt-android:2.7.0")
+    implementation("org.chromium.net:cronet-embedded:143.7445.0")
     implementation("org.mp4parser:muxer:1.9.56")
     implementation("androidx.work:work-runtime-ktx:2.9.0")
     

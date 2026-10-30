@@ -27,7 +27,6 @@ import androidx.work.WorkerParameters
 import com.bumptech.glide.Glide
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
@@ -303,11 +302,16 @@ private class SalesRankingAdapter(
 }
 
 class SalesRankingRepository(private val context: Context) {
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
-        .followRedirects(true)
-        .build()
+    // Same timeouts as before (15s connect / 25s read / followRedirects),
+    // now built through the EchH3 factory: hosts with an ECH config get
+    // Conscrypt ECH, others get plain TLS via the same client. A failed
+    // ECH handshake degrades to this source's empty section through the
+    // existing per-source try/catch, never a crash.
+    private val client = EchH3Router.newOkHttpClient(
+        connectSec = 15,
+        readSec = 25,
+        followRedirects = true,
+    )
 
     fun fetchAll(): List<SalesSection> = listOf(
         source("proclivity", "Proclivity-DB｜FANZA 女優月榜", SalesCategory.ONLINE,

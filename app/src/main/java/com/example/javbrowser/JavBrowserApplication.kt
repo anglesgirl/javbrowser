@@ -8,6 +8,10 @@ class JavBrowserApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         AppTelemetry.initialize(this)
+        // App-layer ECH+H3: install Conscrypt (provider #1) so the EchH3
+        // factory can build ECH-capable clients. CronetEngine itself stays
+        // lazy (built on first non-ECH search). Telemetry untouched.
+        EchH3Router.init(this)
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             override fun onActivityCreated(activity: Activity, state: Bundle?) {
                 if (state != null) return
