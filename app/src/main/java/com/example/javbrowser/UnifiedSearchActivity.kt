@@ -114,16 +114,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         renderPanel()
 
         adapter = UnifiedSearchAdapter(sites.associate { it.id to it.displayName },
-            onOpen = { item ->
-                rememberReadAnchor()
-                preserveSessionOnStop = true
-                BrowserNavigator.open(this, item.detailUrl)
-            },
+            onOpen = { item -> openResult(item) },
             onShowSources = { group ->
                 rememberReadAnchor()
                 UnifiedSearchSourceSheet.show(this, group, sites.associate { it.id to it.displayName }) { item ->
-                    preserveSessionOnStop = true
-                    BrowserNavigator.open(this, item.detailUrl)
+                    openResult(item)
                 }
             })
         resultsView = findViewById<RecyclerView>(R.id.rv_unified_results).apply {
@@ -136,6 +131,55 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             })
         }
         adapter.onListCommitted = { restoreReadAnchorIfNeeded() }
+
+    /**
+     * Opens a search result. For hosts that publish an ECH config
+     * (the app-layer fetch works while WebView is the blocked leg),
+     * first try sniffing the video URL from the detail page HTML
+     * fetched over ECH and play it in the internal player; any
+     * failure falls back to opening the page in WebView (current
+     * behavior). Non-ECH hosts go straight to WebView, no extra fetch.
+     */
+    private fun openResult(item: SearchItem) {
+        rememberReadAnchor()
+        preserveSessionOnStop = true
+        SearchScheduler.workers.execute {
+            val videoUrl = trySniffVideoUrl(item)
+            runOnUiThread {
+                if (videoUrl != null) {
+                    startActivity(android.content.Intent(this, FullscreenInternalPlayerActivity::class.java).apply {
+                        putExtra(FullscreenInternalPlayerActivity.EXTRA_VIDEO_URL, videoUrl)
+                        putExtra(FullscreenInternalPlayerActivity.EXTRA_REFERER, item.detailUrl)
+                        putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, item.detailUrl)
+                        putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, item.title)
+                    })
+                } else {
+                    BrowserNavigator.open(this, item.detailUrl)
+                }
+            }
+        }
+    }
+
+    /** Returns a sniffed video URL, or null to fall back to WebView. Never throws. */
+    private fun trySniffVideoUrl(item: SearchItem): String? {
+        return try {
+            val host = try { java.net.URL(item.detailUrl).host } catch (e: Exception) { return null }
+            if (EchDoh.configFor(host) == null) return null
+            val site = sites.firstOrNull { it.id == item.siteId } ?: return null
+            runOnUiThread {
+                android.widget.Toast.makeText(this,
+                    LanguageManager.text(this, "正在嗅探播放地址…", "Sniffing video URL…"),
+                    android.widget.Toast.LENGTH_SHORT).show()
+            }
+            val response = SearchHttpFetcher().fetch(item.detailUrl, SearchCancellation(), site)
+            if (response.transportError != null) return null
+            if (response.statusCode !in 200..299) return null
+            if (response.body.isBlank()) return null
+            VideoPageSniffer.sniff(response.body, item.detailUrl)
+        } catch (e: Exception) {
+            null
+        }
+    }
         loadLocalMetadata()
 
         setupSiteChooser()
