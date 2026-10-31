@@ -157,7 +157,38 @@ class AdFilterRules(private val context: Context) {
             "labadena.com",
             "go.mavrtracktor.com",
             "magsrv.com",
-            "tsyndicate.com"
+            "tsyndicate.com",
+            // 2026-10-31: well-known ad/pop/tracker networks (substring
+            // match on the full URL; all are pure ad-serving hosts, not
+            // site-function hosts, so blocking them does not break pages).
+            "doubleclick.net",
+            "googlesyndication.com",
+            "googleadservices.com",
+            "adservice.google.com",
+            "popads.net",
+            "popcash.net",
+            "adcash.com",
+            "propellerads.com",
+            "adsterra.com",
+            "hilltopads.com",
+            "outbrain.com",
+            "taboola.com",
+            "juicyads.com",
+            "trafficjunky.com",
+            "trafficstars.com",
+            "ero-advertising.com",
+            "plugrush.com",
+            "adnxs.com",
+            "adsrvr.org",
+            "amazon-adsystem.com",
+            "criteo.com",
+            "adform.net",
+            "smartadserver.com",
+            "pubmatic.com",
+            "rubiconproject.com",
+            "openx.net",
+            "streamhls.click",
+            "popunder"
         )
 
         private val DEFAULT_RULES = """

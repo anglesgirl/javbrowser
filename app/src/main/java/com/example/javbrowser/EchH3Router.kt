@@ -3,6 +3,8 @@ package com.example.javbrowser
 import android.content.Context
 import android.util.Log
 import android.webkit.CookieManager
+import android.webkit.WebResourceResponse
+import java.io.ByteArrayInputStream
 import okhttp3.Dns
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
@@ -21,8 +23,9 @@ import java.util.concurrent.TimeUnit
 
 /**
  * The single factory and router for app-layer network access (search,
- * page fetching, and the video proxy's upstream fetch — the player
- * WebView itself never comes here; its TLS is system-controlled).
+ * page fetching, the video proxy's upstream fetch, and the main browser
+ * WebView's intercepted GETs — WebView's own default loads, and POSTs,
+ * never come here; their TLS is system-controlled).
  *
  * Routing (ECH first, security over speed): for every host, [EchDoh]
  * resolves the HTTPS record first. A host that publishes an ECH config
@@ -191,6 +194,124 @@ object EchH3Router {
         } catch (e: Exception) {
             throw IOException("shared ECH client unavailable", e)
         }
+    }
+
+    /**
+     * Shared client for browser (WebView) resource fetches: same ECH
+     * shape as the proxy's client, no call timeout (a page resource or
+     * video stream must never be killed by a call bound), connect/read
+     * mirroring the proxy (15s/30s, read is per-read idle). Built only
+     * after route() has verified Conscrypt is up for an ECH host, so
+     * the newOkHttpClient plain-fallback trap cannot fire here.
+     */
+    private val webClient: OkHttpClient by lazy {
+        newOkHttpClient(
+            connectSec = 15,
+            readSec = 30,
+            callSec = null,
+            followRedirects = true,
+            retryOnConnectionFailure = true,
+        )
+    }
+
+    /**
+     * Fetches one browser GET request through ECH, for
+     * WebViewClient.shouldInterceptRequest. Call only from that
+     * callback's background thread, never the main thread (blocking).
+     *
+     * Returns null when the URL is not HTTPS or its host publishes no
+     * ECH config — the caller MUST then fall through to WebView
+     * default (plaintext is correct for non-ECH sites). Any non-null
+     * result MUST be returned as-is: on ECH failure (after one 700ms
+     * retry with the cached config invalidated, mirroring
+     * SearchHttpFetcher) it is a fail-closed 502 error page, never a
+     * plaintext fallback. A route() exception (DoH itself broken) also
+     * returns null: with no config obtainable, ECH is impossible
+     * anyway, so plaintext is the only transport left.
+     *
+     * Request headers are forwarded except Host/Connection/
+     * Content-Length/Transfer-Encoding (OkHttp sets those) and
+     * Accept-Encoding (OkHttp's transparent gzip handles it, so WebView
+     * always gets plain bytes). Set-Cookie is written back to
+     * CookieManager so ECH-fetched pages share login state with
+     * WebView's own requests. Only main-frame successes and all
+     * failures are logged, so image-heavy pages do not spam logcat.
+     */
+    fun fetchWebViewResource(
+        url: String,
+        requestHeaders: Map<String, String>?,
+        isMainFrame: Boolean,
+    ): WebResourceResponse? {
+        val parsed = url.toHttpUrlOrNull() ?: return null
+        if (parsed.scheme != "https") return null
+        val isEch = runCatching { route(parsed.host) == Route.Ech }.getOrDefault(false)
+        if (!isEch) return null
+        val builder = okhttp3.Request.Builder().url(url)
+        requestHeaders?.forEach { (name, value) ->
+            if (!name.equals("Host", ignoreCase = true) &&
+                !name.equals("Connection", ignoreCase = true) &&
+                !name.equals("Accept-Encoding", ignoreCase = true) &&
+                !name.equals("Content-Length", ignoreCase = true) &&
+                !name.equals("Transfer-Encoding", ignoreCase = true)
+            ) {
+                builder.header(name, value)
+            }
+        }
+        val request = builder.build()
+        var lastError: Exception? = null
+        repeat(2) { attempt ->
+            if (attempt > 0) {
+                EchDoh.invalidate(parsed.host)
+                try {
+                    Thread.sleep(700)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return errorResponse()
+                }
+            }
+            try {
+                val response = webClient.newCall(request).execute()
+                val finalUrl = response.request.url.toString()
+                response.headers("Set-Cookie").forEach { value ->
+                    CookieManager.getInstance().setCookie(finalUrl, value)
+                }
+                val contentType = response.header("Content-Type")
+                val mime = contentType?.substringBefore(';')?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: "application/octet-stream"
+                val encoding = contentType?.split(';')?.map { it.trim() }
+                    ?.firstOrNull { it.startsWith("charset=", ignoreCase = true) }
+                    ?.substringAfter('=', "")?.trim()?.takeIf { it.isNotEmpty() } ?: "utf-8"
+                val headers = mutableMapOf<String, String>()
+                response.headers.toMultimap().forEach { (name, values) ->
+                    if (!name.equals("Set-Cookie", ignoreCase = true)) {
+                        headers[name] = values.joinToString(", ")
+                    }
+                }
+                val body = response.body?.byteStream() ?: ByteArrayInputStream(ByteArray(0))
+                if (isMainFrame) {
+                    Log.d(TAG, "webview ECH $finalUrl status=${response.code}")
+                }
+                return WebResourceResponse(
+                    mime, encoding, response.code, response.message, headers, body,
+                )
+            } catch (e: Exception) {
+                lastError = e
+                Log.d(TAG, "webview ECH attempt $attempt failed for ${redactForLog(url)}: ${e.message}")
+            }
+        }
+        Log.w(TAG, "webview ECH failed for ${redactForLog(url)}: ${lastError?.message}")
+        return errorResponse()
+    }
+
+    private fun errorResponse(): WebResourceResponse =
+        WebResourceResponse(
+            "text/plain", "utf-8", 502, "Bad Gateway", emptyMap(),
+            ByteArrayInputStream(ByteArray(0)),
+        )
+
+    private fun redactForLog(url: String): String {
+        val parsed = url.toHttpUrlOrNull() ?: return url.take(160)
+        return "${parsed.scheme}://${parsed.host}${parsed.encodedPath}".take(160)
     }
 
     /**
