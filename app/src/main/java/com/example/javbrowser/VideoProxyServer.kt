@@ -276,7 +276,12 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
             requestBuilder.header("Range", rangeHeader)
         }
         val response = echClient.newCall(requestBuilder.build()).execute()
-        val body = response.body
+        // This OkHttp declares body nullable; an upstream response with
+        // no body is an error, not an empty stream (fail-closed to 500).
+        val body = response.body ?: run {
+            response.close()
+            throw java.io.IOException("Empty upstream body")
+        }
         return Upstream(
             code = response.code,
             contentType = response.header("Content-Type") ?: "",
