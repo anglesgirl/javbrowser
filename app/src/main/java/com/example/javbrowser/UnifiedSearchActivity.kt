@@ -249,7 +249,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         var hiddenWebView: android.webkit.WebView? = null
         var done = false
         var chasedEmbed = false
-        var timeoutRunnable: Runnable? = null
+        var timeoutRunnable: Runnable by kotlin.properties.Delegates.notNull()
         fun finish(url: String?) {
             if (done) return
             done = true
