@@ -252,7 +252,14 @@ object EchH3Router {
                 !name.equals("Connection", ignoreCase = true) &&
                 !name.equals("Accept-Encoding", ignoreCase = true) &&
                 !name.equals("Content-Length", ignoreCase = true) &&
-                !name.equals("Transfer-Encoding", ignoreCase = true)
+                !name.equals("Transfer-Encoding", ignoreCase = true) &&
+                // Cache validators must not be forwarded: an intercepted
+                // response bypasses WebView's HTTP cache, so an upstream
+                // 304 ("use your cache") has no cached body to use and
+                // surfaces as a response-code failure. Forcing a full
+                // 200 avoids that trap (reloads included).
+                !name.equals("If-Modified-Since", ignoreCase = true) &&
+                !name.equals("If-None-Match", ignoreCase = true)
             ) {
                 builder.header(name, value)
             }
@@ -283,7 +290,18 @@ object EchH3Router {
                     ?.substringAfter('=', "")?.trim()?.takeIf { it.isNotEmpty() } ?: "utf-8"
                 val headers = mutableMapOf<String, String>()
                 response.headers.toMultimap().forEach { (name, values) ->
-                    if (!name.equals("Set-Cookie", ignoreCase = true)) {
+                    // Hop-by-hop and framing headers are consumed by the
+                    // transport and must not reach WebView: Set-Cookie is
+                    // already synced to CookieManager above, Content-Type
+                    // is carried by the mimeType parameter, and a stale
+                    // Content-Encoding/Transfer-Encoding would make
+                    // WebView decode already-decoded bytes.
+                    if (!name.equals("Set-Cookie", ignoreCase = true) &&
+                        !name.equals("Content-Encoding", ignoreCase = true) &&
+                        !name.equals("Transfer-Encoding", ignoreCase = true) &&
+                        !name.equals("Connection", ignoreCase = true) &&
+                        !name.equals("Content-Type", ignoreCase = true)
+                    ) {
                         headers[name] = values.joinToString(", ")
                     }
                 }
@@ -292,7 +310,7 @@ object EchH3Router {
                     Log.d(TAG, "webview ECH $finalUrl status=${response.code}")
                 }
                 return WebResourceResponse(
-                    mime, encoding, response.code, response.message, headers, body,
+                    mime, encoding, response.code, reasonFor(response.code, response.message), headers, body,
                 )
             } catch (e: Exception) {
                 lastError = e
@@ -301,6 +319,29 @@ object EchH3Router {
         }
         Log.w(TAG, "webview ECH failed for ${redactForLog(url)}: ${lastError?.message}")
         return errorResponse()
+    }
+
+    /**
+     * HTTP/2 responses carry no reason phrase (OkHttp reports ""), and
+     * an empty reason on an intercepted response is a malformed status
+     * line candidate — default it by code instead of passing "" through.
+     */
+    private fun reasonFor(code: Int, message: String): String {
+        if (message.isNotBlank()) return message
+        return when (code) {
+            200 -> "OK"
+            206 -> "Partial Content"
+            301 -> "Moved Permanently"
+            302 -> "Found"
+            304 -> "Not Modified"
+            400 -> "Bad Request"
+            401 -> "Unauthorized"
+            403 -> "Forbidden"
+            404 -> "Not Found"
+            502 -> "Bad Gateway"
+            503 -> "Service Unavailable"
+            else -> ""
+        }
     }
 
     private fun errorResponse(): WebResourceResponse =
