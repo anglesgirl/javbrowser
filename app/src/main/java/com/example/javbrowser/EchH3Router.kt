@@ -254,10 +254,13 @@ object EchH3Router {
                 !name.equals("Content-Length", ignoreCase = true) &&
                 !name.equals("Transfer-Encoding", ignoreCase = true) &&
                 // Cache validators must not be forwarded: an intercepted
-                // response bypasses WebView's HTTP cache, so an upstream
-                // 304 ("use your cache") has no cached body to use and
-                // surfaces as a response-code failure. Forcing a full
-                // 200 avoids that trap (reloads included).
+                // response used to be able to enter WebView's HTTP cache
+                // via upstream cache headers, so an upstream 304 ("use
+                // your cache") had no cached body to use and surfaced
+                // as a response-code failure. Forcing a full 200 avoids
+                // that trap (reloads included). The response side now
+                // also forces no-store (see below), so intercepted
+                // responses never poison the cache in the first place.
                 !name.equals("If-Modified-Since", ignoreCase = true) &&
                 !name.equals("If-None-Match", ignoreCase = true)
             ) {
@@ -296,15 +299,31 @@ object EchH3Router {
                     // is carried by the mimeType parameter, and a stale
                     // Content-Encoding/Transfer-Encoding would make
                     // WebView decode already-decoded bytes.
+                    // Cache headers are stripped too and replaced by
+                    // no-store below: an intercepted error page (or any
+                    // intercepted response) must never sit in WebView's
+                    // HTTP cache, or a refresh keeps serving the stale
+                    // error and only a cache clear recovers (seen live:
+                    // ERR_HTTP_RESPONSE_CODE_FAILURE stuck until the
+                    // app cache was cleared).
                     if (!name.equals("Set-Cookie", ignoreCase = true) &&
                         !name.equals("Content-Encoding", ignoreCase = true) &&
                         !name.equals("Transfer-Encoding", ignoreCase = true) &&
                         !name.equals("Connection", ignoreCase = true) &&
-                        !name.equals("Content-Type", ignoreCase = true)
+                        !name.equals("Content-Type", ignoreCase = true) &&
+                        !name.equals("Cache-Control", ignoreCase = true) &&
+                        !name.equals("Expires", ignoreCase = true) &&
+                        !name.equals("ETag", ignoreCase = true) &&
+                        !name.equals("Last-Modified", ignoreCase = true)
                     ) {
                         headers[name] = values.joinToString(", ")
                     }
                 }
+                // Intercepted responses are always re-fetched: WebView
+                // must not cache them (see above).
+                headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+                headers["Pragma"] = "no-cache"
+                headers["Expires"] = "0"
                 val body = response.body?.byteStream() ?: ByteArrayInputStream(ByteArray(0))
                 if (isMainFrame) {
                     Log.d(TAG, "webview ECH $finalUrl status=${response.code}")
@@ -346,7 +365,12 @@ object EchH3Router {
 
     private fun errorResponse(): WebResourceResponse =
         WebResourceResponse(
-            "text/plain", "utf-8", 502, "Bad Gateway", emptyMap(),
+            "text/plain", "utf-8", 502, "Bad Gateway",
+            mapOf(
+                "Cache-Control" to "no-store, no-cache, must-revalidate",
+                "Pragma" to "no-cache",
+                "Expires" to "0",
+            ),
             ByteArrayInputStream(ByteArray(0)),
         )
 
