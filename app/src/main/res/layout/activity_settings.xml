@@ -579,6 +579,15 @@
                     android:text="我的屏蔽列表"
                     android:textColor="#FFFFFF"
                     android:layout_marginTop="12dp" />
+
+                <Button
+                    android:id="@+id/btn_user_dom_list"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:backgroundTint="#FF5722"
+                    android:text="我屏蔽的元素"
+                    android:textColor="#FFFFFF"
+                    android:layout_marginTop="12dp" />
             </LinearLayout>
         </androidx.cardview.widget.CardView>
 

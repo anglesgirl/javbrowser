@@ -60,6 +60,8 @@ class MainActivity : LocalizedActivity() {
     private lateinit var btnDownloads: Button
     private lateinit var btnCrossSiteSearch: Button
     private lateinit var btnCopyPageUrl: Button
+    private lateinit var btnBlockElement: Button
+    private var domBlockPickerActive = false
     private lateinit var progressBar: android.widget.ProgressBar
     private lateinit var favoritesManager: FavoritesManager
     private lateinit var privacySettings: PrivacySettings
@@ -320,6 +322,8 @@ class MainActivity : LocalizedActivity() {
         btnCrossSiteSearch = findViewById(R.id.btn_cross_site_search)
         btnCopyPageUrl = findViewById(R.id.btn_copy_page_url)
         btnCopyPageUrl.setOnClickListener { copyCurrentPageUrl() }
+        btnBlockElement = findViewById(R.id.btn_block_element)
+        btnBlockElement.setOnClickListener { enterDomBlockPicker() }
         btnCopyPageUrl.setOnLongClickListener {
             Toast.makeText(this, LanguageManager.text(this, "複製目前網頁網址", "Copy current page URL"), Toast.LENGTH_SHORT).show()
             true
@@ -608,6 +612,18 @@ class MainActivity : LocalizedActivity() {
                 SiteDomRemoveRule("div:has(> a[href*='/api/hop/'])")
             )
             rules.add(SiteDomRemoveRule("a[href*='/api/hop/']"))
+        }
+        // 使用者點選屏蔽的元素規則：域名匹配（含子域）即併入，與站點規則走同一套
+        // 移除 + MutationObserver，動態後插的廣告框也會被清掉。
+        val pageHost = try {
+            Uri.parse(pageUrl.orEmpty()).host.orEmpty().lowercase()
+        } catch (e: Exception) {
+            ""
+        }
+        if (pageHost.isNotEmpty()) {
+            adFilterRules.getUserDomRemoveRules()
+                .filter { pageHost == it.domain || pageHost.endsWith(".${it.domain}") }
+                .forEach { rules.add(SiteDomRemoveRule(it.selector)) }
         }
         if (view == null || rules.isEmpty()) return
         val payload = org.json.JSONArray()
@@ -1038,7 +1054,7 @@ class MainActivity : LocalizedActivity() {
         }
         val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
             .setTitle("屏蔽這個來源？")
-            .setMessage("來源：$host\n\n屏蔽後，該來源的圖片、腳本與廣告將不再載入。屏錯了可在設定 → 我的屏蔽列表裡刪除。")
+            .setMessage("來源：$host\n\n屏蔽後，該來源的圖片、腳本與廣告將不再載入。框本身還在的話，點工具欄的 🚫 進點選模式，點一下那個框就能移除。屏錯了可在設定 → 我的屏蔽列表裡刪除。")
         if (sameBase || baseDomain == host) {
             dialog.setPositiveButton("屏蔽此域名") { _, _ -> addUserBlockAndReload(host) }
         } else {
@@ -1058,6 +1074,122 @@ class MainActivity : LocalizedActivity() {
             Toast.LENGTH_SHORT
         ).show()
         webView.reload()
+    }
+
+    /**
+     * 點選屏蔽：長按只能攔住廣告圖片/連結的請求，框本身是頁面元素，
+     * 網路層攔不掉——要框消失得把元素從 DOM 移除。點工具欄 🚫 進入
+     * 點選模式，點一下要屏蔽的元素，確認選擇器後立即移除，並記成
+     * 使用者元素規則，以後打開同站頁面自動移除（含動態後插的框）。
+     * 按返回鍵取消點選模式；換頁自動退出。
+     */
+    private fun enterDomBlockPicker() {
+        if (domBlockPickerActive) return
+        domBlockPickerActive = true
+        webView.evaluateJavascript(
+            """
+            (function() {
+                if (window.__javDomPicker) return;
+                var current = null;
+                function describe(el) {
+                    var s = (el.tagName || '').toLowerCase();
+                    if (el.id) s += '#' + el.id;
+                    return s;
+                }
+                function selectorFor(el) {
+                    var parts = [];
+                    var node = el;
+                    while (node && node.nodeType === 1 && node !== document.documentElement) {
+                        var part = (node.tagName || '').toLowerCase();
+                        if (node.id) {
+                            try {
+                                if (document.querySelectorAll('#' + CSS.escape(node.id)).length === 1) {
+                                    parts.unshift(part + '#' + CSS.escape(node.id));
+                                    break;
+                                }
+                            } catch (e) {}
+                            part += '#' + CSS.escape(node.id);
+                            parts.unshift(part);
+                            break;
+                        }
+                        var cls = (node.className && typeof node.className === 'string')
+                            ? node.className.trim().split(/\s+/).filter(Boolean).slice(0, 2)
+                                .map(function(c) { return '.' + CSS.escape(c); }).join('')
+                            : '';
+                        part += cls;
+                        var sib = node.parentNode
+                            ? Array.prototype.filter.call(node.parentNode.children, function(x) { return x.tagName === node.tagName; })
+                            : [];
+                        if (sib.length > 1) part += ':nth-of-type(' + (sib.indexOf(node) + 1) + ')';
+                        parts.unshift(part);
+                        node = node.parentNode;
+                        if (parts.length > 6) break;
+                    }
+                    return parts.join(' > ');
+                }
+                function onOver(e) {
+                    var t = e.target;
+                    if (current === t) return;
+                    if (current) current.style.outline = '';
+                    current = t;
+                    t.style.outline = '2px solid red';
+                }
+                function onClick(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    var sel = selectorFor(e.target);
+                    var tag = describe(e.target);
+                    exitPicker();
+                    try { Android.onDomBlockPicked(sel, tag); } catch (err) {}
+                }
+                function exitPicker() {
+                    document.removeEventListener('mouseover', onOver, true);
+                    document.removeEventListener('click', onClick, true);
+                    if (current) { current.style.outline = ''; current = null; }
+                    window.__javDomPicker = false;
+                }
+                window.__javDomPickerExit = exitPicker;
+                window.__javDomPicker = true;
+                document.addEventListener('mouseover', onOver, true);
+                document.addEventListener('click', onClick, true);
+            })();
+            """.trimIndent(),
+            null
+        )
+        Toast.makeText(this, "點選模式：點一下要屏蔽的元素，按返回鍵取消", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun exitDomBlockPicker() {
+        if (!domBlockPickerActive) return
+        domBlockPickerActive = false
+        webView.evaluateJavascript(
+            "(function() { try { if (window.__javDomPickerExit) window.__javDomPickerExit(); } catch (e) {} })();",
+            null
+        )
+    }
+
+    private fun showDomBlockConfirmDialog(selector: String, tag: String) {
+        domBlockPickerActive = false
+        val pageHost = runCatching { android.net.Uri.parse(webView.url ?: currentPageUrl).host }.getOrNull()?.lowercase().orEmpty()
+        if (pageHost.isEmpty() || selector.isEmpty()) {
+            Toast.makeText(this, "這個元素拿不到可用的選擇器", Toast.LENGTH_SHORT).show()
+            return
+        }
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("屏蔽這個元素？")
+            .setMessage("元素：$tag\n選擇器：$selector\n\n確認後立即移除，以後打開 $pageHost 的頁面也會自動移除。屏錯了可在設定 → 我屏蔽的元素裡刪除。")
+            .setPositiveButton("屏蔽") { _, _ ->
+                val added = adFilterRules.addUserDomRemoveRule(pageHost, selector)
+                Toast.makeText(
+                    this,
+                    if (added) "已屏蔽該元素" else "該元素已在屏蔽列表中",
+                    Toast.LENGTH_SHORT
+                ).show()
+                // 走同一套移除 + MutationObserver，立即清掉現有與動態後插的框。
+                applySiteDomRules(webView, webView.url ?: currentPageUrl)
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     private fun setupWebView() {
@@ -1559,6 +1691,11 @@ class MainActivity : LocalizedActivity() {
                     startActivity(Intent(this@MainActivity, SalesRankingActivity::class.java))
                 }
             }
+            // 點選屏蔽的回調：使用者在點選模式點中的元素選擇器。
+            @android.webkit.JavascriptInterface
+            fun onDomBlockPicked(selector: String, tag: String) {
+                runOnUiThread { showDomBlockConfirmDialog(selector, tag) }
+            }
         }, "Android")
 
         // 在 javhdporn.net 每個 frame V8 建立時立即注入 Streamtape patch（document-start 等級）
@@ -1926,6 +2063,8 @@ class MainActivity : LocalizedActivity() {
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
+                // 換頁後點選模式的 JS 已隨舊文檔消失，只需復位旗標。
+                domBlockPickerActive = false
                 cancelPendingFileChooser()
                 supjavSelectionGeneration++
                 supjavMediaResolver.close()
@@ -6061,6 +6200,11 @@ class MainActivity : LocalizedActivity() {
     }
     
     override fun onBackPressed() {
+        // 點選屏蔽模式中，返回鍵先取消點選，不後退頁面。
+        if (domBlockPickerActive) {
+            exitDomBlockPicker()
+            return
+        }
         // 全螢幕模式中，返回鍵先退出全螢幕
         if (customView != null) {
             webView.webChromeClient?.onHideCustomView()

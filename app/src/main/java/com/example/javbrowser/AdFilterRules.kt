@@ -41,6 +41,12 @@ data class SiteDomRemoveRule(
     val closest: String? = null
 )
 
+/** 使用者點選屏蔽的元素規則：domain 為屏蔽時所在頁面的域名（含子域生效）。 */
+data class UserDomRule(
+    val domain: String,
+    val selector: String
+)
+
 data class SiteAdRuleSet(
     val allowRequests: List<SiteUrlRule> = emptyList(),
     val requestBlock: List<SiteUrlRule> = emptyList(),
@@ -58,6 +64,7 @@ class AdFilterRules(private val context: Context) {
         private const val KEY_LAST_UPDATE = "last_update"
         private const val KEY_CLOUD_URL = "cloud_url"
         private const val KEY_USER_BLOCK_JSON = "user_block_list"
+        private const val KEY_USER_DOM_JSON = "user_dom_remove_list"
         const val DEFAULT_CLOUD_URL = "https://raw.githubusercontent.com/fekilooo/javbrowser/refs/heads/main/ad-filter-rules.json"
 
         // 雲端尚未升級至 siteRules 時的安全備援；雲端一旦提供 siteRules 即完全以雲端為準。
@@ -684,6 +691,50 @@ class AdFilterRules(private val context: Context) {
         val list = getUserBlockList().toMutableList()
         if (!list.remove(normalized)) return false
         prefs.edit().putString(KEY_USER_BLOCK_JSON, JSONArray(list).toString()).apply()
+        return true
+    }
+
+    // 使用者點選屏蔽的元素規則：{domain, selector}，與網路屏蔽一樣獨立存放。
+    fun getUserDomRemoveRules(): List<UserDomRule> {
+        return try {
+            val array = JSONArray(prefs.getString(KEY_USER_DOM_JSON, "[]") ?: "[]")
+            val list = mutableListOf<UserDomRule>()
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                val domain = item.optString("domain", "").trim().lowercase()
+                val selector = item.optString("selector", "").trim()
+                if (domain.isNotEmpty() && selector.isNotEmpty() &&
+                    list.none { it.domain == domain && it.selector == selector }) {
+                    list.add(UserDomRule(domain, selector))
+                }
+            }
+            list
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    fun addUserDomRemoveRule(domain: String, selector: String): Boolean {
+        val d = domain.trim().lowercase()
+        val s = selector.trim()
+        if (d.isEmpty() || s.isEmpty()) return false
+        val list = getUserDomRemoveRules().toMutableList()
+        if (list.any { it.domain == d && it.selector == s }) return false
+        list.add(UserDomRule(d, s))
+        val array = JSONArray()
+        list.forEach { array.put(JSONObject().apply { put("domain", it.domain); put("selector", it.selector) }) }
+        prefs.edit().putString(KEY_USER_DOM_JSON, array.toString()).apply()
+        return true
+    }
+
+    fun removeUserDomRemoveRule(domain: String, selector: String): Boolean {
+        val d = domain.trim().lowercase()
+        val s = selector.trim()
+        val list = getUserDomRemoveRules().toMutableList()
+        if (!list.remove(UserDomRule(d, s))) return false
+        val array = JSONArray()
+        list.forEach { array.put(JSONObject().apply { put("domain", it.domain); put("selector", it.selector) }) }
+        prefs.edit().putString(KEY_USER_DOM_JSON, array.toString()).apply()
         return true
     }
 

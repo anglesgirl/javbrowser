@@ -68,6 +68,10 @@ class SettingsActivity : LocalizedActivity() {
             text = t("我的屏蔽列表", "My block list")
             setOnClickListener { showUserBlockListDialog() }
         }
+        findViewById<Button>(R.id.btn_user_dom_list).apply {
+            text = t("我屏蔽的元素", "My blocked elements")
+            setOnClickListener { showUserDomListDialog() }
+        }
 
         privacySettings = PrivacySettings(this)
         appIconManager = AppIconManager(this)
@@ -420,6 +424,33 @@ class SettingsActivity : LocalizedActivity() {
             .show()
     }
 
+    /** 點選屏蔽的元素管理入口：列出域名 + 選擇器，點一項確認後刪除。 */
+    private fun showUserDomListDialog() {
+        val list = adFilterRules.getUserDomRemoveRules()
+        if (list.isEmpty()) {
+            Toast.makeText(this, t("還沒有屏蔽任何元素", "No blocked elements yet"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        val labels = list.map { "${it.domain} — ${it.selector}" }.toTypedArray()
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle(t("我屏蔽的元素", "My blocked elements"))
+            .setItems(labels) { _, which ->
+                val rule = list[which]
+                androidx.appcompat.app.AlertDialog.Builder(this)
+                    .setTitle(t("刪除屏蔽？", "Remove block?"))
+                    .setMessage(t("以後打開 ${rule.domain} 的頁面將不再移除 ${rule.selector}。", "Pages on ${rule.domain} will no longer remove ${rule.selector}."))
+                    .setPositiveButton(t("刪除", "Remove")) { _, _ ->
+                        adFilterRules.removeUserDomRemoveRule(rule.domain, rule.selector)
+                        updateRulesStatus()
+                        Toast.makeText(this, t("已刪除", "Removed"), Toast.LENGTH_SHORT).show()
+                    }
+                    .setNegativeButton(t("取消", "Cancel"), null)
+                    .show()
+            }
+            .setNegativeButton(t("關閉", "Close"), null)
+            .show()
+    }
+
     private fun updateRulesStatus() {
         // Load cloud URL
         etCloudUrl.setText(adFilterRules.cloudUrl)
@@ -447,6 +478,7 @@ class SettingsActivity : LocalizedActivity() {
                 Total: ${stats["total"]} rules
 
                 User blocks: ${adFilterRules.getUserBlockList().size}
+                User blocked elements: ${adFilterRules.getUserDomRemoveRules().size}
             """.trimIndent()
         } else {
             """
@@ -462,6 +494,7 @@ class SettingsActivity : LocalizedActivity() {
                 總計: ${stats["total"]} 個規則
 
                 使用者屏蔽: ${adFilterRules.getUserBlockList().size} 個
+                使用者元素屏蔽: ${adFilterRules.getUserDomRemoveRules().size} 個
             """.trimIndent()
         }
         
