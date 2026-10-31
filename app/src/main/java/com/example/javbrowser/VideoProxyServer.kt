@@ -10,6 +10,8 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.GZIPInputStream
 import java.util.zip.InflaterInputStream
+import okhttp3.OkHttpClient
+import okhttp3.Request
 
 /**
  * 本地 HTTP Proxy Server
@@ -41,6 +43,50 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
 
     private val proxyTargets = ConcurrentHashMap<String, ProxyTarget>()
     private val upstreamCookies = ConcurrentHashMap<String, ConcurrentHashMap<String, String>>()
+
+    /**
+     * One upstream fetch, transport-agnostic: the plain HttpURLConnection
+     * path and the ECH OkHttp path both produce this shape, so the
+     * response-building code below (status, ROU unwrap, m3u8 rewrite,
+     * fixed/chunked body) stays identical for both.
+     * [body] is null only for the plain path's >= 400 with no error
+     * stream; the caller turns that into a fixed 500 as before.
+     * [close] releases the upstream connection (disconnect / close the
+     * OkHttp response). The streaming body path deliberately does not
+     * close, exactly like the old code (NanoHTTPD drains the stream).
+     */
+    private class Upstream(
+        val code: Int,
+        val contentType: String,
+        val contentEncoding: String,
+        val contentLength: Long,
+        val contentRange: String?,
+        val acceptRanges: String?,
+        val setCookies: List<String>,
+        val body: InputStream?,
+        val finalUrl: String,
+        val via: String,
+        val close: () -> Unit,
+    )
+
+    /**
+     * Shared ECH client for proxy upstream fetches. Shared (not
+     * per-request) so video Range requests reuse connections instead of
+     * re-handshaking every segment. Built only after [EchH3Router.route]
+     * has already verified Conscrypt is up for an ECH host, so the
+     * newOkHttpClient plain-fallback trap (Conscrypt unavailable ->
+     * silent plain client) cannot fire here: route() returns Ech only
+     * when ensureProvider() is true. No call timeout (see fetchViaEch).
+     */
+    private val echClient: OkHttpClient by lazy {
+        EchH3Router.newOkHttpClient(
+            connectSec = 15,
+            readSec = 30,
+            callSec = null,
+            followRedirects = true,
+            retryOnConnectionFailure = true,
+        )
+    }
 
     /**
      * 產生給外部播放器用的本地 URL
@@ -108,21 +154,46 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
         return ProxyTarget(realUrl, referer, cookies)
     }
 
-    private fun proxyRequest(
-        requestedUrl: String,
+    /**
+     * Picks the upstream transport. HTTPS + an ECH config for the host
+     * ([EchH3Router.route] == Ech) goes through the ECH client; anything
+     * else (plain HTTP, no config, DoH failure) keeps the old
+     * HttpURLConnection path byte-for-byte. The gate itself never
+     * breaks playback: if DoH fails we cannot know the config, and the
+     * ECH client could not have fetched a config either, so plain is
+     * the only possible transport anyway.
+     */
+    private fun fetchUpstream(
+        realUrl: String,
         referer: String,
-        cookies: String,
-        rangeHeader: String?
-    ): Response {
-        val realUrl = authorizeUrl(requestedUrl)
-        val isRouStream = RouVideoDomains.isUrl(referer)
+        outboundCookies: String,
+        rangeHeader: String?,
+        isRouStream: Boolean,
+    ): Upstream {
+        val host = hostForUrl(realUrl)
+        val useEch = host != null &&
+            realUrl.startsWith("https://", ignoreCase = true) &&
+            runCatching { EchH3Router.route(host) == EchH3Router.Route.Ech }.getOrDefault(false)
+        return if (useEch) {
+            fetchViaEch(realUrl, referer, outboundCookies, rangeHeader, isRouStream)
+        } else {
+            fetchViaHttpUrlConnection(realUrl, referer, outboundCookies, rangeHeader, isRouStream)
+        }
+    }
+
+    /** The pre-ECH transport, unchanged: plain system TLS, visible SNI. */
+    private fun fetchViaHttpUrlConnection(
+        realUrl: String,
+        referer: String,
+        outboundCookies: String,
+        rangeHeader: String?,
+        isRouStream: Boolean,
+    ): Upstream {
         val connection = URL(realUrl).openConnection() as HttpURLConnection
         try {
             connection.connectTimeout = CONNECT_TIMEOUT
             connection.readTimeout = READ_TIMEOUT
             connection.instanceFollowRedirects = true
-
-            val outboundCookies = mergeCookiesForUrl(realUrl, referer, cookies)
 
             connection.setRequestProperty("User-Agent", USER_AGENT)
             if (referer.isNotEmpty()) connection.setRequestProperty("Referer", referer)
@@ -144,25 +215,115 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
                 connection.setRequestProperty("Range", rangeHeader)
             }
 
-            val responseCode = connection.responseCode
-            val contentType = connection.contentType ?: ""
-            val contentEncoding = connection.getHeaderField("Content-Encoding").orEmpty()
-            val contentLength = connection.contentLengthLong
-            val contentRange = connection.getHeaderField("Content-Range")
-            val acceptRanges = connection.getHeaderField("Accept-Ranges")
-            rememberSetCookies(realUrl, connection.headerFields["Set-Cookie"])
+            val code = connection.responseCode
+            return Upstream(
+                code = code,
+                contentType = connection.contentType ?: "",
+                contentEncoding = connection.getHeaderField("Content-Encoding").orEmpty(),
+                contentLength = connection.contentLengthLong,
+                contentRange = connection.getHeaderField("Content-Range"),
+                acceptRanges = connection.getHeaderField("Accept-Ranges"),
+                setCookies = connection.headerFields["Set-Cookie"] ?: emptyList(),
+                body = if (code >= 400) connection.errorStream else connection.inputStream,
+                finalUrl = connection.url.toString(),
+                via = "PLAIN",
+                close = { connection.disconnect() },
+            )
+        } catch (e: Exception) {
+            connection.disconnect()
+            throw e
+        }
+    }
+
+    /**
+     * ECH upstream fetch for hosts that publish an ECH config. Same
+     * request headers as the plain path, same response shape. NO call
+     * timeout: a video stream lasts far longer than any call bound, and
+     * the search client's 15s call timeout would kill playback
+     * mid-stream — connect/read timeouts mirror the plain path
+     * (15s/30s, read is per-read idle, so a flowing stream never trips
+     * it). Fail-closed: any transport failure throws to serve()'s 500;
+     * the caller never retries this host over plaintext. (The policy's
+     * per-host DISABLED for config-less redirect targets is
+     * Conscrypt's own design, not a fallback added here: a redirect
+     * hop to a host without a config goes plain exactly as before.)
+     */
+    private fun fetchViaEch(
+        realUrl: String,
+        referer: String,
+        outboundCookies: String,
+        rangeHeader: String?,
+        isRouStream: Boolean,
+    ): Upstream {
+        val requestBuilder = Request.Builder().url(realUrl)
+            .header("User-Agent", USER_AGENT)
+        if (referer.isNotEmpty()) requestBuilder.header("Referer", referer)
+        if (outboundCookies.isNotEmpty()) requestBuilder.header("Cookie", outboundCookies)
+        requestBuilder.header("Accept", "*/*")
+        requestBuilder.header("Accept-Encoding", "identity;q=1, *;q=0")
+        requestBuilder.header("Sec-Fetch-Dest", "video")
+        requestBuilder.header("Sec-Fetch-Mode", "no-cors")
+        requestBuilder.header("Sec-Fetch-Site", "same-site")
+        if (realUrl.contains("doppiocdn", ignoreCase = true) ||
+            referer.contains("stripchat", ignoreCase = true)
+        ) {
+            originForUrl(referer)?.let { requestBuilder.header("Origin", it) }
+            requestBuilder.header("Accept", "application/vnd.apple.mpegurl,application/x-mpegURL,*/*")
+        }
+        // ROU 的 PNG 包裝必須取得完整檔案才能找到 roUd chunk；不要把播放器的
+        // Range 要求傳給上游，解包後再一次回傳完整片段。
+        if (!rangeHeader.isNullOrEmpty() && !isRouStream) {
+            requestBuilder.header("Range", rangeHeader)
+        }
+        val response = echClient.newCall(requestBuilder.build()).execute()
+        val body = response.body
+        return Upstream(
+            code = response.code,
+            contentType = response.header("Content-Type") ?: "",
+            contentEncoding = response.header("Content-Encoding").orEmpty(),
+            contentLength = body.contentLength(),
+            contentRange = response.header("Content-Range"),
+            acceptRanges = response.header("Accept-Ranges"),
+            setCookies = response.headers("Set-Cookie"),
+            body = body.byteStream(),
+            finalUrl = response.request.url.toString(),
+            via = "ECH",
+            close = { response.close() },
+        )
+    }
+
+    private fun proxyRequest(
+        requestedUrl: String,
+        referer: String,
+        cookies: String,
+        rangeHeader: String?
+    ): Response {
+        val realUrl = authorizeUrl(requestedUrl)
+        val isRouStream = RouVideoDomains.isUrl(referer)
+        val outboundCookies = mergeCookiesForUrl(realUrl, referer, cookies)
+        val upstream = fetchUpstream(realUrl, referer, outboundCookies, rangeHeader, isRouStream)
+        try {
+            val responseCode = upstream.code
+            val contentType = upstream.contentType
+            val contentEncoding = upstream.contentEncoding
+            val contentLength = upstream.contentLength
+            val contentRange = upstream.contentRange
+            val acceptRanges = upstream.acceptRanges
+            rememberSetCookies(realUrl, upstream.setCookies)
 
             android.util.Log.d(
                 "VideoProxy",
-                "CDN response=$responseCode type=$contentType length=$contentLength range=${rangeHeader ?: "-"} url=${redactUrlForLog(realUrl)} referer=$referer cookieLen=${outboundCookies.length}"
+                "CDN response=$responseCode type=$contentType length=$contentLength range=${rangeHeader ?: "-"} url=${redactUrlForLog(realUrl)} referer=$referer cookieLen=${outboundCookies.length} via=${upstream.via}"
             )
 
             val inputStream: InputStream = if (responseCode >= 400) {
-                connection.errorStream ?: return newFixedLengthResponse(
+                upstream.body ?: return newFixedLengthResponse(
                     Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "CDN error $responseCode"
                 )
             } else {
-                connection.inputStream
+                upstream.body ?: return newFixedLengthResponse(
+                    Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Empty upstream body"
+                )
             }
 
             if (responseCode >= 400) {
@@ -177,8 +338,8 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
             if (isRouStream) {
                 val wrappedBytes = inputStream.readBytes()
                 val mediaBytes = unwrapRouPngPayload(wrappedBytes) ?: wrappedBytes
-                val finalUrl = connection.url.toString()
-                connection.disconnect()
+                val finalUrl = upstream.finalUrl
+                upstream.close()
                 val textHead = mediaBytes.take(16).toByteArray().toString(Charsets.UTF_8)
                 if (textHead.startsWith("#EXTM3U")) {
                     val playlist = mediaBytes.toString(Charsets.UTF_8)
@@ -234,7 +395,7 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
                 } else null
                 val rawContent = decompressedContent ?: playlistBytes.toString(Charsets.UTF_8)
                 val wasGunzipDecompressed = decompressedContent != null
-                connection.disconnect()
+                upstream.close()
                 if (isStripchatStream) {
                     val head = rawContent.take(220).replace('\n', ' ').replace('\r', ' ')
                     android.util.Log.w(
@@ -275,7 +436,7 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
 
             return response
         } catch (e: Exception) {
-            connection.disconnect()
+            upstream.close()
             throw e
         }
     }

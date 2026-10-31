@@ -20,9 +20,9 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
- * The single factory and router for app-layer network access (search and
- * page fetching only — WebView and video playback/download never come
- * here).
+ * The single factory and router for app-layer network access (search,
+ * page fetching, and the video proxy's upstream fetch — the player
+ * WebView itself never comes here; its TLS is system-controlled).
  *
  * Routing (ECH first, security over speed): for every host, [EchDoh]
  * resolves the HTTPS record first. A host that publishes an ECH config
