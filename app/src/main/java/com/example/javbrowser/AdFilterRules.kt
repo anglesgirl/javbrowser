@@ -57,6 +57,7 @@ class AdFilterRules(private val context: Context) {
         private const val KEY_RULES_JSON = "rules_json"
         private const val KEY_LAST_UPDATE = "last_update"
         private const val KEY_CLOUD_URL = "cloud_url"
+        private const val KEY_USER_BLOCK_JSON = "user_block_list"
         const val DEFAULT_CLOUD_URL = "https://raw.githubusercontent.com/fekilooo/javbrowser/refs/heads/main/ad-filter-rules.json"
 
         // 雲端尚未升級至 siteRules 時的安全備援；雲端一旦提供 siteRules 即完全以雲端為準。
@@ -651,6 +652,39 @@ class AdFilterRules(private val context: Context) {
         } catch (e: Exception) {
             emptyMap()
         }
+    }
+
+    // 使用者長按屏蔽：存在獨立 key，不動 rules_json，雲端更新不會覆蓋。
+    fun getUserBlockList(): List<String> {
+        return try {
+            val array = JSONArray(prefs.getString(KEY_USER_BLOCK_JSON, "[]") ?: "[]")
+            val list = mutableListOf<String>()
+            for (i in 0 until array.length()) {
+                val item = array.optString(i, "").trim().lowercase()
+                if (item.isNotEmpty() && !list.contains(item)) list.add(item)
+            }
+            list
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    fun addUserBlock(host: String): Boolean {
+        val normalized = host.trim().lowercase()
+        if (normalized.isEmpty()) return false
+        val list = getUserBlockList().toMutableList()
+        if (list.contains(normalized)) return false
+        list.add(normalized)
+        prefs.edit().putString(KEY_USER_BLOCK_JSON, JSONArray(list).toString()).apply()
+        return true
+    }
+
+    fun removeUserBlock(host: String): Boolean {
+        val normalized = host.trim().lowercase()
+        val list = getUserBlockList().toMutableList()
+        if (!list.remove(normalized)) return false
+        prefs.edit().putString(KEY_USER_BLOCK_JSON, JSONArray(list).toString()).apply()
+        return true
     }
 
     // 導出規則為 JSON

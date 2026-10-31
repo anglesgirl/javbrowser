@@ -286,15 +286,15 @@ class MainActivity : LocalizedActivity() {
         adFilterRules = AdFilterRules(this)
         domainConfig = DomainConfig(adFilterRules)
 
-        // 載入初始封鎖清單（從 SharedPreferences 快取）
-        cachedBlockList = adFilterRules.getCommonBlockList().toSet()
+        // 載入初始封鎖清單（從 SharedPreferences 快取，含使用者長按屏蔽）
+        refreshBlockList()
         cachedSiteRules = adFilterRules.getSiteRules()
         adFilterRules.refreshRouVideoDomain()
 
         adFilterRules.updateRulesFromCloud(AdFilterRules.DEFAULT_CLOUD_URL) { success, msg ->
             if (success) {
                 // 雲端規則更新成功，刷新快取
-                cachedBlockList = adFilterRules.getCommonBlockList().toSet()
+                refreshBlockList()
                 cachedSiteRules = adFilterRules.getSiteRules()
                 adFilterRules.refreshRouVideoDomain()
                 android.util.Log.d(
@@ -447,6 +447,8 @@ class MainActivity : LocalizedActivity() {
 
     override fun onResume() {
         super.onResume()
+        // 設定裡刪掉的使用者屏蔽回來即生效。
+        if (::adFilterRules.isInitialized) refreshBlockList()
         (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager)
             .addPrimaryClipChangedListener(homeClipboardListener)
         android.util.Log.d("MAIN", "onResume: isUnlocked=$isUnlocked, isFreshStart=$isFreshStart")
@@ -1013,6 +1015,51 @@ class MainActivity : LocalizedActivity() {
         view.evaluateJavascript(js, null)
     }
 
+    /** 攔截清單 = 雲端/內建通用規則 + 使用者長按屏蔽（後者獨立存放，雲端更新不覆蓋）。 */
+    private fun refreshBlockList() {
+        cachedBlockList = (adFilterRules.getCommonBlockList() + adFilterRules.getUserBlockList()).toSet()
+    }
+
+    /**
+     * 長按屏蔽：把長按到的廣告來源加入使用者屏蔽列表。
+     * 預設屏蔽完整子域名；來源若不在本站的域名下，也可選整個域名（含子域名）。
+     * 本站自己的域名拒絕屏蔽，避免一按就把本站內容全擋掉。寫入後立即刷新
+     * 攔截列表並重載頁面，讓屏蔽馬上生效。
+     */
+    private fun showBlockSourceDialog(targetUrl: String, host: String) {
+        val pageHost = runCatching { android.net.Uri.parse(webView.url ?: currentPageUrl).host }.getOrNull()?.lowercase().orEmpty()
+        val baseDomain = host.split(".").takeLast(2).joinToString(".")
+        // 頁面本身就在該域名下（本站或其子域）時，整個域名不能屏蔽，
+        // 否則連主框架導航都會被攔截（攔截不分主框架）。
+        val sameBase = pageHost == baseDomain || pageHost.endsWith(".$baseDomain")
+        if (host == pageHost) {
+            Toast.makeText(this, "這是本站自己的內容，不能屏蔽", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("屏蔽這個來源？")
+            .setMessage("來源：$host\n\n屏蔽後，該來源的圖片、腳本與廣告將不再載入。屏錯了可在設定 → 我的屏蔽列表裡刪除。")
+        if (sameBase || baseDomain == host) {
+            dialog.setPositiveButton("屏蔽此域名") { _, _ -> addUserBlockAndReload(host) }
+        } else {
+            dialog.setPositiveButton("屏蔽整個域名") { _, _ -> addUserBlockAndReload(baseDomain) }
+            dialog.setNeutralButton("僅此子域名") { _, _ -> addUserBlockAndReload(host) }
+        }
+        dialog.setNegativeButton("取消", null)
+        dialog.show()
+    }
+
+    private fun addUserBlockAndReload(host: String) {
+        val added = adFilterRules.addUserBlock(host)
+        refreshBlockList()
+        Toast.makeText(
+            this,
+            if (added) "已屏蔽 $host，正在刷新頁面" else "$host 已在屏蔽列表中，正在刷新頁面",
+            Toast.LENGTH_SHORT
+        ).show()
+        webView.reload()
+    }
+
     private fun setupWebView() {
         val settings = webView.settings
         settings.javaScriptEnabled = true
@@ -1020,6 +1067,24 @@ class MainActivity : LocalizedActivity() {
         settings.mediaPlaybackRequiresUserGesture = false
         settings.setSupportMultipleWindows(true)   // 讓 onCreateWindow 能攔截 popup
         settings.userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+
+        // 長按屏蔽：長按廣告圖片/連結，彈窗確認後把來源域名加入使用者屏蔽列表。
+        // 只有帶 URL 的類型才接管；其他類型（文字等）回傳 false，走 WebView 預設長按行為。
+        webView.setOnLongClickListener {
+            val result = webView.hitTestResult ?: return@setOnLongClickListener false
+            val targetUrl = when (result.type) {
+                WebView.HitTestResult.IMAGE_TYPE,
+                WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE,
+                WebView.HitTestResult.SRC_ANCHOR_TYPE,
+                WebView.HitTestResult.ANCHOR_TYPE -> result.extra
+                else -> null
+            } ?: return@setOnLongClickListener false
+            val host = runCatching { android.net.Uri.parse(targetUrl).host }.getOrNull()
+                ?.lowercase()?.trim().orEmpty()
+            if (host.isEmpty()) return@setOnLongClickListener false
+            showBlockSourceDialog(targetUrl, host)
+            true
+        }
 
         // Add JS interface globally
         webView.addJavascriptInterface(object {

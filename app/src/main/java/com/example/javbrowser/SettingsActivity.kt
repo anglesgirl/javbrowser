@@ -64,6 +64,10 @@ class SettingsActivity : LocalizedActivity() {
             text = t("播放紀錄", "Playback history")
             setOnClickListener { startActivity(android.content.Intent(this@SettingsActivity, PlaybackHistoryActivity::class.java)) }
         }
+        findViewById<Button>(R.id.btn_user_block_list).apply {
+            text = t("我的屏蔽列表", "My block list")
+            setOnClickListener { showUserBlockListDialog() }
+        }
 
         privacySettings = PrivacySettings(this)
         appIconManager = AppIconManager(this)
@@ -390,6 +394,32 @@ class SettingsActivity : LocalizedActivity() {
         }
     }
 
+    /** 長按屏蔽的管理入口：列出使用者屏蔽的域名，點一項確認後刪除，返回瀏覽器即生效。 */
+    private fun showUserBlockListDialog() {
+        val list = adFilterRules.getUserBlockList()
+        if (list.isEmpty()) {
+            Toast.makeText(this, t("還沒有屏蔽任何來源", "No blocked sources yet"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle(t("我的屏蔽列表", "My block list"))
+            .setItems(list.toTypedArray()) { _, which ->
+                val host = list[which]
+                androidx.appcompat.app.AlertDialog.Builder(this)
+                    .setTitle(t("刪除屏蔽？", "Remove block?"))
+                    .setMessage(t("以後將不再攔截 $host。", "Requests from $host will no longer be blocked."))
+                    .setPositiveButton(t("刪除", "Remove")) { _, _ ->
+                        adFilterRules.removeUserBlock(host)
+                        updateRulesStatus()
+                        Toast.makeText(this, t("已刪除 $host", "Removed $host"), Toast.LENGTH_SHORT).show()
+                    }
+                    .setNegativeButton(t("取消", "Cancel"), null)
+                    .show()
+            }
+            .setNegativeButton(t("關閉", "Close"), null)
+            .show()
+    }
+
     private fun updateRulesStatus() {
         // Load cloud URL
         etCloudUrl.setText(adFilterRules.cloudUrl)
@@ -415,6 +445,8 @@ class SettingsActivity : LocalizedActivity() {
                 Redirect blocks: ${stats["redirectBlock"]}
 
                 Total: ${stats["total"]} rules
+
+                User blocks: ${adFilterRules.getUserBlockList().size}
             """.trimIndent()
         } else {
             """
@@ -428,6 +460,8 @@ class SettingsActivity : LocalizedActivity() {
                 重定向阻擋 (僅專用): ${stats["redirectBlock"]} 個
 
                 總計: ${stats["total"]} 個規則
+
+                使用者屏蔽: ${adFilterRules.getUserBlockList().size} 個
             """.trimIndent()
         }
         

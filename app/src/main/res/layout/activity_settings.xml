@@ -570,6 +570,15 @@
                         android:text="導入規則"
                         android:textColor="#FFFFFF" />
                 </LinearLayout>
+
+                <Button
+                    android:id="@+id/btn_user_block_list"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:backgroundTint="#FF5722"
+                    android:text="我的屏蔽列表"
+                    android:textColor="#FFFFFF"
+                    android:layout_marginTop="12dp" />
             </LinearLayout>
         </androidx.cardview.widget.CardView>
 
