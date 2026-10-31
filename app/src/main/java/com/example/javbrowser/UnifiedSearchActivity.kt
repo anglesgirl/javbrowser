@@ -203,6 +203,24 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     private fun openResult(item: SearchItem) {
         rememberReadAnchor()
         preserveSessionOnStop = true
+        // javhdporn: the real file never appears in static HTML (only ads do),
+        // so resolve it through a hidden WebView instead of static sniffing.
+        if (item.siteId == SearchSiteIds.JAVHD) {
+            runOnUiThread {
+                android.widget.Toast.makeText(this,
+                    LanguageManager.text(this, "正在解析真实地址…", "Resolving real video URL…"),
+                    android.widget.Toast.LENGTH_SHORT).show()
+            }
+            tryResolveJavhdRealUrl(item) { realUrl ->
+                if (isDestroyed || isFinishing) return@tryResolveJavhdRealUrl
+                if (realUrl != null) {
+                    showSniffPicker(item, listOf(realUrl to null))
+                } else {
+                    BrowserNavigator.open(this, item.detailUrl)
+                }
+            }
+            return
+        }
         SearchScheduler.workers.execute {
             val candidates = trySniffVideoCandidates(item)
             runOnUiThread {
@@ -212,6 +230,88 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     showSniffPicker(item, candidates)
                 }
             }
+        }
+    }
+
+    /**
+     * Resolves javhdporn's real file through a hidden WebView, mirroring
+     * MainActivity's proven interception: the detail page's player runs JS,
+     * and the real file only appears as a network request — a Streamtape
+     * get_video URL or a tapecontent media URL (generic .mp4/.m3u8 is NOT
+     * captured, to avoid page ads). A Streamtape /e/ embed is chased by
+     * loading it as the top page and simulating a play click after 2s,
+     * exactly like extractStreamtapeUrl. Callback on the UI thread with
+     * the real URL, or null on timeout (15s) / failure — the caller then
+     * falls back to WebView. Never throws.
+     */
+    private fun tryResolveJavhdRealUrl(item: SearchItem, callback: (String?) -> Unit) {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        var hiddenWebView: android.webkit.WebView? = null
+        var done = false
+        var chasedEmbed = false
+        var timeoutRunnable: Runnable? = null
+        fun finish(url: String?) {
+            if (done) return
+            done = true
+            handler.removeCallbacks(timeoutRunnable)
+            hiddenWebView?.destroy()
+            hiddenWebView = null
+            callback(url)
+        }
+        timeoutRunnable = Runnable { finish(null) }
+        handler.post {
+            val wv = android.webkit.WebView(this)
+            hiddenWebView = wv
+            wv.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                mediaPlaybackRequiresUserGesture = false
+            }
+            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+            wv.webViewClient = object : android.webkit.WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: android.webkit.WebView?,
+                    request: android.webkit.WebResourceRequest?
+                ): android.webkit.WebResourceResponse? {
+                    val reqUrl = request?.url?.toString() ?: return null
+                    val isReal = (reqUrl.contains("streamtape") && reqUrl.contains("get_video")) ||
+                        (reqUrl.contains("tapecontent") &&
+                            (reqUrl.contains(".mp4") || reqUrl.contains(".ts") || reqUrl.contains("m3u8")))
+                    if (isReal) {
+                        handler.post { finish(reqUrl) }
+                        return android.webkit.WebResourceResponse("text/plain", "utf-8",
+                            java.io.ByteArrayInputStream(ByteArray(0)))
+                    }
+                    if (!chasedEmbed && reqUrl.contains("streamtape") && reqUrl.contains("/e/")) {
+                        chasedEmbed = true
+                        handler.post { hiddenWebView?.loadUrl(reqUrl) }
+                        return android.webkit.WebResourceResponse("text/plain", "utf-8",
+                            java.io.ByteArrayInputStream(ByteArray(0)))
+                    }
+                    return null
+                }
+
+                override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    handler.postDelayed({
+                        if (!done) {
+                            view?.evaluateJavascript("""
+                                (function(){
+                                    var selectors = ['#overlay','#mainvideo','video','[id*="play"]','[class*="play"]','[class*="btn"]'];
+                                    for(var i=0;i<selectors.length;i++){
+                                        var el=document.querySelector(selectors[i]);
+                                        if(el){el.click();return 'clicked:'+selectors[i];}
+                                    }
+                                    return 'no element found';
+                                })();
+                            """.trimIndent(), null)
+                        }
+                    }, 2000)
+                }
+            }
+            wv.loadUrl(item.detailUrl)
+            handler.postDelayed(timeoutRunnable, 15000)
         }
     }
 
