@@ -16,6 +16,7 @@ enum class SearchParserKind {
     JAVDAY,
     SUPJAV,
     JAVRATE,
+    HENTAIMAMA,
     ROU_VIDEO,
     ROU_SERIES
 }
@@ -50,6 +51,7 @@ object SearchSiteIds {
     const val JAVDAY = "javday"
     const val SUPJAV = "supjav"
     const val JAVRATE = "javrate"
+    const val HENTAIMAMA = "hentaimama"
     const val ROU_VIDEO = "rou_video"
     const val ROU_SERIES = "rou_series"
 }
@@ -96,7 +98,9 @@ object SearchSiteRegistry {
             SearchSite(SearchSiteIds.SUPJAV, "SUPJAV", 10, SearchParserKind.SUPJAV,
                 "supjav:supjav.com", { query, page -> page ?: "https://supjav.com/?s=${encodedQuery(query)}" }, setOf("supjav.com")),
             SearchSite(SearchSiteIds.JAVRATE, "JavRate", 11, SearchParserKind.JAVRATE,
-                "javrate:javrate.com", { query, page -> page ?: "https://www.javrate.com/search/a%E7%89%87/${pathQuery(query.lowercase(java.util.Locale.ROOT))}/?tab=movie" }, setOf("javrate.com"))
+                "javrate:javrate.com", { query, page -> page ?: "https://www.javrate.com/search/a%E7%89%87/${pathQuery(query.lowercase(java.util.Locale.ROOT))}/?tab=movie" }, setOf("javrate.com")),
+            SearchSite(SearchSiteIds.HENTAIMAMA, "HentaiMama", 14, SearchParserKind.HENTAIMAMA,
+                "hentaimama:hentaimama.io", { query, page -> page ?: "https://hentaimama.io/?s=${encodedQuery(query)}" }, setOf("hentaimama.io", "hentaimama.com", "hentaimama.net"))
         ) + rouSites(domain.getRouVideoDomain(), LanguageManager.isEnglish(context))
     }
 

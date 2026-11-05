@@ -247,6 +247,7 @@ object SearchProviderFactory {
             SearchParserKind.JAVDAY -> JavdaySearchProvider(context, site)
             SearchParserKind.SUPJAV -> SupjavSearchProvider(context, site)
             SearchParserKind.JAVRATE -> JavrateSearchProvider(context, site)
+            SearchParserKind.HENTAIMAMA -> HentaimamaSearchProvider(context, site)
             SearchParserKind.ROU_VIDEO, SearchParserKind.ROU_SERIES -> RouSearchProvider(context, site)
         }
     }
