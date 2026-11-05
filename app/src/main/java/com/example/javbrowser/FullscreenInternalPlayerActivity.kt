@@ -47,6 +47,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         const val EXTRA_DOWNLOAD_NAME = "download_name"
         const val EXTRA_LOCAL_PLAYBACK = "local_playback"
         const val EXTRA_PAGE_URL = "page_url"
+        const val EXTRA_SESSION_ID = "playback_session_id"
         const val EXTRA_ROU_EPISODES_JSON = "rou_episodes_json"
         const val EXTRA_ADDITIONAL_EPISODES_JSON = "additional_episodes_json"
         const val EXTRA_PC_RECORDING_EVENTS_URI = "pc_recording_events_uri"
@@ -68,6 +69,16 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
     private val telemetryStarted = java.util.concurrent.atomic.AtomicBoolean(false)
     private val telemetryFailed = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    // Real-playback data: on pause, the video element's state reports
+    // back into the sniff session this play came from (started? seconds?
+    // stalled at ~1s? error?), so the analysis learns which candidate
+    // actually plays. Last write wins (rotation records an interim
+    // sample, exit overwrites with the final state).
+    private var playbackSessionId: Long = -1
+    private var playbackEnteredAtMs: Long = 0
+    private var playbackOutcomeRecorded: Boolean = false
+    private var playbackOutcomeDelivered: Boolean = false
+
     private fun beginPlaybackTelemetry() {
         telemetryStarted.set(false)
         telemetryFailed.set(false)
@@ -83,6 +94,9 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        PlaybackDataStore.init(applicationContext)
+        playbackSessionId = intent.getLongExtra(EXTRA_SESSION_ID, -1)
+        playbackEnteredAtMs = System.currentTimeMillis()
         val telemetryUrl = intent.getStringExtra(EXTRA_VIDEO_URL).orEmpty()
         telemetryLocal = intent.getBooleanExtra(EXTRA_LOCAL_PLAYBACK, false) ||
             telemetryUrl.startsWith("content://") || telemetryUrl.startsWith("file://")
@@ -310,7 +324,72 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         finish()
     }
 
+    override fun onPause() {
+        super.onPause()
+        recordWebViewPlayback()
+    }
+
+    /**
+     * Reads the video element's state and reports it into the sniff
+     * session. evaluateJavascript is async; the callback still runs
+     * while the WebView is alive (it is destroyed in onDestroy).
+     * Never throws.
+     */
+    private fun recordWebViewPlayback() {
+        if (playbackSessionId < 0 || playbackOutcomeRecorded) return
+        if (!::webView.isInitialized) return
+        playbackOutcomeRecorded = true
+        try {
+            webView.evaluateJavascript(
+                "(function(){var v=document.querySelector('video');if(!v) return 'novideo';" +
+                    "return JSON.stringify({t:v.currentTime||0,d:v.duration||0,p:v.paused?1:0,e:v.error?v.error.code:0});})();"
+            ) { value ->
+                try {
+                    val wallSeconds = (System.currentTimeMillis() - playbackEnteredAtMs) / 1000.0
+                    if (value == null || value == "null" || value == "\"novideo\"" || value == "novideo") {
+                        PlaybackDataStore.recordPlayback(
+                            playbackSessionId,
+                            PlaybackOutcome("內部", false, 0.0, wallSeconds, false, "無video元素"),
+                        )
+                        playbackOutcomeDelivered = true
+                        return@evaluateJavascript
+                    }
+                    // The callback value is a JSON-encoded string; unwrap it, then parse the object.
+                    val inner = org.json.JSONTokener(value).nextValue() as? String ?: return@evaluateJavascript
+                    val o = org.json.JSONObject(inner)
+                    val secondsPlayed = o.optDouble("t", 0.0)
+                    val errorCode = o.optInt("e", 0)
+                    val error = if (errorCode != 0) "video error $errorCode" else null
+                    val started = secondsPlayed > 0.5
+                    val stalled = error == null && wallSeconds > 15.0 && secondsPlayed < 2.0
+                    PlaybackDataStore.recordPlayback(
+                        playbackSessionId,
+                        PlaybackOutcome("內部", started, secondsPlayed, wallSeconds, stalled, error),
+                    )
+                    playbackOutcomeDelivered = true
+                } catch (e: Exception) {
+                    // A failed read must never break playback.
+                }
+            }
+        } catch (e: Exception) {
+            // Reading state must never break playback.
+        }
+    }
+
     override fun onDestroy() {
+        // If the onPause JS read never delivered (WebView torn down
+        // first), leave an honest "no data" outcome rather than silence.
+        if (playbackSessionId >= 0 && playbackOutcomeRecorded && !playbackOutcomeDelivered) {
+            try {
+                val wallSeconds = (System.currentTimeMillis() - playbackEnteredAtMs) / 1000.0
+                PlaybackDataStore.recordPlayback(
+                    playbackSessionId,
+                    PlaybackOutcome("內部", false, 0.0, wallSeconds, false, "未讀取到播放狀態"),
+                )
+            } catch (e: Exception) {
+                // Recording must never break teardown.
+            }
+        }
         javrateSession?.clearSubtitleListener()
         if (javrateLease != null) javrateLease?.release() else javrateSession?.close()
         javrateSession = null

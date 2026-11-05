@@ -93,6 +93,9 @@
             android:name=".NetworkLogActivity"
             android:exported="false" />
         <activity
+            android:name=".PlaybackDataActivity"
+            android:exported="false" />
+        <activity
             android:name=".PlaybackHistoryActivity"
             android:exported="false" />
         <activity

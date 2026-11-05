@@ -156,6 +156,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         }
         findViewById<Button>(R.id.btn_unified_view_log).setOnClickListener { openNetworkLog() }
         findViewById<Button>(R.id.btn_unified_view_log_panel).setOnClickListener { openNetworkLog() }
+        findViewById<Button>(R.id.btn_unified_view_playback_data_panel).setOnClickListener { openPlaybackData() }
+        PlaybackDataStore.init(applicationContext)
         findViewById<Button>(R.id.btn_unified_resume).setOnClickListener { session?.resume() }
         findViewById<Button>(R.id.btn_unified_continue_pages).setOnClickListener {
             session?.continuePages(selectedSource.takeIf { it.isNotBlank() })
@@ -207,6 +209,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     private fun openResult(item: SearchItem) {
         rememberReadAnchor()
         preserveSessionOnStop = true
+        // One playback-data session per open: every candidate found, the
+        // pick, and the real playback outcome are recorded against it, so
+        // the analysis can later say which path actually plays.
+        val sessionId = PlaybackDataStore.startSession(item.siteId, item.detailUrl)
         // javhdporn: the real file never appears in static HTML (only ads do),
         // so resolve it through a hidden WebView instead of static sniffing.
         if (item.siteId == SearchSiteIds.JAVHD) {
@@ -215,10 +221,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     LanguageManager.text(this, "正在解析真实地址…", "Resolving real video URL…"),
                     android.widget.Toast.LENGTH_SHORT).show()
             }
-            tryResolveJavhdRealUrl(item) { realUrl ->
+            tryResolveJavhdRealUrl(item, sessionId) { realUrl ->
                 if (isDestroyed || isFinishing) return@tryResolveJavhdRealUrl
                 if (realUrl != null) {
-                    showSniffPicker(item, listOf(realUrl to null))
+                    showSniffPicker(item, listOf(resolverRecord(realUrl, "resolver-javhd")), sessionId)
                 } else {
                     BrowserNavigator.open(this, item.detailUrl)
                 }
@@ -235,10 +241,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     LanguageManager.text(this, "正在解析真实地址…", "Resolving real video URL…"),
                     android.widget.Toast.LENGTH_SHORT).show()
             }
-            tryResolveHentaiMamaRealUrl(item) { realUrl ->
+            tryResolveHentaiMamaRealUrl(item, sessionId) { realUrl ->
                 if (isDestroyed || isFinishing) return@tryResolveHentaiMamaRealUrl
                 if (realUrl != null) {
-                    showSniffPicker(item, listOf(realUrl to null))
+                    showSniffPicker(item, listOf(resolverRecord(realUrl, "resolver-hentaimama")), sessionId)
                 } else {
                     BrowserNavigator.open(this, item.detailUrl)
                 }
@@ -246,16 +252,22 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             return
         }
         SearchScheduler.workers.execute {
-            val candidates = trySniffVideoCandidates(item)
+            val candidates = trySniffVideoCandidates(item, sessionId)
             runOnUiThread {
                 if (candidates.isEmpty()) {
                     BrowserNavigator.open(this, item.detailUrl)
                 } else {
-                    showSniffPicker(item, candidates)
+                    showSniffPicker(item, candidates, sessionId)
                 }
             }
         }
     }
+
+    /** Display-only record for a resolver-produced URL (the store already holds the precise attempt). */
+    private fun resolverRecord(url: String, source: String) = SniffCandidateRecord(
+        url = url, source = source, score = 50,
+        evidence = "解析直連（跳過廣告）", kept = true, dropReason = null, durationSec = null,
+    )
 
     /**
      * Resolves javhdporn's real file through a hidden WebView, mirroring
@@ -268,7 +280,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * the real URL, or null on timeout (15s) / failure — the caller then
      * falls back to WebView. Never throws.
      */
-    private fun tryResolveJavhdRealUrl(item: SearchItem, callback: (String?) -> Unit) {
+    private fun tryResolveJavhdRealUrl(item: SearchItem, sessionId: Long, callback: (String?) -> Unit) {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
         var hiddenWebView: android.webkit.WebView? = null
         var done = false
@@ -280,6 +292,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             handler.removeCallbacks(timeoutRunnable)
             hiddenWebView?.destroy()
             hiddenWebView = null
+            if (url != null) {
+                PlaybackDataStore.addCandidates(sessionId, listOf(resolverRecord(url, "resolver-javhd")))
+            } else {
+                PlaybackDataStore.recordFail(sessionId, "javhd隱藏WebView解析失敗")
+            }
             callback(url)
         }
         timeoutRunnable = Runnable { finish(null) }
@@ -339,7 +356,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         }
     }
 
-    private fun playSniffed(item: SearchItem, videoUrl: String) {
+    private fun playSniffed(item: SearchItem, videoUrl: String, sessionId: Long) {
         // HentaiMama direct files play in the native player: the WebView
         // player stalls on them (plays ~1s, then jumps back), while the
         // same URL plays fine in a browser. Every other site keeps the
@@ -354,31 +371,34 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             putExtra(FullscreenInternalPlayerActivity.EXTRA_REFERER, item.detailUrl)
             putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, item.detailUrl)
             putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, item.title)
+            putExtra(FullscreenInternalPlayerActivity.EXTRA_SESSION_ID, sessionId)
         })
     }
 
-    /** Lists sniffed candidates with their m3u8 duration (null when unknown). Never throws. */
-    private fun showSniffPicker(item: SearchItem, candidates: List<Pair<String, Double?>>) {
-        val labels = candidates.map { (url, duration) -> candidateLabel(url, duration) }.toTypedArray()
+    /** Lists sniffed candidates with their m3u8 duration, score and source. Never throws. */
+    private fun showSniffPicker(item: SearchItem, candidates: List<SniffCandidateRecord>, sessionId: Long) {
+        val labels = candidates.map { candidateLabel(it) }.toTypedArray()
         android.app.AlertDialog.Builder(this)
             .setTitle(LanguageManager.text(this, "选择播放地址", "Choose video URL"))
             .setItems(labels) { _, which ->
-                playSniffed(item, candidates[which].first)
+                PlaybackDataStore.recordPick(sessionId, candidates[which].url, which)
+                playSniffed(item, candidates[which].url, sessionId)
             }
             .setNegativeButton(LanguageManager.text(this, "用浏览器打开", "Open in browser")) { _, _ ->
+                PlaybackDataStore.recordPick(sessionId, null, null)
                 BrowserNavigator.open(this, item.detailUrl)
             }
             .show()
     }
 
-    /** One line per candidate: type, duration (longest is usually the main video), host. */
-    private fun candidateLabel(url: String, duration: Double?): String {
-        val host = try { java.net.URL(url).host } catch (e: Exception) { "" }
-        val type = if (url.lowercase().contains(".m3u8")) "m3u8" else "mp4"
-        val dur = duration?.let {
+    /** One line per candidate: type, duration (longest is usually the main video), host, score. */
+    private fun candidateLabel(c: SniffCandidateRecord): String {
+        val host = try { java.net.URL(c.url).host } catch (e: Exception) { "" }
+        val type = if (c.url.lowercase().contains(".m3u8")) "m3u8" else "mp4"
+        val dur = c.durationSec?.let {
             "${(it / 60).toInt()}:${(it % 60).toInt().toString().padStart(2, '0')}"
         } ?: "—"
-        return "$type · $dur · $host"
+        return "$type · $dur · $host · ${c.score}分"
     }
 
     /** Returns sniffed candidates (proven <60s m3u8 ads excluded), or empty to fall back to WebView. Never throws. */
@@ -391,10 +411,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * Callback on the UI thread with the direct URL, or null on any failure
      * — the caller then falls back to WebView. Never throws.
      */
-    private fun tryResolveHentaiMamaRealUrl(item: SearchItem, callback: (String?) -> Unit) {
+    private fun tryResolveHentaiMamaRealUrl(item: SearchItem, sessionId: Long, callback: (String?) -> Unit) {
         SearchScheduler.workers.execute {
             val fastUrl = try { resolveHentaiMamaRealUrl(item) } catch (e: Exception) { null }
             if (fastUrl != null) {
+                PlaybackDataStore.addCandidates(sessionId, listOf(resolverRecord(fastUrl, "resolver-hentaimama-fast")))
                 runOnUiThread { callback(fastUrl) }
                 return@execute
             }
@@ -402,7 +423,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             // on-device (the sandbox POST works because it comes from a
             // foreign IP). Retry through a hidden WebView, which passes CF
             // challenges exactly like a browser.
-            runOnUiThread { tryResolveHentaiMamaViaWebView(item, callback) }
+            runOnUiThread { tryResolveHentaiMamaViaWebView(item, sessionId, callback) }
         }
     }
 
@@ -415,7 +436,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * on timeout (15s) / failure — the caller then falls back to WebView.
      * Never throws.
      */
-    private fun tryResolveHentaiMamaViaWebView(item: SearchItem, callback: (String?) -> Unit) {
+    private fun tryResolveHentaiMamaViaWebView(item: SearchItem, sessionId: Long, callback: (String?) -> Unit) {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
         var hiddenWebView: android.webkit.WebView? = null
         var done = false
@@ -426,6 +447,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             handler.removeCallbacks(timeoutRunnable)
             hiddenWebView?.destroy()
             hiddenWebView = null
+            if (url != null) {
+                PlaybackDataStore.addCandidates(sessionId, listOf(resolverRecord(url, "resolver-hentaimama-webview")))
+            } else {
+                PlaybackDataStore.recordFail(sessionId, "hentaimama解析失敗（ajax與WebView皆失敗）")
+            }
             callback(url)
         }
         timeoutRunnable = Runnable { finish(null) }
@@ -536,27 +562,69 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         }
     }
 
-    private fun trySniffVideoCandidates(item: SearchItem): List<Pair<String, Double?>> {
+    /**
+     * Returns kept sniffed candidates (proven <60s m3u8 ads excluded), or
+     * empty to fall back to WebView. Every candidate — kept and dropped —
+     * is recorded against the session with its score, source and drop
+     * reason, so the analysis can see which signal actually predicted a
+     * real play. Never throws.
+     */
+    private fun trySniffVideoCandidates(item: SearchItem, sessionId: Long): List<SniffCandidateRecord> {
         return try {
-            val host = try { java.net.URL(item.detailUrl).host } catch (e: Exception) { return emptyList() }
-            if (EchDoh.configFor(host) == null) return emptyList()
-            val site = sites.firstOrNull { it.id == item.siteId } ?: return emptyList()
+            val host = try { java.net.URL(item.detailUrl).host } catch (e: Exception) {
+                PlaybackDataStore.recordFail(sessionId, "詳情頁地址無效")
+                return emptyList()
+            }
+            if (EchDoh.configFor(host) == null) {
+                PlaybackDataStore.recordFail(sessionId, "無ECH設定，不嗅探")
+                return emptyList()
+            }
+            val site = sites.firstOrNull { it.id == item.siteId } ?: run {
+                PlaybackDataStore.recordFail(sessionId, "站點未註冊")
+                return emptyList()
+            }
             runOnUiThread {
                 android.widget.Toast.makeText(this,
                     LanguageManager.text(this, "正在嗅探播放地址…", "Sniffing video URL…"),
                     android.widget.Toast.LENGTH_SHORT).show()
             }
             val response = SearchHttpFetcher().fetch(item.detailUrl, SearchCancellation(), site)
-            if (response.transportError != null) return emptyList()
-            if (response.statusCode !in 200..299) return emptyList()
-            if (response.body.isBlank()) return emptyList()
-            val out = mutableListOf<Pair<String, Double?>>()
-            for (candidate in VideoPageSniffer.sniffCandidates(response.body, item.detailUrl, item.code)) {
-                val duration = m3u8Duration(candidate, site)
-                if (duration == null || duration >= 60.0) out += candidate to duration
+            if (response.transportError != null) {
+                PlaybackDataStore.recordFail(sessionId, "取詳情頁失敗：${response.transportError}")
+                return emptyList()
             }
-            out
+            if (response.statusCode !in 200..299) {
+                PlaybackDataStore.recordFail(sessionId, "詳情頁HTTP ${response.statusCode}")
+                return emptyList()
+            }
+            if (response.body.isBlank()) {
+                PlaybackDataStore.recordFail(sessionId, "詳情頁為空")
+                return emptyList()
+            }
+            val records = mutableListOf<SniffCandidateRecord>()
+            for (sc in VideoPageSniffer.sniffScored(response.body, item.detailUrl, item.code)) {
+                val duration = if (sc.kept) m3u8Duration(sc.url, site) else null
+                val (kept, dropReason, evidence) = when {
+                    !sc.kept -> Triple(false, sc.dropReason, sc.evidence)
+                    duration != null && duration < 60.0 -> Triple(
+                        false, "m3u8時長<60s疑似廣告",
+                        "${sc.evidence} · m3u8 ${duration.toInt()}秒",
+                    )
+                    duration != null -> Triple(
+                        true, null,
+                        "${sc.evidence} · m3u8 ${(duration / 60).toInt()}:${(duration % 60).toInt().toString().padStart(2, '0')}",
+                    )
+                    else -> Triple(true, null, sc.evidence)
+                }
+                val score = sc.score + if (duration != null && duration >= 60.0) 20 else 0
+                records += SniffCandidateRecord(sc.url, sc.source, score, evidence, kept, dropReason, duration)
+            }
+            PlaybackDataStore.addCandidates(sessionId, records)
+            val kept = records.filter { it.kept }
+            if (kept.isEmpty()) PlaybackDataStore.recordFail(sessionId, "找到 ${records.size} 個候選，全部被篩掉")
+            kept
         } catch (e: Exception) {
+            PlaybackDataStore.recordFail(sessionId, "嗅探異常：${e.message}")
             emptyList()
         }
     }
@@ -771,6 +839,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             R.id.tv_unified_saved_notice,
             R.id.btn_unified_copy_diagnostics,
             R.id.btn_unified_view_log_panel,
+            R.id.btn_unified_view_playback_data_panel,
             R.id.unified_site_status_scroll
         ).forEach { findViewById<android.view.View>(it).visibility = visibility }
         findViewById<Button>(R.id.btn_unified_resume).visibility =
@@ -1073,6 +1142,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
 
     private fun openNetworkLog() {
         startActivity(android.content.Intent(this, NetworkLogActivity::class.java))
+    }
+
+    private fun openPlaybackData() {
+        startActivity(android.content.Intent(this, PlaybackDataActivity::class.java))
     }
 
     private fun copyDiagnostics(states: List<SiteSearchState>) {

@@ -32,8 +32,20 @@ class NativePlayerActivity : LocalizedActivity() {
     private var player: ExoPlayer? = null
     private lateinit var playerView: PlayerView
 
+    // Real-playback data: the outcome of this play reports back into the
+    // sniff session it came from, so the analysis learns which candidate
+    // actually plays (started? seconds? stalled at ~1s? error?).
+    private var sessionId: Long = -1
+    private var enteredAtMs: Long = 0
+    private var started: Boolean = false
+    private var errorMsg: String? = null
+    private var outcomeRecorded: Boolean = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        PlaybackDataStore.init(applicationContext)
+        sessionId = intent.getLongExtra(FullscreenInternalPlayerActivity.EXTRA_SESSION_ID, -1)
+        enteredAtMs = System.currentTimeMillis()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         playerView = PlayerView(this).apply {
@@ -77,12 +89,22 @@ class NativePlayerActivity : LocalizedActivity() {
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
             .build()
         exoPlayer.addListener(object : Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY && exoPlayer.playWhenReady) {
+                    started = true
+                }
+            }
+
             override fun onPlayerError(error: PlaybackException) {
                 android.util.Log.w(
                     "NATIVE_PLAYER",
                     "playback failed url=$videoUrl cause=${error.cause}",
                     error
                 )
+                errorMsg = error.message ?: "未知错误"
+                // Record immediately: an error may be followed by a fast
+                // exit, and onPause must not overwrite it with a blank.
+                recordOutcome()
                 Toast.makeText(
                     this@NativePlayerActivity,
                     "播放失败：${error.message ?: "未知错误"}",
@@ -105,6 +127,37 @@ class NativePlayerActivity : LocalizedActivity() {
     override fun onPause() {
         super.onPause()
         player?.pause()
+        recordOutcome()
+    }
+
+    /**
+     * Reports this play into its sniff session. Last write wins, so a
+     * rotation records an interim sample and the exit overwrites it with
+     * the final state. Never throws.
+     */
+    private fun recordOutcome() {
+        if (sessionId < 0 || outcomeRecorded) return
+        outcomeRecorded = true
+        try {
+            val positionMs = player?.currentPosition ?: 0L
+            val wallSeconds = (System.currentTimeMillis() - enteredAtMs) / 1000.0
+            val secondsPlayed = positionMs / 1000.0
+            if (positionMs > 500L) started = true
+            val stalled = errorMsg == null && wallSeconds > 15.0 && secondsPlayed < 2.0
+            PlaybackDataStore.recordPlayback(
+                sessionId,
+                PlaybackOutcome(
+                    player = "原生",
+                    started = started,
+                    secondsPlayed = secondsPlayed,
+                    wallSeconds = wallSeconds,
+                    stalled = stalled,
+                    error = errorMsg,
+                ),
+            )
+        } catch (e: Exception) {
+            // Recording must never break playback.
+        }
     }
 
     override fun onDestroy() {
