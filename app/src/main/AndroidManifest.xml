@@ -96,6 +96,12 @@
             android:name=".PlaybackDataActivity"
             android:exported="false" />
         <activity
+            android:name=".VideoChoiceActivity"
+            android:exported="false" />
+        <activity
+            android:name=".HentaiMamaEpisodeActivity"
+            android:exported="false" />
+        <activity
             android:name=".PlaybackHistoryActivity"
             android:exported="false" />
         <activity

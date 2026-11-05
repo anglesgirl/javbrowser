@@ -1,5 +1,6 @@
 package com.example.javbrowser
 
+import android.app.Activity
 import android.content.Context
 import android.os.Bundle
 import android.view.Gravity
@@ -15,6 +16,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import androidx.activity.result.contract.ActivityResultContracts
 import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -197,6 +199,67 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     }
 
     /**
+     * Result of the full-page episode list (A方案 — replaces the old
+     * "選擇一集" dialog). The result echoes the session and the series
+     * item back, so a rotation while the page is open loses nothing;
+     * back press returns canceled and nothing happens, exactly like
+     * dismissing the old dialog.
+     */
+    private val episodeLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
+        val data = result.data ?: return@registerForActivityResult
+        val sessionId = data.getLongExtra(HentaiMamaEpisodeActivity.EXTRA_SESSION_ID, -1L)
+        if (sessionId < 0) return@registerForActivityResult
+        val detailUrl = data.getStringExtra(HentaiMamaEpisodeActivity.EXTRA_DETAIL_URL).orEmpty()
+        when (data.getStringExtra(HentaiMamaEpisodeActivity.EXTRA_RESULT_KIND)) {
+            HentaiMamaEpisodeActivity.RESULT_KIND_PICK -> {
+                val epUrl = data.getStringExtra(HentaiMamaEpisodeActivity.EXTRA_PICKED_URL).orEmpty()
+                if (epUrl.isBlank() || detailUrl.isBlank()) return@registerForActivityResult
+                val item = SearchItem(
+                    stableId = "", siteId = data.getStringExtra(HentaiMamaEpisodeActivity.EXTRA_SITE_ID).orEmpty(),
+                    title = data.getStringExtra(HentaiMamaEpisodeActivity.EXTRA_TITLE).orEmpty(),
+                    detailUrl = detailUrl, canonicalUrl = detailUrl)
+                resolveHentaiMamaEpisode(item.copy(detailUrl = epUrl), sessionId)
+            }
+            HentaiMamaEpisodeActivity.RESULT_KIND_BROWSER -> {
+                PlaybackDataStore.recordPick(sessionId, null, null)
+                if (detailUrl.isNotBlank()) BrowserNavigator.open(this, detailUrl)
+            }
+        }
+    }
+
+    /**
+     * Result of the full-page play-address list (A方案 — replaces the
+     * old "选择播放地址" dialog). Same echo-back contract as above:
+     * pick plays it (recorded in the playback-data session), browser
+     * opens WebView, back press does nothing.
+     */
+    private val choiceLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
+        val data = result.data ?: return@registerForActivityResult
+        val sessionId = data.getLongExtra(VideoChoiceActivity.EXTRA_SESSION_ID, -1L)
+        if (sessionId < 0) return@registerForActivityResult
+        val detailUrl = data.getStringExtra(VideoChoiceActivity.EXTRA_DETAIL_URL).orEmpty()
+        when (data.getStringExtra(VideoChoiceActivity.EXTRA_RESULT_KIND)) {
+            VideoChoiceActivity.RESULT_KIND_PICK -> {
+                val url = data.getStringExtra(VideoChoiceActivity.EXTRA_PICKED_URL).orEmpty()
+                if (url.isBlank() || detailUrl.isBlank()) return@registerForActivityResult
+                val item = SearchItem(
+                    stableId = "", siteId = data.getStringExtra(VideoChoiceActivity.EXTRA_SITE_ID).orEmpty(),
+                    title = data.getStringExtra(VideoChoiceActivity.EXTRA_TITLE).orEmpty(),
+                    detailUrl = detailUrl, canonicalUrl = detailUrl)
+                PlaybackDataStore.recordPick(sessionId, url,
+                    data.getIntExtra(VideoChoiceActivity.EXTRA_PICKED_INDEX, -1).takeIf { it >= 0 })
+                playSniffed(item, url, sessionId)
+            }
+            VideoChoiceActivity.RESULT_KIND_BROWSER -> {
+                PlaybackDataStore.recordPick(sessionId, null, null)
+                if (detailUrl.isNotBlank()) BrowserNavigator.open(this, detailUrl)
+            }
+        }
+    }
+
+    /**
      * Opens a search result. For hosts that publish an ECH config
      * (the app-layer fetch works while WebView is the blocked leg),
      * sniff the detail page HTML fetched over ECH and list the
@@ -316,17 +379,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         resolveHentaiMamaEpisode(item.copy(detailUrl = episodes[0].first), sessionId)
                     }
                     else -> {
-                        val labels = episodes.map { it.second }.toTypedArray()
-                        android.app.AlertDialog.Builder(this)
-                            .setTitle(LanguageManager.text(this, "選擇一集", "Choose an episode"))
-                            .setItems(labels) { _, which ->
-                                resolveHentaiMamaEpisode(item.copy(detailUrl = episodes[which].first), sessionId)
-                            }
-                            .setNegativeButton(LanguageManager.text(this, "用浏览器打开", "Open in browser")) { _, _ ->
-                                PlaybackDataStore.recordPick(sessionId, null, null)
-                                BrowserNavigator.open(this, item.detailUrl)
-                            }
-                            .show()
+                        episodeLauncher.launch(HentaiMamaEpisodeActivity.intent(this, item, episodes, sessionId))
                     }
                 }
             }
@@ -439,30 +492,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         })
     }
 
-    /** Lists sniffed candidates with their m3u8 duration, score and source. Never throws. */
+    /** Lists sniffed candidates with their m3u8 duration, score and source — now a full page, not a dialog. Never throws. */
     private fun showSniffPicker(item: SearchItem, candidates: List<SniffCandidateRecord>, sessionId: Long) {
-        val labels = candidates.map { candidateLabel(it) }.toTypedArray()
-        android.app.AlertDialog.Builder(this)
-            .setTitle(LanguageManager.text(this, "选择播放地址", "Choose video URL"))
-            .setItems(labels) { _, which ->
-                PlaybackDataStore.recordPick(sessionId, candidates[which].url, which)
-                playSniffed(item, candidates[which].url, sessionId)
-            }
-            .setNegativeButton(LanguageManager.text(this, "用浏览器打开", "Open in browser")) { _, _ ->
-                PlaybackDataStore.recordPick(sessionId, null, null)
-                BrowserNavigator.open(this, item.detailUrl)
-            }
-            .show()
-    }
-
-    /** One line per candidate: type, duration (longest is usually the main video), host, score. */
-    private fun candidateLabel(c: SniffCandidateRecord): String {
-        val host = try { java.net.URL(c.url).host } catch (e: Exception) { "" }
-        val type = if (c.url.lowercase().contains(".m3u8")) "m3u8" else "mp4"
-        val dur = c.durationSec?.let {
-            "${(it / 60).toInt()}:${(it % 60).toInt().toString().padStart(2, '0')}"
-        } ?: "—"
-        return "$type · $dur · $host · ${c.score}分"
+        if (isDestroyed || isFinishing) return
+        choiceLauncher.launch(VideoChoiceActivity.intent(this, item, candidates, sessionId))
     }
 
     /** Returns sniffed candidates (proven <60s m3u8 ads excluded), or empty to fall back to WebView. Never throws. */
