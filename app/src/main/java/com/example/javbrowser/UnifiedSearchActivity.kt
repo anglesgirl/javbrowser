@@ -476,6 +476,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         val foundParts = LinkedHashMap<Int, String>()
         var partLabels: List<String> = emptyList()
         var tokens: List<String> = emptyList()
+        var detailHtml: String = ""
         var jqueryJs: String? = null
         var driverCastJs: String? = null
         var castJs: String? = null
@@ -727,6 +728,15 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
 
         setupEmbedFn = ::setupEmbedPage
 
+        /** Strip the page's own scripts: the bundled cast.js is the
+         * only script the sandbox runs. Theme/ad/analytics scripts are
+         * removed so they cannot run, rewrite the DOM, or phone home;
+         * the static DOM they would have read stays intact. */
+        fun stripScripts(html: String): String {
+            return html.replace(Regex("(?is)<script\\b[^>]*>.*?</script>"), "")
+                .replace(Regex("(?is)<script\\b[^>]*/>"), "")
+        }
+
         /** Trigger every Part's click on the cast page and collect the
          * `sources` each handler computes (via the overridden
          * jQuery.ajax). The handler runs synchronously on trigger, so
@@ -744,6 +754,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     fail("直取失敗：驅動未就緒")
                     return@evalJs
                 }
+            // Clicking the already-active server is a no-op (the
+            // handler skips it), and the first server is active by
+            // default — clear the marker before every trigger so each
+            // Part's handler actually runs.
+            evalJs("jQuery('.box-server .srv').removeClass('default-srv'); 'ok'") {
                 evalJs("jQuery('.box-server .srv').eq($partIdx).trigger('click'); 'ok'") {
                     evalJs("JSON.stringify(window.__javhdAjaxCalls.slice($n0))") { value ->
                         if (done) return@evalJs
@@ -771,24 +786,18 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     }
                 }
             }
+            }
         }
 
-        /** Cast stage: blank page with the .video-player div and the
-         * .box-server/.srv anchors, then jQuery + driver + cast.js.
-         * The WebView is a pure JS sandbox — every network request is
-         * blocked; the app does all network natively. */
+        /** Cast stage: the real detail page (scripts stripped), then
+         * jQuery + driver + cast.js. The page must be real, not a
+         * hand-built blank: cast.js reads elements the blank page did
+         * not have (video-player-area, video-player, playeriframe) and
+         * throws at load when they are missing, so no handler is ever
+         * registered. The WebView is a pure JS sandbox — every network
+         * request is blocked; the app does all network natively. */
         fun setupCastPage() {
             if (done) return
-            val pageHtml = buildString {
-                append("<html><head></head><body>")
-                append("<div class=\"video-player\" data-mpu=\"${tokens.firstOrNull().orEmpty()}\"></div>")
-                append("<div class=\"box-server\">")
-                tokens.forEachIndexed { i, token ->
-                    val label = partLabels.getOrNull(i).orEmpty().ifEmpty { "Part${i + 1}" }
-                    append("<a class=\"srv\" href=\"javascript:void(0)\" data-link=\"$token\" data-type=\"load-fv\">$label</a>")
-                }
-                append("</div></body></html>")
-            }
             val wv = android.webkit.WebView(this)
             hiddenWebView = wv
             wv.settings.apply {
@@ -832,7 +841,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     }
                 }
             }
-            wv.loadDataWithBaseURL("https://www.javhdporn.net/", pageHtml, "text/html", "utf-8", null)
+            wv.loadDataWithBaseURL(item.detailUrl, detailHtml, "text/html", "utf-8", null)
         }
 
         // Step 1 (worker): read the bundled site scripts, then fetch
@@ -886,6 +895,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 partLabels = pairs.mapIndexed { i, (_, label) ->
                     label.ifEmpty { "Part${i + 1}" }
                 }
+                detailHtml = stripScripts(detail.body)
                 setupCastPage()
             }
         }
@@ -988,7 +998,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 })
             } else {
                 val reason = if (directFailReason != null) {
-                    "直取失敗：$directFailReason；點擊亦失敗：${javhdFailReason()}"
+                    "$directFailReason；點擊亦失敗：${javhdFailReason()}"
                 } else {
                     javhdFailReason()
                 }
