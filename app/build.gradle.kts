@@ -75,6 +75,12 @@ dependencies {
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // Native player (Media3/ExoPlayer) for direct files: bypasses the
+    // WebView video element, the localhost proxy and ECH interception.
+    // 1.4.1 fits this project's Kotlin 1.9 / AGP 8.2 / compileSdk 34.
+    implementation("androidx.media3:media3-exoplayer:1.4.1")
+    implementation("androidx.media3:media3-ui:1.4.1")
+
     // App-layer ECH (Conscrypt) + HTTP/3 (Cronet) for search/page fetch.
     // OkHttp, AGP, Kotlin and the SDK levels are deliberately NOT upgraded.
     implementation("org.conscrypt:conscrypt-android:2.7.0")

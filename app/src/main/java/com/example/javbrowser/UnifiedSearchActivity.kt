@@ -340,7 +340,16 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     }
 
     private fun playSniffed(item: SearchItem, videoUrl: String) {
-        startActivity(android.content.Intent(this, FullscreenInternalPlayerActivity::class.java).apply {
+        // HentaiMama direct files play in the native player: the WebView
+        // player stalls on them (plays ~1s, then jumps back), while the
+        // same URL plays fine in a browser. Every other site keeps the
+        // existing internal player.
+        val target = if (item.siteId == SearchSiteIds.HENTAIMAMA) {
+            NativePlayerActivity::class.java
+        } else {
+            FullscreenInternalPlayerActivity::class.java
+        }
+        startActivity(android.content.Intent(this, target).apply {
             putExtra(FullscreenInternalPlayerActivity.EXTRA_VIDEO_URL, videoUrl)
             putExtra(FullscreenInternalPlayerActivity.EXTRA_REFERER, item.detailUrl)
             putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, item.detailUrl)
