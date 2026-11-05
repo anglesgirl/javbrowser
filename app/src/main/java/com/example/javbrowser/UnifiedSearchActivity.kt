@@ -665,11 +665,18 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     if (done) return@pollJs
                     if (videodata.isNullOrEmpty()) {
                         // Read back whatever videodata became, plus the
-                        // capture counts, so the failure message shows
-                        // what binddata actually did.
+                        // capture counts and what the done callback
+                        // passed to binddata (if anything), so the
+                        // failure message shows where it actually died:
+                        // "binddata未調用" = callback never reached it;
+                        // "binddata參數=undefined" = decode produced
+                        // nothing; a URL here with videodata still
+                        // undefined = binddata itself failed to set it.
                         evalJs("(window.__javhdAjaxCalls ? window.__javhdAjaxCalls.length : -1) + '/' + (window.__javhdDoneCbs ? window.__javhdDoneCbs.length : -1)") { counts ->
                             evalJs("typeof window.videodata === 'string' ? window.videodata : (window.videodata === undefined ? 'undefined' : typeof window.videodata)") { actual ->
-                                fail("直取失敗：Part${partIdx + 1} 嵌頁地址未解出（videodata=${unquoteJs(actual).orEmpty().take(80)}；ajax/done=${unquoteJs(counts).orEmpty()}；src=${lastSourcesPreview}；data=${lastDataPreview}）")
+                                evalJs("typeof window.__binddataArg === 'undefined' ? 'binddata未調用' : ('binddata參數=' + window.__binddataArg)") { arg ->
+                                    fail("直取失敗：Part${partIdx + 1} 嵌頁地址未解出（videodata=${unquoteJs(actual).orEmpty().take(80)}；${unquoteJs(arg).orEmpty().take(120)}；ajax/done=${unquoteJs(counts).orEmpty()}；src=${lastSourcesPreview}；data=${lastDataPreview}）")
+                                }
                             }
                         }
                         return@pollJs
@@ -889,10 +896,22 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                                 // cast.js reads all there?
                                 evalJs("(function(){try{var jq=(typeof jQuery!=='undefined');var srv=document.querySelectorAll('.box-server .srv').length;var h=0;try{var el=document.querySelector('.box-server .srv');var ev=el&&jq?jQuery._data(el,'events'):null;h=ev&&ev.click?ev.click.length:0;}catch(e){}var ids=['video-player-area','video-player','playeriframe'].map(function(id){return id+'='+(!!document.getElementById(id));}).join(',');return 'jq='+jq+' srv='+srv+' handlers='+h+' '+ids;}catch(e){return 'ERR:'+e.message;}})();") { probe ->
                                     traceJavhd(sessionId, "沙盒探針：${unquoteJs(probe).orEmpty()}")
-                                    // jQuery ready callbacks fire on
-                                    // injection (document already complete);
-                                    // give handler registration a beat.
-                                    handler.postDelayed({ if (!done) collectSources(0) }, 500)
+                                    // Wrap window.binddata so the feed
+                                    // step can report exactly what (if
+                                    // anything) the done callback passes
+                                    // to it. The callback calls
+                                    // window.binddata (verified in jsdom),
+                                    // so this intercepts it without
+                                    // changing behaviour: the wrapper
+                                    // records the argument, then calls
+                                    // the original.
+                                    evalJs("(function(){if(window.__binddataWrapped)return 'already';var orig=window.binddata;if(typeof orig!=='function')return 'no-binddata';window.binddata=function(arg){try{window.__binddataArg=(arg===undefined?'undefined':String(arg));}catch(e){window.__binddataArg='ERR:'+e.message;}return orig.apply(this,arguments);};window.__binddataWrapped=true;return 'wrapped';})();") { wrap ->
+                                        traceJavhd(sessionId, "binddata 包裝：${unquoteJs(wrap).orEmpty()}")
+                                        // jQuery ready callbacks fire on
+                                        // injection (document already complete);
+                                        // give handler registration a beat.
+                                        handler.postDelayed({ if (!done) collectSources(0) }, 500)
+                                    }
                                 }
                             }
                         }
