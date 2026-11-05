@@ -235,19 +235,20 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // setup (video domain gdvid.info), never in static HTML — static
         // sniffing only finds snapshot thumbnails. Resolve it over HTTP,
         // skipping the VAST ad entirely; any failure falls back to WebView.
+        // NOTE: search results link to series intro pages (/tvshows/),
+        // which have no player at all — only an episode list. Resolving
+        // the intro page as if it were an episode always fails, so a
+        // series goes through its episode list first.
         if (item.siteId == SearchSiteIds.HENTAIMAMA) {
             runOnUiThread {
                 android.widget.Toast.makeText(this,
                     LanguageManager.text(this, "正在解析真实地址…", "Resolving real video URL…"),
                     android.widget.Toast.LENGTH_SHORT).show()
             }
-            tryResolveHentaiMamaRealUrl(item, sessionId) { realUrl ->
-                if (isDestroyed || isFinishing) return@tryResolveHentaiMamaRealUrl
-                if (realUrl != null) {
-                    showSniffPicker(item, listOf(resolverRecord(realUrl, "resolver-hentaimama")), sessionId)
-                } else {
-                    BrowserNavigator.open(this, item.detailUrl)
-                }
+            if (item.detailUrl.contains("/episodes/")) {
+                resolveHentaiMamaEpisode(item, sessionId)
+            } else {
+                resolveHentaiMamaSeries(item, sessionId)
             }
             return
         }
@@ -268,6 +269,69 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         url = url, source = source, score = 50,
         evidence = "解析直連（跳過廣告）", kept = true, dropReason = null, durationSec = null,
     )
+
+    /** Resolves one episode page to its direct file, then picker or browser fallback. Never throws. */
+    private fun resolveHentaiMamaEpisode(item: SearchItem, sessionId: Long) {
+        tryResolveHentaiMamaRealUrl(item, sessionId) { realUrl ->
+            if (isDestroyed || isFinishing) return@tryResolveHentaiMamaRealUrl
+            if (realUrl != null) {
+                showSniffPicker(item, listOf(resolverRecord(realUrl, "resolver-hentaimama")), sessionId)
+            } else {
+                BrowserNavigator.open(this, item.detailUrl)
+            }
+        }
+    }
+
+    /**
+     * Series intro page (/tvshows/): fetch its episode list over ECH,
+     * then resolve the chosen episode. One episode resolves directly;
+     * several show an episode picker. No episodes, or a fetch failure,
+     * falls back to WebView. Never throws.
+     */
+    private fun resolveHentaiMamaSeries(item: SearchItem, sessionId: Long) {
+        SearchScheduler.workers.execute {
+            val site = sites.firstOrNull { it.id == item.siteId }
+            val episodes: List<Pair<String, String>> = try {
+                if (site == null) {
+                    emptyList()
+                } else {
+                    val response = SearchHttpFetcher().fetch(item.detailUrl, SearchCancellation(), site)
+                    if (response.transportError != null || response.statusCode !in 200..299 || response.body.isBlank()) {
+                        emptyList()
+                    } else {
+                        VideoExtractor.extractHentaiMamaEpisodes(response.body, item.detailUrl)
+                    }
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+            runOnUiThread {
+                if (isDestroyed || isFinishing) return@runOnUiThread
+                when {
+                    episodes.isEmpty() -> {
+                        PlaybackDataStore.recordFail(sessionId, "系列介紹頁無劇集列表")
+                        BrowserNavigator.open(this, item.detailUrl)
+                    }
+                    episodes.size == 1 -> {
+                        resolveHentaiMamaEpisode(item.copy(detailUrl = episodes[0].first), sessionId)
+                    }
+                    else -> {
+                        val labels = episodes.map { it.second }.toTypedArray()
+                        android.app.AlertDialog.Builder(this)
+                            .setTitle(LanguageManager.text(this, "選擇一集", "Choose an episode"))
+                            .setItems(labels) { _, which ->
+                                resolveHentaiMamaEpisode(item.copy(detailUrl = episodes[which].first), sessionId)
+                            }
+                            .setNegativeButton(LanguageManager.text(this, "用浏览器打开", "Open in browser")) { _, _ ->
+                                PlaybackDataStore.recordPick(sessionId, null, null)
+                                BrowserNavigator.open(this, item.detailUrl)
+                            }
+                            .show()
+                    }
+                }
+            }
+        }
+    }
 
     /**
      * Resolves javhdporn's real file through a hidden WebView, mirroring
@@ -441,10 +505,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         var hiddenWebView: android.webkit.WebView? = null
         var done = false
         var timeoutRunnable: Runnable by kotlin.properties.Delegates.notNull()
+        // No-op default: finish() may run before onPageFinished assigns the real poll.
+        var pollRunnable: Runnable = Runnable {}
         fun finish(url: String?) {
             if (done) return
             done = true
             handler.removeCallbacks(timeoutRunnable)
+            handler.removeCallbacks(pollRunnable)
             hiddenWebView?.destroy()
             hiddenWebView = null
             if (url != null) {
@@ -477,16 +544,19 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                             null
                         )
                     }, 2000)
-                    // Then read the injected dt_embed iframe src.
-                    handler.postDelayed({
-                        if (done) return@postDelayed
+                    // Poll for the injected dt_embed iframe: the page
+                    // auto-loads its first mirror, but the AJAX can be
+                    // slow behind a CF challenge — a one-shot read at 5s
+                    // misses it. Poll every second until the 15s timeout.
+                    pollRunnable = Runnable {
+                        if (done) return@Runnable
                         view?.evaluateJavascript(
                             "(function(){var f=document.querySelector('iframe[src*=\"dt_embed\"]');return f?f.src:'';})();"
                         ) { value ->
                             if (done) return@evaluateJavascript
                             val embedUrl = value?.removeSurrounding("\"").orEmpty()
                             if (embedUrl.isBlank() || !embedUrl.contains("dt_embed")) {
-                                finish(null)
+                                handler.postDelayed(pollRunnable, 1000)
                                 return@evaluateJavascript
                             }
                             SearchScheduler.workers.execute {
@@ -510,7 +580,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                                 handler.post { finish(fileUrl) }
                             }
                         }
-                    }, 5000)
+                    }
+                    handler.postDelayed(pollRunnable, 3000)
                 }
             }
             wv.loadUrl(item.detailUrl)

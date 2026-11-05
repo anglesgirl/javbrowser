@@ -431,6 +431,38 @@ object VideoExtractor {
         return Regex("""https?://[^"\\]*dt_embed=rtmp[^"\\]*""").find(unescaped)?.value
     }
 
+    /**
+     * Episode links from a series intro page (/tvshows/<slug>/). The
+     * series page itself has no player (no get_player_contents), only
+     * an episode list (.dt-se-item links to /episodes/<slug>/). Returns
+     * (episode URL, label) in page order, deduplicated. Only episodes
+     * of this series are kept (slug starts with the series slug);
+     * if that filter yields nothing, all /episodes/ links are kept.
+     * Label is "第 N 集" from the slug's -episode-N suffix, else the
+     * slug tail.
+     */
+    fun extractHentaiMamaEpisodes(html: String, pageUrl: String): List<Pair<String, String>> {
+        val seriesSlug = pageUrl.trimEnd('/').substringAfterLast('/')
+        val all = mutableListOf<Pair<String, String>>()
+        val seen = mutableSetOf<String>()
+        for (m in Regex("""["']([^"']*?/episodes/[^"']+?/)["']""").findAll(html)) {
+            val raw = m.groupValues.getOrNull(1).orEmpty()
+            if (raw.isBlank()) continue
+            val resolved = if (raw.startsWith("http://") || raw.startsWith("https://")) raw
+            else try { java.net.URL(java.net.URL(pageUrl), raw).toString() } catch (e: Exception) { raw }
+            if (resolved in seen) continue
+            seen += resolved
+            val slug = resolved.trimEnd('/').substringAfterLast('/')
+            val epNum = Regex("""-episode-(\d+)$""").find(slug)?.groupValues?.getOrNull(1)
+            val label = if (epNum != null) "第 $epNum 集" else slug
+            all += resolved to label
+        }
+        val sameSeries = all.filter { (url, _) ->
+            url.trimEnd('/').substringAfterLast('/').startsWith("$seriesSlug-")
+        }
+        return sameSeries.ifEmpty { all }
+    }
+
     /** Direct video file from the dt_embed player page's JWPlayer setup
      *  (sources: [{"file": "https://gdvid.info/No/....mp4", "type": "mp4"}]). */
     fun extractHentaiMamaVideoFile(embedHtml: String): String? {
