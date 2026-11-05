@@ -605,6 +605,12 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 domStorageEnabled = true
                 userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
                 mediaPlaybackRequiresUserGesture = false
+                // Never serve this page from cache: a page that once failed
+                // sticks dead in the shared WebView cache (known app
+                // behaviour — only clearing the app cache revives it), and
+                // a dead cached page has no Server links to click. The
+                // resolver must always see the live page.
+                cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
             }
             android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
             wv.webViewClient = object : android.webkit.WebViewClient() {
