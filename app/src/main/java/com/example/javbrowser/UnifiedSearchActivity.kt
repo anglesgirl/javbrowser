@@ -408,9 +408,17 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * the next part; a part that never produces a file is skipped after
      * 20s. Old Streamtape videos (no .srv links) keep the legacy path:
      * generic play click + streamtape/tapecontent interception.
-     * Callback on the UI thread with every part found (label + URL),
-     * or null when none resolves — the caller then falls back to
-     * WebView. Never throws.
+     * The hidden WebView gets the same ECH treatment as the main
+     * browser (EchH3Router.fetchWebViewResource for GET fall-through),
+     * so the detail page loads here exactly the way it loads there.
+     * The file host is geo-selected (us-a2 in the sandbox run), so the
+     * interceptor also accepts any /file.mp4 path, not just vdcdn.xyz.
+     * On failure the recorded reason carries the step that died
+     * (page loaded? Server links? embed seen? media hosts seen?) so
+     * the 播放數據 screen says where it stopped instead of just
+     * "解析失敗". Callback on the UI thread with every part found
+     * (label + URL), or null when none resolves — the caller then
+     * falls back to WebView. Never throws.
      */
     private fun tryResolveJavhdRealUrl(
         item: SearchItem,
@@ -430,6 +438,16 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         var checker: Runnable? = null
         var timeoutRunnable: Runnable by kotlin.properties.Delegates.notNull()
 
+        // Diagnostics for the 播放數據 screen: which step the resolve
+        // died on. pageFinished = any main frame finished; embedSeen =
+        // the video.javhdporn.net/p/ iframe was requested; mediaHosts =
+        // every host that served a .mp4/.m3u8/.ts (matched or not — a
+        // file from an unexpected host shows up here, not in silence).
+        var pageFinished = false
+        var embedSeen = false
+        val mediaHosts = LinkedHashSet<String>()
+        val pageSlug = item.detailUrl.trimEnd('/').substringAfterLast('/')
+
         // Ad hosts seen on the detail + embed pages (popunders, VAST,
         // the paid-SMS scam creatives). Blocked outright in this hidden
         // WebView so the resolve never runs any of them. The video file
@@ -439,6 +457,17 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             "jads.co", "wpadmngr.com", "xlviirdr.com", "xlirdr.com",
             "javhdporn.live", "javhd-trk.com", "vivodemisrentas.net",
         )
+
+        /** Step-level failure reason for the 播放數據 screen. Never throws. */
+        fun javhdFailReason(): String {
+            val media = if (mediaHosts.isEmpty()) "無" else mediaHosts.take(3).joinToString(",")
+            return when {
+                !pageFinished -> "javhd解析失敗 [$pageSlug]：頁面未完成加載"
+                partLabels.isEmpty() -> "javhd解析失敗 [$pageSlug]：頁面已載、無Server連結；媒體host=$media"
+                !embedSeen -> "javhd解析失敗 [$pageSlug]：srv=${partLabels.size} 已點Part${partIdx + 1}、嵌頁未載入；媒體host=$media"
+                else -> "javhd解析失敗 [$pageSlug]：srv=${partLabels.size} 嵌頁已載、未見文件；媒體host=$media"
+            }
+        }
 
         fun finish() {
             if (done) return
@@ -459,7 +488,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     )
                 })
             } else {
-                PlaybackDataStore.recordFail(sessionId, "javhd隱藏WebView解析失敗")
+                PlaybackDataStore.recordFail(sessionId, javhdFailReason())
             }
             callback(result)
         }
@@ -495,6 +524,30 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 List(arr.length()) { i -> arr.optString(i).trim() }.filter { it.isNotEmpty() }
             } catch (e: Exception) {
                 emptyList()
+            }
+        }
+
+        fun listSrv(attempt: Int) {
+            hiddenWebView?.evaluateJavascript(
+                "(function(){var a=document.querySelectorAll('a.srv');var out=[];" +
+                    "for(var i=0;i<a.length;i++){out.push((a[i].textContent||'').trim()||('Part'+(i+1)));}" +
+                    "return JSON.stringify(out);})();"
+            ) { value ->
+                if (done) return@evaluateJavascript
+                partLabels = parseSrvLabels(value)
+                if (partLabels.isEmpty()) {
+                    // No Server links yet — the page may still be
+                    // settling or redirecting; retry twice before
+                    // falling back to the legacy Streamtape path.
+                    if (attempt < 2) {
+                        handler.postDelayed({ if (!done) listSrv(attempt + 1) }, 4000)
+                    } else {
+                        clickLegacyPlay()
+                        handler.postDelayed({ if (!done) finish() }, 20000)
+                    }
+                } else {
+                    checker?.let { handler.post(it) }
+                }
             }
         }
 
@@ -564,11 +617,19 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         return android.webkit.WebResourceResponse("text/plain", "utf-8",
                             java.io.ByteArrayInputStream(ByteArray(0)))
                     }
+                    if (reqUrl.contains("video.javhdporn.net/p/")) embedSeen = true
+                    if (reqUrl.contains(".mp4") || reqUrl.contains(".m3u8") || reqUrl.contains(".ts")) {
+                        try { mediaHosts.add(java.net.URL(reqUrl).host) } catch (e: Exception) { }
+                    }
                     val isReal = (reqUrl.contains("streamtape") && reqUrl.contains("get_video")) ||
                         (reqUrl.contains("tapecontent") &&
                             (reqUrl.contains(".mp4") || reqUrl.contains(".ts") || reqUrl.contains("m3u8"))) ||
                         (reqUrl.contains("vdcdn.xyz") &&
-                            (reqUrl.contains(".mp4") || reqUrl.contains("m3u8")))
+                            (reqUrl.contains(".mp4") || reqUrl.contains("m3u8"))) ||
+                        // The file host is geo-selected (us-a2 in the
+                        // sandbox run); any /file.mp4 is the JWPlayer
+                        // file, whatever region host serves it.
+                        reqUrl.contains("/file.mp4")
                     if (isReal) {
                         handler.post {
                             if (!done) {
@@ -585,6 +646,18 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         return android.webkit.WebResourceResponse("text/plain", "utf-8",
                             java.io.ByteArrayInputStream(ByteArray(0)))
                     }
+                    // ECH: same treatment as the main browser — GET
+                    // requests to hosts with an ECH config ride the
+                    // app-layer stack instead of WebView's plaintext
+                    // TLS. Without this the hidden WebView can hang on
+                    // page load while the main browser opens the same
+                    // URL fine; hosts without a config fall through to
+                    // WebView default as before.
+                    if (request?.method.equals("GET", ignoreCase = true) == true) {
+                        EchH3Router.fetchWebViewResource(
+                            reqUrl, request?.requestHeaders, request?.isMainFrame == true,
+                        )?.let { return it }
+                    }
                     return null
                 }
 
@@ -592,23 +665,9 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     super.onPageFinished(view, url)
                     if (setupDone || done) return
                     setupDone = true
+                    pageFinished = true
                     handler.postDelayed({
-                        if (done) return@postDelayed
-                        view?.evaluateJavascript(
-                            "(function(){var a=document.querySelectorAll('a.srv');var out=[];" +
-                                "for(var i=0;i<a.length;i++){out.push((a[i].textContent||'').trim()||('Part'+(i+1)));}" +
-                                "return JSON.stringify(out);})();"
-                        ) { value ->
-                            if (done) return@evaluateJavascript
-                            partLabels = parseSrvLabels(value)
-                            if (partLabels.isEmpty()) {
-                                // No Server links: legacy Streamtape video.
-                                clickLegacyPlay()
-                                handler.postDelayed({ if (!done) finish() }, 20000)
-                            } else {
-                                checker?.let { handler.post(it) }
-                            }
-                        }
+                        if (!done) listSrv(0)
                     }, 2000)
                 }
             }
