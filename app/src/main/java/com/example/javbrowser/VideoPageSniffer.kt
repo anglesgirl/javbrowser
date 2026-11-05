@@ -19,14 +19,20 @@ object VideoPageSniffer {
 
     private val mediaTagSrc =
         Regex("""<(?:video|source)[^>]+src\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+    // The extension must terminate the path (end of URL, or a ?/#
+    // query/fragment follows). Without this, video-snapshot thumbnails
+    // such as "...Episode-1.mp4_snapshot_05.21_....webp" match as "mp4"
+    // candidates and get fed to the internal player, which then cannot
+    // load (it is an image, not a video). Real stream URLs end in
+    // .mp4/.m3u8 or carry ?/# parameters, so they still match.
     private val looseM3u8 =
-        Regex("""https?://[^"'\s<>]+\.m3u8[^"'\s<>]*""", RegexOption.IGNORE_CASE)
+        Regex("""https?://[^"'\s<>]+\.m3u8(?=[?#]|["'\s<>]|$)(?:[?#][^"'\s<>]*)?""", RegexOption.IGNORE_CASE)
     private val looseMp4 =
-        Regex("""https?://[^"'\s<>]+\.mp4[^"'\s<>]*""", RegexOption.IGNORE_CASE)
+        Regex("""https?://[^"'\s<>]+\.mp4(?=[?#]|["'\s<>]|$)(?:[?#][^"'\s<>]*)?""", RegexOption.IGNORE_CASE)
     // Matched as whole URL segments only, so "load" or "download"
     // never false-positive on the "ad" keyword.
     private val adSegment =
-        Regex("""(?<![a-z0-9])(ad|ads|preview|trailer|thumb|sample)(?![a-z0-9])""", RegexOption.IGNORE_CASE)
+        Regex("""(?<![a-z0-9])(ad|ads|preview|trailer|thumb|sample|snapshot)(?![a-z0-9])""", RegexOption.IGNORE_CASE)
 
     fun sniffCandidates(html: String, pageUrl: String, code: String?): List<String> {
         if (html.isBlank()) return emptyList()
