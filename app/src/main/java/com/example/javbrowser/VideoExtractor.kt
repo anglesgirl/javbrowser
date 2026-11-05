@@ -434,19 +434,26 @@ object VideoExtractor {
     /**
      * Episode links from a series intro page (/tvshows/<slug>/). The
      * series page itself has no player (no get_player_contents), only
-     * an episode list (.dt-se-item links to /episodes/<slug>/). Returns
-     * (episode URL, label) in page order, deduplicated. Only episodes
-     * of this series are kept (slug starts with the series slug);
-     * if that filter yields nothing, all /episodes/ links are kept.
-     * Label is "第 N 集" from the slug's -episode-N suffix, else the
-     * slug tail.
+     * an episode list. Only links inside the episode list itself are
+     * taken: <a class="dt-se-item" href="/episodes/...">. The page
+     * also carries /episodes/ links to OTHER series (related / latest
+     * sections), so a whole-page scan is wrong — that is how 6 foreign
+     * episodes ended up in a 2-episode series' picker. There is no
+     * "keep everything if the filter misses" fallback any more: an
+     * empty list falls back to WebView instead of showing wrong
+     * episodes. Returns (episode URL, label) in page order,
+     * deduplicated. Label is "第 N 集" from the slug's -episode-N
+     * suffix, else the slug tail.
      */
     fun extractHentaiMamaEpisodes(html: String, pageUrl: String): List<Pair<String, String>> {
-        val seriesSlug = pageUrl.trimEnd('/').substringAfterLast('/')
-        val all = mutableListOf<Pair<String, String>>()
+        val out = mutableListOf<Pair<String, String>>()
         val seen = mutableSetOf<String>()
-        for (m in Regex("""["']([^"']*?/episodes/[^"']+?/)["']""").findAll(html)) {
-            val raw = m.groupValues.getOrNull(1).orEmpty()
+        val seenNums = mutableSetOf<String>()
+        for (m in Regex("""<a\b[^>]*>""").findAll(html)) {
+            val tag = m.value
+            if (!tag.contains("dt-se-item")) continue
+            val raw = Regex("""href=["']([^"']*?/episodes/[^"']+?/)["']""")
+                .find(tag)?.groupValues?.getOrNull(1).orEmpty()
             if (raw.isBlank()) continue
             val resolved = if (raw.startsWith("http://") || raw.startsWith("https://")) raw
             else try { java.net.URL(java.net.URL(pageUrl), raw).toString() } catch (e: Exception) { raw }
@@ -454,13 +461,14 @@ object VideoExtractor {
             seen += resolved
             val slug = resolved.trimEnd('/').substringAfterLast('/')
             val epNum = Regex("""-episode-(\d+)$""").find(slug)?.groupValues?.getOrNull(1)
+            // Same episode number via another source list is the same
+            // episode (a series page can list each episode once per
+            // source); keep the first URL only.
+            if (epNum != null && !seenNums.add(epNum)) continue
             val label = if (epNum != null) "第 $epNum 集" else slug
-            all += resolved to label
+            out += resolved to label
         }
-        val sameSeries = all.filter { (url, _) ->
-            url.trimEnd('/').substringAfterLast('/').startsWith("$seriesSlug-")
-        }
-        return sameSeries.ifEmpty { all }
+        return out
     }
 
     /** Direct video file from the dt_embed player page's JWPlayer setup
