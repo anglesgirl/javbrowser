@@ -477,6 +477,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         var partLabels: List<String> = emptyList()
         var tokens: List<String> = emptyList()
         var detailHtml: String = ""
+        var lastSourcesPreview: String = ""
+        var lastDataPreview: String = ""
         var jqueryJs: String? = null
         var driverCastJs: String? = null
         var castJs: String? = null
@@ -610,6 +612,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     handler.post { fail("直取失敗：Part${partIdx + 1} api/play無效") }
                     return@execute
                 }
+                lastSourcesPreview = sources.take(24) + "…len=" + sources.length
+                lastDataPreview = data.take(24) + "…len=" + data.length
                 handler.post { if (!done) feedDoneFn(partIdx, postJson) }
             }
         }
@@ -634,10 +638,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 pollJs("typeof window.videodata === 'string' && window.videodata.indexOf('http') === 0 ? window.videodata : ''", 10000) { videodata ->
                     if (done) return@pollJs
                     if (videodata.isNullOrEmpty()) {
-                        // Read back whatever videodata became, so the
-                        // failure message shows what binddata did.
-                        evalJs("typeof window.videodata === 'string' ? window.videodata : (window.videodata === undefined ? 'undefined' : typeof window.videodata)") { actual ->
-                            fail("直取失敗：Part${partIdx + 1} 嵌頁地址未解出（videodata=${unquoteJs(actual).orEmpty().take(80)}）")
+                        // Read back whatever videodata became, plus the
+                        // capture counts, so the failure message shows
+                        // what binddata actually did.
+                        evalJs("(window.__javhdAjaxCalls ? window.__javhdAjaxCalls.length : -1) + '/' + (window.__javhdDoneCbs ? window.__javhdDoneCbs.length : -1)") { counts ->
+                            evalJs("typeof window.videodata === 'string' ? window.videodata : (window.videodata === undefined ? 'undefined' : typeof window.videodata)") { actual ->
+                                fail("直取失敗：Part${partIdx + 1} 嵌頁地址未解出（videodata=${unquoteJs(actual).orEmpty().take(80)}；ajax/done=${unquoteJs(counts).orEmpty()}；src=${lastSourcesPreview}；data=${lastDataPreview}）")
+                            }
                         }
                         return@pollJs
                     }
@@ -881,11 +888,15 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 handler.post { fail("直取失敗：詳情頁取不到") }
                 return@execute
             }
-            // <a class="srv" href="javascript:void(0)" data-link="TOKEN" ...>Part1</a>
-            val srvRe = Regex("<a[^>]*data-link=\"([^\"]+)\"[^>]*>([^<]*)</a>")
-            val found = srvRe.findAll(detail.body).map { m ->
-                m.groupValues.getOrNull(1).orEmpty().trim() to
-                    m.groupValues.getOrNull(2).orEmpty().trim()
+            // <a class="srv" ... data-link="TOKEN" ...><i ...></i> Part1</a>
+            // The anchor content holds an <i> icon, so the label cannot
+            // be captured with ([^<]*); take the token from the opening
+            // tag and the label leniently after any nested tags.
+            val tokenRe = Regex("<a[^>]*data-link=\"([^\"]+)\"[^>]*>")
+            val labelRe = Regex("<a[^>]*data-link=\"[^\"]+\"[^>]*>(?:<[^>]*>)*\\s*([^<]*)</a>")
+            val labels = labelRe.findAll(detail.body).map { it.groupValues.getOrNull(1).orEmpty().trim() }.toList()
+            val found = tokenRe.findAll(detail.body).mapIndexed { i, m ->
+                m.groupValues.getOrNull(1).orEmpty().trim() to labels.getOrNull(i).orEmpty()
             }.filter { it.first.isNotEmpty() }.toList()
             val pairs = if (found.isNotEmpty()) found else run {
                 // Fallback: Part1's token is also the data-mpu value.
