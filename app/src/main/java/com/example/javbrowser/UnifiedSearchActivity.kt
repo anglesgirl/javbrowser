@@ -656,33 +656,54 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     return@evalJs
                 }
                 traceJavhd(sessionId, "Part${partIdx + 1} 餵回調：已餵")
-                // binddata runs synchronously inside the callback and
-                // sets window.videodata; poll briefly in case it defers.
-                // Accept any http URL: the embed host varies by region
-                // (video.javhdporn.net is not the only one), so do not
-                // hard-code it here.
-                pollJs("typeof window.videodata === 'string' && window.videodata.indexOf('http') === 0 ? window.videodata : ''", 10000) { videodata ->
-                    if (done) return@pollJs
-                    if (videodata.isNullOrEmpty()) {
-                        // Read back whatever videodata became, plus the
-                        // capture counts and what the done callback
-                        // passed to binddata (if anything), so the
-                        // failure message shows where it actually died:
-                        // "binddata未調用" = callback never reached it;
-                        // "binddata參數=undefined" = decode produced
-                        // nothing; a URL here with videodata still
-                        // undefined = binddata itself failed to set it.
-                        evalJs("(window.__javhdAjaxCalls ? window.__javhdAjaxCalls.length : -1) + '/' + (window.__javhdDoneCbs ? window.__javhdDoneCbs.length : -1)") { counts ->
-                            evalJs("typeof window.videodata === 'string' ? window.videodata : (window.videodata === undefined ? 'undefined' : typeof window.videodata)") { actual ->
-                                evalJs("typeof window.__binddataArg === 'undefined' ? 'binddata未調用' : ('binddata參數=' + window.__binddataArg)") { arg ->
-                                    fail("直取失敗：Part${partIdx + 1} 嵌頁地址未解出（videodata=${unquoteJs(actual).orEmpty().take(80)}；${unquoteJs(arg).orEmpty().take(120)}；ajax/done=${unquoteJs(counts).orEmpty()}；src=${lastSourcesPreview}；data=${lastDataPreview}）")
+                // Read the embed URL from the binddata wrapper first.
+                // The wrapper (installed after the sandbox probe)
+                // records the argument the done callback passes to
+                // binddata as window.__binddataArg. On the device
+                // binddata receives the correct URL but
+                // window.videodata stays undefined — the property name
+                // binddata decodes differs from jsdom, so the URL lands
+                // under another name and polling videodata alone never
+                // finds it. The wrapper argument IS the embed URL, so
+                // use it directly. Fall back to the videodata poll if
+                // the wrapper has nothing (binddata not called, or the
+                // wrapper not installed). Accept any http URL: the
+                // embed host varies by region (video.javhdporn.net is
+                // not the only one), so do not hard-code it here.
+                evalJs("typeof window.__binddataArg === 'string' && window.__binddataArg.indexOf('http') === 0 ? window.__binddataArg : ''") { argUrl ->
+                    if (done) return@evalJs
+                    val url = unquoteJs(argUrl).orEmpty()
+                    if (url.isNotEmpty()) {
+                        traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁地址（binddata參數）：$url")
+                        fetchEmbedFn(partIdx, url)
+                        return@evalJs
+                    }
+                    // binddata runs synchronously inside the callback
+                    // and sets window.videodata; poll briefly in case
+                    // it defers.
+                    pollJs("typeof window.videodata === 'string' && window.videodata.indexOf('http') === 0 ? window.videodata : ''", 10000) { videodata ->
+                        if (done) return@pollJs
+                        if (videodata.isNullOrEmpty()) {
+                            // Read back whatever videodata became, plus the
+                            // capture counts and what the done callback
+                            // passed to binddata (if anything), so the
+                            // failure message shows where it actually died:
+                            // "binddata未調用" = callback never reached it;
+                            // "binddata參數=undefined" = decode produced
+                            // nothing; a URL here with videodata still
+                            // undefined = binddata itself failed to set it.
+                            evalJs("(window.__javhdAjaxCalls ? window.__javhdAjaxCalls.length : -1) + '/' + (window.__javhdDoneCbs ? window.__javhdDoneCbs.length : -1)") { counts ->
+                                evalJs("typeof window.videodata === 'string' ? window.videodata : (window.videodata === undefined ? 'undefined' : typeof window.videodata)") { actual ->
+                                    evalJs("typeof window.__binddataArg === 'undefined' ? 'binddata未調用' : ('binddata參數=' + window.__binddataArg)") { arg ->
+                                        fail("直取失敗：Part${partIdx + 1} 嵌頁地址未解出（videodata=${unquoteJs(actual).orEmpty().take(80)}；${unquoteJs(arg).orEmpty().take(120)}；ajax/done=${unquoteJs(counts).orEmpty()}；src=${lastSourcesPreview}；data=${lastDataPreview}）")
+                                    }
                                 }
                             }
+                            return@pollJs
                         }
-                        return@pollJs
+                        traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁地址：$videodata")
+                        fetchEmbedFn(partIdx, videodata)
                     }
-                    traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁地址：$videodata")
-                    fetchEmbedFn(partIdx, videodata)
                 }
             }
         }
