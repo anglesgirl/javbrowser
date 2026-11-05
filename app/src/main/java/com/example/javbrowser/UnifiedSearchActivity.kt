@@ -443,7 +443,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // the video.javhdporn.net/p/ iframe was requested; mediaHosts =
         // every host that served a .mp4/.m3u8/.ts (matched or not — a
         // file from an unexpected host shows up here, not in silence).
+        // pageStarted/maxProgress/lastLoadError pin a stalled load:
+        // started-but-never-finished with a progress % and the last
+        // error is a very different failure from never-started.
         var pageFinished = false
+        var pageStarted = false
+        var maxProgress = 0
+        var lastLoadError: String? = null
         var embedSeen = false
         val mediaHosts = LinkedHashSet<String>()
         val pageSlug = item.detailUrl.trimEnd('/').substringAfterLast('/')
@@ -462,7 +468,9 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         fun javhdFailReason(): String {
             val media = if (mediaHosts.isEmpty()) "無" else mediaHosts.take(3).joinToString(",")
             return when {
-                !pageFinished -> "javhd解析失敗 [$pageSlug]：頁面未完成加載"
+                !pageStarted -> "javhd解析失敗 [$pageSlug]：頁面未開始加載"
+                !pageFinished -> "javhd解析失敗 [$pageSlug]：頁面未完成加載（進度$maxProgress%" +
+                    (lastLoadError?.let { "，$it" } ?: "") + ")"
                 partLabels.isEmpty() -> "javhd解析失敗 [$pageSlug]：頁面已載、無Server連結；媒體host=$media"
                 !embedSeen -> "javhd解析失敗 [$pageSlug]：srv=${partLabels.size} 已點Part${partIdx + 1}、嵌頁未載入；媒體host=$media"
                 else -> "javhd解析失敗 [$pageSlug]：srv=${partLabels.size} 嵌頁已載、未見文件；媒體host=$media"
@@ -613,6 +621,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
             }
             android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+            wv.webChromeClient = object : android.webkit.WebChromeClient() {
+                override fun onProgressChanged(view: android.webkit.WebView?, newProgress: Int) {
+                    if (newProgress > maxProgress) maxProgress = newProgress
+                }
+            }
             wv.webViewClient = object : android.webkit.WebViewClient() {
                 override fun shouldInterceptRequest(
                     view: android.webkit.WebView?,
@@ -665,6 +678,33 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         )?.let { return it }
                     }
                     return null
+                }
+
+                override fun onPageStarted(view: android.webkit.WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                    super.onPageStarted(view, url, favicon)
+                    pageStarted = true
+                }
+
+                override fun onReceivedError(
+                    view: android.webkit.WebView?,
+                    request: android.webkit.WebResourceRequest?,
+                    error: android.webkit.WebResourceError?,
+                ) {
+                    super.onReceivedError(view, request, error)
+                    if (lastLoadError == null && error != null) {
+                        lastLoadError = "錯誤 ${request?.url?.host ?: "?"} ${error.errorCode} ${error.description}"
+                    }
+                }
+
+                override fun onReceivedHttpError(
+                    view: android.webkit.WebView?,
+                    request: android.webkit.WebResourceRequest?,
+                    errorResponse: android.webkit.WebResourceResponse?,
+                ) {
+                    super.onReceivedHttpError(view, request, errorResponse)
+                    if (lastLoadError == null && errorResponse != null) {
+                        lastLoadError = "HTTP ${errorResponse.statusCode} ${request?.url?.host ?: "?"}"
+                    }
                 }
 
                 override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
