@@ -19,7 +19,12 @@ internal fun candidateLabel(c: SniffCandidateRecord): String {
     val dur = c.durationSec?.let {
         "${(it / 60).toInt()}:${(it % 60).toInt().toString().padStart(2, '0')}"
     } ?: "—"
-    return "$type · $dur · $host · ${c.score}分"
+    // Resolver parts (javhdporn Part1/Part2) share one host and no
+    // duration, so the part tag in the evidence is the only thing that
+    // tells the rows apart.
+    val part = Regex("^Part\\d+").find(c.evidence)?.value
+    val prefix = if (part != null) "$part · " else ""
+    return "$prefix$type · $dur · $host · ${c.score}分"
 }
 
 /**

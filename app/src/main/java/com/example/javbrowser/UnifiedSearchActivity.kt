@@ -284,10 +284,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     LanguageManager.text(this, "正在解析真实地址…", "Resolving real video URL…"),
                     android.widget.Toast.LENGTH_SHORT).show()
             }
-            tryResolveJavhdRealUrl(item, sessionId) { realUrl ->
+            tryResolveJavhdRealUrl(item, sessionId) { parts ->
                 if (isDestroyed || isFinishing) return@tryResolveJavhdRealUrl
-                if (realUrl != null) {
-                    showSniffPicker(item, listOf(resolverRecord(realUrl, "resolver-javhd")), sessionId)
+                if (parts != null) {
+                    showSniffPicker(item, parts.map { (label, url) ->
+                        resolverRecord(url, "resolver-javhd",
+                            if (label.isEmpty()) "解析直連（跳過廣告）" else "$label 解析直連（跳過廣告）")
+                    }, sessionId)
                 } else {
                     BrowserNavigator.open(this, item.detailUrl)
                 }
@@ -328,9 +331,9 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     }
 
     /** Display-only record for a resolver-produced URL (the store already holds the precise attempt). */
-    private fun resolverRecord(url: String, source: String) = SniffCandidateRecord(
+    private fun resolverRecord(url: String, source: String, evidence: String = "解析直連（跳過廣告）") = SniffCandidateRecord(
         url = url, source = source, score = 50,
-        evidence = "解析直連（跳過廣告）", kept = true, dropReason = null, durationSec = null,
+        evidence = evidence, kept = true, dropReason = null, durationSec = null,
     )
 
     /** Resolves one episode page to its direct file, then picker or browser fallback. Never throws. */
@@ -387,36 +390,160 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     }
 
     /**
-     * Resolves javhdporn's real file through a hidden WebView, mirroring
-     * MainActivity's proven interception: the detail page's player runs JS,
-     * and the real file only appears as a network request — a Streamtape
-     * get_video URL or a tapecontent media URL (generic .mp4/.m3u8 is NOT
-     * captured, to avoid page ads). A Streamtape /e/ embed is chased by
-     * loading it as the top page and simulating a play click after 2s,
-     * exactly like extractStreamtapeUrl. Callback on the UI thread with
-     * the real URL, or null on timeout (15s) / failure — the caller then
-     * falls back to WebView. Never throws.
+     * Resolves javhdporn's real files through a hidden WebView. The detail
+     * page carries no video URL at all — only an encrypted data-mpu token
+     * and Server links (Part1/Part2, a.srv[data-type="load-fv"]). Clicking
+     * a Server link makes the page's own JS decode the token and load
+     * video.javhdporn.net/p/<code> (signed t/s params), whose JWPlayer
+     * setup decodes data-config into the direct file
+     * https://<region>.vdcdn.xyz/<token>/file.mp4?sign=...&t=... — the
+     * preload fetch is what the interceptor catches (verified 2026-11-05
+     * by running the embed page's own main.js in Node: the setup it
+     * produces has an empty advertising schedule, so the file itself
+     * carries no ad). Playing that file directly skips the whole ad
+     * stack (VAST pre-roll, popunders, the paid-SMS scam ads), and the
+     * hidden WebView also blocks the ad hosts outright.
+     * One part at a time: click a.srv[i], wait for its file (the first
+     * click is sometimes a no-op — retry once after 8s), then move to
+     * the next part; a part that never produces a file is skipped after
+     * 20s. Old Streamtape videos (no .srv links) keep the legacy path:
+     * generic play click + streamtape/tapecontent interception.
+     * Callback on the UI thread with every part found (label + URL),
+     * or null when none resolves — the caller then falls back to
+     * WebView. Never throws.
      */
-    private fun tryResolveJavhdRealUrl(item: SearchItem, sessionId: Long, callback: (String?) -> Unit) {
+    private fun tryResolveJavhdRealUrl(
+        item: SearchItem,
+        sessionId: Long,
+        callback: (List<Pair<String, String>>?) -> Unit,
+    ) {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
         var hiddenWebView: android.webkit.WebView? = null
         var done = false
         var chasedEmbed = false
+        var setupDone = false
+        var partLabels: List<String> = emptyList()
+        var partIdx = 0
+        var partClicks = 0
+        var partStartedAt = 0L
+        val foundParts = LinkedHashMap<Int, String>()
+        var checker: Runnable? = null
         var timeoutRunnable: Runnable by kotlin.properties.Delegates.notNull()
-        fun finish(url: String?) {
+
+        // Ad hosts seen on the detail + embed pages (popunders, VAST,
+        // the paid-SMS scam creatives). Blocked outright in this hidden
+        // WebView so the resolve never runs any of them. The video file
+        // host (vdcdn.xyz) and the embed host are NOT in this list.
+        val adHosts = listOf(
+            "whitetrafsa", "content-sync.xyz", "alaphoid.com", "udzpel.com",
+            "jads.co", "wpadmngr.com", "xlviirdr.com", "xlirdr.com",
+            "javhdporn.live", "javhd-trk.com", "vivodemisrentas.net",
+        )
+
+        fun finish() {
             if (done) return
             done = true
             handler.removeCallbacks(timeoutRunnable)
+            checker?.let { handler.removeCallbacks(it) }
             hiddenWebView?.destroy()
             hiddenWebView = null
-            if (url != null) {
-                PlaybackDataStore.addCandidates(sessionId, listOf(resolverRecord(url, "resolver-javhd")))
+            val result = if (foundParts.isEmpty()) null else foundParts.entries.map { (i, url) ->
+                val label = if (i in partLabels.indices) partLabels[i] else ""
+                label to url
+            }
+            if (result != null) {
+                PlaybackDataStore.addCandidates(sessionId, result.map { (label, url) ->
+                    resolverRecord(
+                        url, "resolver-javhd",
+                        if (label.isEmpty()) "解析直連（跳過廣告）" else "$label 解析直連（跳過廣告）",
+                    )
+                })
             } else {
                 PlaybackDataStore.recordFail(sessionId, "javhd隱藏WebView解析失敗")
             }
-            callback(url)
+            callback(result)
         }
-        timeoutRunnable = Runnable { finish(null) }
+
+        fun clickSrv(i: Int) {
+            partClicks++
+            hiddenWebView?.evaluateJavascript(
+                "(function(){var a=document.querySelectorAll('a.srv');" +
+                    "if(a.length>" + i + "){a[" + i + "].click();return 'clicked';}" +
+                    "return 'no-srv';})();",
+                null,
+            )
+        }
+
+        fun clickLegacyPlay() {
+            hiddenWebView?.evaluateJavascript(
+                "(function(){" +
+                    "var s=['#overlay','#mainvideo','video','[id*=\"play\"]','[class*=\"play\"]','[class*=\"btn\"]'];" +
+                    "for(var i=0;i<s.length;i++){" +
+                    "var el=document.querySelector(s[i]);" +
+                    "if(el){el.click();return 'clicked:'+s[i];}}" +
+                    "return 'no element found';})();",
+                null,
+            )
+        }
+
+        fun parseSrvLabels(value: String?): List<String> {
+            val raw = value?.trim().orEmpty()
+            if (raw.isEmpty() || raw == "null") return emptyList()
+            return try {
+                val inner = org.json.JSONTokener(raw).nextValue() as? String ?: return emptyList()
+                val arr = org.json.JSONArray(inner)
+                List(arr.length()) { i -> arr.optString(i).trim() }.filter { it.isNotEmpty() }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+        checker = object : Runnable {
+            override fun run() {
+                if (done) return
+                if (partLabels.isEmpty()) {
+                    // Legacy video (no Server links): the single play
+                    // click was already sent; the 20s cutoff ends it.
+                    handler.postDelayed(this, 3000)
+                    return
+                }
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (partIdx >= partLabels.size) {
+                    finish()
+                    return
+                }
+                when {
+                    foundParts.containsKey(partIdx) -> {
+                        partIdx++
+                        partClicks = 0
+                        if (partIdx >= partLabels.size) {
+                            finish()
+                            return
+                        }
+                        partStartedAt = now
+                        clickSrv(partIdx)
+                    }
+                    partClicks == 0 -> {
+                        partStartedAt = now
+                        clickSrv(partIdx)
+                    }
+                    partClicks == 1 && now - partStartedAt > 8000 -> clickSrv(partIdx)
+                    now - partStartedAt > 20000 -> {
+                        partIdx++
+                        partClicks = 0
+                        if (partIdx >= partLabels.size) {
+                            finish()
+                            return
+                        }
+                        partStartedAt = now
+                        clickSrv(partIdx)
+                    }
+                }
+                handler.postDelayed(this, 3000)
+            }
+        }
+
+        timeoutRunnable = Runnable { finish() }
         handler.post {
             val wv = android.webkit.WebView(this)
             hiddenWebView = wv
@@ -433,11 +560,22 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     request: android.webkit.WebResourceRequest?
                 ): android.webkit.WebResourceResponse? {
                     val reqUrl = request?.url?.toString() ?: return null
+                    if (adHosts.any { reqUrl.contains(it) }) {
+                        return android.webkit.WebResourceResponse("text/plain", "utf-8",
+                            java.io.ByteArrayInputStream(ByteArray(0)))
+                    }
                     val isReal = (reqUrl.contains("streamtape") && reqUrl.contains("get_video")) ||
                         (reqUrl.contains("tapecontent") &&
-                            (reqUrl.contains(".mp4") || reqUrl.contains(".ts") || reqUrl.contains("m3u8")))
+                            (reqUrl.contains(".mp4") || reqUrl.contains(".ts") || reqUrl.contains("m3u8"))) ||
+                        (reqUrl.contains("vdcdn.xyz") &&
+                            (reqUrl.contains(".mp4") || reqUrl.contains("m3u8")))
                     if (isReal) {
-                        handler.post { finish(reqUrl) }
+                        handler.post {
+                            if (!done) {
+                                val key = if (partLabels.isEmpty()) -1 else partIdx
+                                if (!foundParts.containsKey(key)) foundParts[key] = reqUrl
+                            }
+                        }
                         return android.webkit.WebResourceResponse("text/plain", "utf-8",
                             java.io.ByteArrayInputStream(ByteArray(0)))
                     }
@@ -452,33 +590,41 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
 
                 override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
                     super.onPageFinished(view, url)
+                    if (setupDone || done) return
+                    setupDone = true
                     handler.postDelayed({
-                        if (!done) {
-                            view?.evaluateJavascript("""
-                                (function(){
-                                    var selectors = ['#overlay','#mainvideo','video','[id*="play"]','[class*="play"]','[class*="btn"]'];
-                                    for(var i=0;i<selectors.length;i++){
-                                        var el=document.querySelector(selectors[i]);
-                                        if(el){el.click();return 'clicked:'+selectors[i];}
-                                    }
-                                    return 'no element found';
-                                })();
-                            """.trimIndent(), null)
+                        if (done) return@postDelayed
+                        view?.evaluateJavascript(
+                            "(function(){var a=document.querySelectorAll('a.srv');var out=[];" +
+                                "for(var i=0;i<a.length;i++){out.push((a[i].textContent||'').trim()||('Part'+(i+1)));}" +
+                                "return JSON.stringify(out);})();"
+                        ) { value ->
+                            if (done) return@evaluateJavascript
+                            partLabels = parseSrvLabels(value)
+                            if (partLabels.isEmpty()) {
+                                // No Server links: legacy Streamtape video.
+                                clickLegacyPlay()
+                                handler.postDelayed({ if (!done) finish() }, 20000)
+                            } else {
+                                checker?.let { handler.post(it) }
+                            }
                         }
                     }, 2000)
                 }
             }
             wv.loadUrl(item.detailUrl)
-            handler.postDelayed(timeoutRunnable, 15000)
+            handler.postDelayed(timeoutRunnable, 75000)
         }
     }
 
     private fun playSniffed(item: SearchItem, videoUrl: String, sessionId: Long) {
-        // HentaiMama direct files play in the native player: the WebView
-        // player stalls on them (plays ~1s, then jumps back), while the
-        // same URL plays fine in a browser. Every other site keeps the
+        // HentaiMama and javhdporn direct files play in the native player:
+        // the WebView player stalls on them (plays ~1s, then jumps back),
+        // while the same URL plays fine in a browser. javhdporn's file host
+        // also ignores Range requests (200 with the full body), which the
+        // native player tolerates better. Every other site keeps the
         // existing internal player.
-        val target = if (item.siteId == SearchSiteIds.HENTAIMAMA) {
+        val target = if (item.siteId == SearchSiteIds.HENTAIMAMA || item.siteId == SearchSiteIds.JAVHD) {
             NativePlayerActivity::class.java
         } else {
             FullscreenInternalPlayerActivity::class.java
