@@ -655,7 +655,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     // WebView default as before.
                     if (request?.method.equals("GET", ignoreCase = true) == true) {
                         EchH3Router.fetchWebViewResource(
-                            reqUrl, request?.requestHeaders, request?.isMainFrame == true,
+                            reqUrl, request?.requestHeaders, request?.isForMainFrame == true,
                         )?.let { return it }
                     }
                     return null
