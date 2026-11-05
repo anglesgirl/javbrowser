@@ -393,8 +393,102 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      */
     private fun tryResolveHentaiMamaRealUrl(item: SearchItem, callback: (String?) -> Unit) {
         SearchScheduler.workers.execute {
-            val realUrl = try { resolveHentaiMamaRealUrl(item) } catch (e: Exception) { null }
-            runOnUiThread { callback(realUrl) }
+            val fastUrl = try { resolveHentaiMamaRealUrl(item) } catch (e: Exception) { null }
+            if (fastUrl != null) {
+                runOnUiThread { callback(fastUrl) }
+                return@execute
+            }
+            // Fast path failed — usually the admin-ajax POST is CF-challenged
+            // on-device (the sandbox POST works because it comes from a
+            // foreign IP). Retry through a hidden WebView, which passes CF
+            // challenges exactly like a browser.
+            runOnUiThread { tryResolveHentaiMamaViaWebView(item, callback) }
+        }
+    }
+
+    /**
+     * Resolves HentaiMama's real file through a hidden WebView: load the
+     * episode page (CF clearance happens like a browser), click the mirror
+     * tab so the page itself runs get_player_contents, read the injected
+     * dt_embed iframe src, then fetch the embed page over ECH and parse
+     * the JWPlayer file. Callback on the UI thread with the URL, or null
+     * on timeout (15s) / failure — the caller then falls back to WebView.
+     * Never throws.
+     */
+    private fun tryResolveHentaiMamaViaWebView(item: SearchItem, callback: (String?) -> Unit) {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        var hiddenWebView: android.webkit.WebView? = null
+        var done = false
+        var timeoutRunnable: Runnable by kotlin.properties.Delegates.notNull()
+        fun finish(url: String?) {
+            if (done) return
+            done = true
+            handler.removeCallbacks(timeoutRunnable)
+            hiddenWebView?.destroy()
+            hiddenWebView = null
+            callback(url)
+        }
+        timeoutRunnable = Runnable { finish(null) }
+        handler.post {
+            val wv = android.webkit.WebView(this)
+            hiddenWebView = wv
+            wv.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                mediaPlaybackRequiresUserGesture = false
+            }
+            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+            wv.webViewClient = object : android.webkit.WebViewClient() {
+                override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    // Let the page settle, then click the mirror tab so the
+                    // page runs get_player_contents itself.
+                    handler.postDelayed({
+                        if (done) return@postDelayed
+                        view?.evaluateJavascript(
+                            "(function(){var t=document.querySelector('.dt-mi-tabs li a.selected')||document.querySelector('.dt-mi-tabs li a');if(t){t.click();return 'clicked';}return 'no-tab';})();",
+                            null
+                        )
+                    }, 2000)
+                    // Then read the injected dt_embed iframe src.
+                    handler.postDelayed({
+                        if (done) return@postDelayed
+                        view?.evaluateJavascript(
+                            "(function(){var f=document.querySelector('iframe[src*=\"dt_embed\"]');return f?f.src:'';})();"
+                        ) { value ->
+                            if (done) return@evaluateJavascript
+                            val embedUrl = value?.removeSurrounding("\"").orEmpty()
+                            if (embedUrl.isBlank() || !embedUrl.contains("dt_embed")) {
+                                finish(null)
+                                return@evaluateJavascript
+                            }
+                            SearchScheduler.workers.execute {
+                                val fileUrl = try {
+                                    val site = sites.firstOrNull { it.id == item.siteId }
+                                    if (site == null) {
+                                        null
+                                    } else {
+                                        val embed = SearchHttpFetcher().fetch(
+                                            embedUrl, SearchCancellation(), site
+                                        )
+                                        if (embed.transportError != null || embed.statusCode !in 200..299 || embed.body.isBlank()) {
+                                            null
+                                        } else {
+                                            VideoExtractor.extractHentaiMamaVideoFile(embed.body)
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    null
+                                }
+                                handler.post { finish(fileUrl) }
+                            }
+                        }
+                    }, 5000)
+                }
+            }
+            wv.loadUrl(item.detailUrl)
+            handler.postDelayed(timeoutRunnable, 15000)
         }
     }
 
@@ -420,10 +514,16 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             val form = FormBody.Builder().apply {
                 fields.forEach { (k, v) -> add(k, v) }
             }.build()
-            val request = Request.Builder().url(url)
+            val requestBuilder = Request.Builder().url(url)
                 .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
                 .header("Referer", referer)
-                .post(form).build()
+            // CF clearance: the app's WebView may already hold __cf_bm for
+            // this host (from browsing the episode page); send it so the
+            // admin-ajax POST is not challenged the way a bare request is.
+            val cookies = android.webkit.CookieManager.getInstance().getCookie(referer)
+                ?.takeIf { it.isNotEmpty() }
+            if (!cookies.isNullOrEmpty()) requestBuilder.header("Cookie", cookies)
+            val request = requestBuilder.post(form).build()
             val client = OkHttpClient.Builder()
                 .connectTimeout(10, TimeUnit.SECONDS)
                 .readTimeout(15, TimeUnit.SECONDS)
