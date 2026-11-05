@@ -429,11 +429,29 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * embed main.js decodes the vdcdn file URL. Any step failing falls
      * back to the hidden-WebView click path (resolveJavhdViaClick).
      */
+    /** Trace clock for the javhd resolve log: reset at the start of
+     * each sniff so every trace line carries a relative timestamp
+     * (where it stuck is visible from the gaps). */
+    private var javhdTraceT0 = 0L
+
+    /** One trace line for the current javhd sniff, shown in 播放數據
+     * under 過程 and copied with it. Never throws. */
+    private fun traceJavhd(sessionId: Long, line: String) {
+        try {
+            val t = if (javhdTraceT0 == 0L) 0.0
+                else (android.os.SystemClock.elapsedRealtime() - javhdTraceT0) / 1000.0
+            PlaybackDataStore.addTrace(sessionId, "+${"%.1f".format(t)}s $line")
+        } catch (e: Exception) {
+        }
+    }
+
     private fun tryResolveJavhdRealUrl(
         item: SearchItem,
         sessionId: Long,
         callback: (List<Pair<String, String>>?) -> Unit,
     ) {
+        javhdTraceT0 = android.os.SystemClock.elapsedRealtime()
+        traceJavhd(sessionId, "嗅探開始：${item.detailUrl}")
         resolveJavhdDirect(item, sessionId) { parts, directFail ->
             if (parts != null) {
                 callback(parts)
@@ -494,6 +512,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             hiddenWebView?.destroy()
             hiddenWebView = null
             if (parts != null) {
+                traceJavhd(sessionId, "直取完成：${parts.size} 個 Part（${parts.joinToString("，") { it.first }}）")
                 PlaybackDataStore.addCandidates(sessionId, parts.map { (label, url) ->
                     resolverRecord(url, "resolver-javhd-direct", "$label 直接提取（跳過廣告）")
                 })
@@ -503,6 +522,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
 
         fun fail(reason: String) {
             if (done) return
+            traceJavhd(sessionId, "直取失敗：$reason")
             finish(null, reason)
         }
 
@@ -590,14 +610,17 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 return
             }
             SearchScheduler.workers.execute {
-                val postJson = postFormEch(
-                    "https://www.javhdporn.net/api/play/", item.detailUrl,
-                    mapOf("sources" to sources, "ver" to "2"),
-                ) ?: postForm(
+                val echJson = postFormEch(
                     "https://www.javhdporn.net/api/play/", item.detailUrl,
                     mapOf("sources" to sources, "ver" to "2"),
                 )
+                val postJson = echJson ?: postForm(
+                    "https://www.javhdporn.net/api/play/", item.detailUrl,
+                    mapOf("sources" to sources, "ver" to "2"),
+                )
+                val transport = if (echJson != null) "ECH" else "明文"
                 if (postJson.isNullOrBlank()) {
+                    traceJavhd(sessionId, "Part${partIdx + 1} POST api/play：ECH 與明文皆失敗")
                     handler.post { fail("直取失敗：Part${partIdx + 1} api/play失敗") }
                     return@execute
                 }
@@ -609,11 +632,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     null
                 }
                 if (data == null) {
+                    traceJavhd(sessionId, "Part${partIdx + 1} POST api/play（$transport）：回包無效（前 ${postJson.take(80)}）")
                     handler.post { fail("直取失敗：Part${partIdx + 1} api/play無效") }
                     return@execute
                 }
                 lastSourcesPreview = sources.take(24) + "…len=" + sources.length
                 lastDataPreview = data.take(24) + "…len=" + data.length
+                traceJavhd(sessionId, "Part${partIdx + 1} POST api/play（$transport）：status=true，data長 ${data.length}（前 ${data.take(24)}）")
                 handler.post { if (!done) feedDoneFn(partIdx, postJson) }
             }
         }
@@ -630,6 +655,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     fail("直取失敗：Part${partIdx + 1} done回調未註冊")
                     return@evalJs
                 }
+                traceJavhd(sessionId, "Part${partIdx + 1} 餵回調：已餵")
                 // binddata runs synchronously inside the callback and
                 // sets window.videodata; poll briefly in case it defers.
                 // Accept any http URL: the embed host varies by region
@@ -648,6 +674,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         }
                         return@pollJs
                     }
+                    traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁地址：$videodata")
                     fetchEmbedFn(partIdx, videodata)
                 }
             }
@@ -668,18 +695,23 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 val embed = try {
                     SearchHttpFetcher().fetch(embedUrl, SearchCancellation(), site)
                 } catch (e: Exception) {
+                    traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁 GET：拋錯 ${e.message}")
                     handler.post { fail("直取失敗：Part${partIdx + 1} 嵌頁取不到") }
                     return@execute
                 }
+                val embedHost = try { java.net.URL(embedUrl).host } catch (e: Exception) { "?" }
                 if (embed.transportError != null || embed.statusCode !in 200..299 || embed.body.isBlank()) {
+                    traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁 GET $embedHost：失敗（HTTP ${embed.statusCode}，transport=${embed.transportError ?: "無"}）")
                     handler.post { fail("直取失敗：Part${partIdx + 1} 嵌頁取不到") }
                     return@execute
                 }
                 val config = Regex("data-config=\"([^\"]+)\"").find(embed.body)?.groupValues?.getOrNull(1).orEmpty()
                 if (config.isEmpty()) {
+                    traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁 GET $embedHost：HTTP ${embed.statusCode}，無 data-config（${embed.body.length}字節）")
                     handler.post { fail("直取失敗：Part${partIdx + 1} 嵌頁無data-config") }
                     return@execute
                 }
+                traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁 GET $embedHost：HTTP ${embed.statusCode}，data-config 長 ${config.length}")
                 handler.post { if (!done) setupEmbedFn(partIdx, embedUrl, config) }
             }
         }
@@ -726,9 +758,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                                     ""
                                 }
                                 if (fileUrl.isEmpty() || !(fileUrl.contains("/file.mp4") || fileUrl.contains(".m3u8"))) {
+                                    traceJavhd(sessionId, "Part${partIdx + 1} 解嵌頁失敗：__jwSetup=${setup.orEmpty().take(120)}")
                                     fail("直取失敗：Part${partIdx + 1} 直鏈未解出")
                                     return@pollJs
                                 }
+                                traceJavhd(sessionId, "Part${partIdx + 1} 直鏈：$fileUrl")
                                 foundParts[partIdx] = fileUrl
                                 postAndFeed(partIdx + 1)
                             }
@@ -792,9 +826,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                             ""
                         }
                         if (sources.isEmpty()) {
+                            traceJavhd(sessionId, "Part${partIdx + 1} 點擊：ajax新增 ${try { org.json.JSONArray(arrJson).length() } catch (e: Exception) { -1 }} 個，sources 未算出")
                             fail("直取失敗：Part${partIdx + 1} sources未算出")
                             return@evalJs
                         }
+                        traceJavhd(sessionId, "Part${partIdx + 1} 點擊：ajax新增 ${try { org.json.JSONArray(arrJson).length() } catch (e: Exception) { -1 }} 個，sources長 ${sources.length}（前 ${sources.take(24)}）")
                         sourcesByPart[partIdx] = sources
                         collectSources(partIdx + 1)
                     }
@@ -846,10 +882,18 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     evalJs(jquery) {
                         evalJs(driver) {
                             evalJs(cast) {
-                                // jQuery ready callbacks fire on
-                                // injection (document already complete);
-                                // give handler registration a beat.
-                                handler.postDelayed({ if (!done) collectSources(0) }, 500)
+                                // Probe what the sandbox actually holds
+                                // before triggering: jQuery present?
+                                // how many click handlers registered on
+                                // the first .srv? are the elements
+                                // cast.js reads all there?
+                                evalJs("(function(){try{var jq=(typeof jQuery!=='undefined');var srv=document.querySelectorAll('.box-server .srv').length;var h=0;try{var el=document.querySelector('.box-server .srv');var ev=el&&jq?jQuery._data(el,'events'):null;h=ev&&ev.click?ev.click.length:0;}catch(e){}var ids=['video-player-area','video-player','playeriframe'].map(function(id){return id+'='+(!!document.getElementById(id));}).join(',');return 'jq='+jq+' srv='+srv+' handlers='+h+' '+ids;}catch(e){return 'ERR:'+e.message;}})();") { probe ->
+                                    traceJavhd(sessionId, "沙盒探針：${unquoteJs(probe).orEmpty()}")
+                                    // jQuery ready callbacks fire on
+                                    // injection (document already complete);
+                                    // give handler registration a beat.
+                                    handler.postDelayed({ if (!done) collectSources(0) }, 500)
+                                }
                             }
                         }
                     }
@@ -881,13 +925,21 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             val detail = try {
                 SearchHttpFetcher().fetch(item.detailUrl, SearchCancellation(), site)
             } catch (e: Exception) {
+                traceJavhd(sessionId, "詳情頁 GET：拋錯 ${e.message}")
                 handler.post { fail("直取失敗：詳情頁取不到") }
                 return@execute
             }
             if (detail.transportError != null || detail.statusCode !in 200..299 || detail.body.isBlank()) {
+                traceJavhd(sessionId, "詳情頁 GET：失敗（HTTP ${detail.statusCode}，transport=${detail.transportError ?: "無"}）")
                 handler.post { fail("直取失敗：詳情頁取不到") }
                 return@execute
             }
+            val detailRoute = try {
+                EchH3Router.route(java.net.URL(item.detailUrl).host).toString()
+            } catch (e: Exception) {
+                "?"
+            }
+            traceJavhd(sessionId, "詳情頁：HTTP ${detail.statusCode}，${detail.body.length}字節，最終=${detail.finalUrl}，路由=$detailRoute")
             // <a class="srv" ... data-link="TOKEN" ...><i ...></i> Part1</a>
             // The anchor content holds an <i> icon, so the label cannot
             // be captured with ([^<]*); take the token from the opening
@@ -907,6 +959,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 handler.post { fail("直取失敗：詳情頁無令牌") }
                 return@execute
             }
+            traceJavhd(
+                sessionId,
+                "令牌：${pairs.size} 個（${pairs.joinToString("，") { it.second.ifEmpty { "?" } }}），長 ${pairs.joinToString("/") { it.first.length.toString() }}" +
+                    if (found.isEmpty()) "（正則 0 個，改用 data-mpu）" else "",
+            )
             handler.post {
                 if (done) return@post
                 tokens = pairs.map { it.first }
@@ -914,6 +971,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     label.ifEmpty { "Part${i + 1}" }
                 }
                 detailHtml = stripScripts(detail.body)
+                traceJavhd(sessionId, "沙盒頁：去 script 後 ${detailHtml.length}字節")
                 setupCastPage()
             }
         }
@@ -1008,6 +1066,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 label to url
             }
             if (result != null) {
+                traceJavhd(sessionId, "點擊完成：${result.size} 個 Part")
                 PlaybackDataStore.addCandidates(sessionId, result.map { (label, url) ->
                     resolverRecord(
                         url, "resolver-javhd",
@@ -1020,6 +1079,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 } else {
                     javhdFailReason()
                 }
+                traceJavhd(sessionId, "點擊失敗：${javhdFailReason()}")
                 PlaybackDataStore.recordFail(sessionId, reason)
             }
             callback(result)
@@ -1028,6 +1088,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         fun clickSrv(i: Int) {
             partClicks++
             lastClickedPart = i + 1
+            traceJavhd(sessionId, "點擊 Part${i + 1}（第 $partClicks 次）")
             hiddenWebView?.evaluateJavascript(
                 "(function(){var a=document.querySelectorAll('a.srv');" +
                     "if(a.length>" + i + "){a[" + i + "].click();return 'clicked';}" +
@@ -1049,6 +1110,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             ) { value ->
                 val s = value?.trim()?.removeSurrounding("\"").orEmpty()
                 if (s.isNotEmpty() && s != "null") domAfterClick = s
+                traceJavhd(sessionId, "DOM 探針：$domAfterClick")
                 if (!done) finish()
             }
         }
@@ -1089,6 +1151,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     // No Server links yet — the page may still be
                     // settling or redirecting; retry twice before
                     // falling back to the legacy Streamtape path.
+                    traceJavhd(sessionId, "Server 連結：0 個（第 ${attempt + 1} 次）")
                     if (attempt < 2) {
                         handler.postDelayed({ if (!done) listSrv(attempt + 1) }, 4000)
                     } else {
@@ -1096,6 +1159,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         handler.postDelayed({ if (!done) finish() }, 20000)
                     }
                 } else {
+                    traceJavhd(sessionId, "Server 連結：${partLabels.size} 個（${partLabels.joinToString("，")}）")
                     // Probe jQuery before clicking: the theme's click
                     // handler lives in cast.js and needs jQuery (from
                     // ajax.googleapis.com). If jQuery never loaded, the
@@ -1107,6 +1171,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         val s = value?.trim()?.removeSurrounding("\"").orEmpty()
                         if (s == "jq-yes") jQueryLoaded = true
                         else if (s == "jq-no") jQueryLoaded = false
+                        traceJavhd(sessionId, "jQuery：${if (jQueryLoaded == true) "已載入" else "未載入"}")
                         if (!done) checker?.let { handler.post(it) }
                     }
                 }
@@ -1190,9 +1255,19 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         return android.webkit.WebResourceResponse("text/plain", "utf-8",
                             java.io.ByteArrayInputStream(ByteArray(0)))
                     }
-                    if (reqUrl.contains("video.javhdporn.net/p/")) embedSeen = true
+                    if (reqUrl.contains("video.javhdporn.net/p/")) {
+                        if (!embedSeen) {
+                            embedSeen = true
+                            traceJavhd(sessionId, "嵌頁請求：${reqUrl.take(100)}")
+                        } else {
+                            embedSeen = true
+                        }
+                    }
                     if (reqUrl.contains(".mp4") || reqUrl.contains(".m3u8") || reqUrl.contains(".ts")) {
-                        try { mediaHosts.add(java.net.URL(reqUrl).host) } catch (e: Exception) { }
+                        try {
+                            val h = java.net.URL(reqUrl).host
+                            if (mediaHosts.add(h)) traceJavhd(sessionId, "媒體請求：$h")
+                        } catch (e: Exception) { }
                     }
                     val isReal = (reqUrl.contains("streamtape") && reqUrl.contains("get_video")) ||
                         (reqUrl.contains("tapecontent") &&
@@ -1207,7 +1282,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         handler.post {
                             if (!done) {
                                 val key = if (partLabels.isEmpty()) -1 else partIdx
-                                if (!foundParts.containsKey(key)) foundParts[key] = reqUrl
+                                if (!foundParts.containsKey(key)) {
+                                    foundParts[key] = reqUrl
+                                    traceJavhd(sessionId, "直鏈請求：${reqUrl.take(120)}")
+                                }
                             }
                         }
                         return android.webkit.WebResourceResponse("text/plain", "utf-8",
@@ -1215,6 +1293,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     }
                     if (!chasedEmbed && reqUrl.contains("streamtape") && reqUrl.contains("/e/")) {
                         chasedEmbed = true
+                        traceJavhd(sessionId, "跳轉 streamtape：${reqUrl.take(100)}")
                         handler.post { hiddenWebView?.loadUrl(reqUrl) }
                         return android.webkit.WebResourceResponse("text/plain", "utf-8",
                             java.io.ByteArrayInputStream(ByteArray(0)))
@@ -1236,6 +1315,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
 
                 override fun onPageStarted(view: android.webkit.WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                     super.onPageStarted(view, url, favicon)
+                    if (!pageStarted) traceJavhd(sessionId, "頁面開始加載：${url?.take(100)}")
                     pageStarted = true
                 }
 
@@ -1247,6 +1327,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     super.onReceivedError(view, request, error)
                     if (lastLoadError == null && error != null) {
                         lastLoadError = "錯誤 ${request?.url?.host ?: "?"} ${error.errorCode} ${error.description}"
+                        traceJavhd(sessionId, "頁面錯誤：$lastLoadError")
                     }
                 }
 
@@ -1258,6 +1339,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     super.onReceivedHttpError(view, request, errorResponse)
                     if (lastLoadError == null && errorResponse != null) {
                         lastLoadError = "HTTP ${errorResponse.statusCode} ${request?.url?.host ?: "?"}"
+                        traceJavhd(sessionId, "頁面錯誤：$lastLoadError")
                     }
                 }
 
@@ -1266,12 +1348,14 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     if (setupDone || done) return
                     setupDone = true
                     pageFinished = true
+                    traceJavhd(sessionId, "頁面完成加載（進度 $maxProgress%）")
                     handler.postDelayed({
                         if (!done) listSrv(0)
                     }, 2000)
                 }
             }
             wv.loadUrl(item.detailUrl)
+            traceJavhd(sessionId, "點擊開始：載入 ${item.detailUrl}")
             handler.postDelayed(timeoutRunnable, 75000)
         }
     }

@@ -66,10 +66,16 @@ data class SniffSession(
     /** Why the sniff produced nothing usable (resolver failed, no candidates, …). */
     val failStage: String? = null,
     val playback: PlaybackOutcome? = null,
+    /** Step-by-step trace of the resolve, one line per step with a
+     * relative timestamp (e.g. "+1.2s 详情页：HTTP 200 …"). Written
+     * live while the resolve runs, so one test run on the device
+     * shows exactly where it died instead of needing a guess. */
+    val trace: List<String> = emptyList(),
 )
 
 object PlaybackDataStore {
     const val MAX_SESSIONS = 100
+    private const val MAX_TRACE_LINES = 200
     private const val FILE_NAME = "playback_data.json"
 
     private val lock = Any()
@@ -105,6 +111,14 @@ object PlaybackDataStore {
 
     fun recordFail(sessionId: Long, stage: String) {
         update(sessionId) { it.copy(failStage = stage, pickOutcome = "無候選") }
+    }
+
+    /** Append one trace line (max 200 per session, then ignored). */
+    fun addTrace(sessionId: Long, line: String) {
+        update(sessionId) { s ->
+            if (s.trace.size >= MAX_TRACE_LINES) s
+            else s.copy(trace = s.trace + line)
+        }
     }
 
     /** url null = user chose the browser fallback; rank null likewise. */
@@ -260,7 +274,11 @@ object PlaybackDataStore {
             }
             sb.append("  播放（${p.player}）：$verdict")
         }
-        return sb.toString()
+        if (s.trace.isNotEmpty()) {
+            sb.append("\n  過程：\n")
+            s.trace.forEach { sb.append("    $it\n") }
+        }
+        return sb.toString().trimEnd()
     }
 
     fun formatTime(timeMs: Long): String =
@@ -335,6 +353,11 @@ object PlaybackDataStore {
             po.put("error", p.error)
             o.put("playback", po)
         }
+        if (s.trace.isNotEmpty()) {
+            val tr = org.json.JSONArray()
+            s.trace.forEach { tr.put(it) }
+            o.put("trace", tr)
+        }
         return o
     }
 
@@ -368,6 +391,11 @@ object PlaybackDataStore {
                     error = it.optString("error").takeIf { e -> e.isNotEmpty() },
                 )
             }
+            val trace = mutableListOf<String>()
+            val tr = o.optJSONArray("trace")
+            if (tr != null) {
+                for (i in 0 until tr.length()) trace += tr.optString(i)
+            }
             SniffSession(
                 id = o.optLong("id"),
                 timeMs = o.optLong("timeMs"),
@@ -379,6 +407,7 @@ object PlaybackDataStore {
                 pickOutcome = o.optString("pickOutcome", "待選"),
                 failStage = o.optString("failStage").takeIf { it.isNotEmpty() },
                 playback = playback,
+                trace = trace,
             )
         } catch (e: Exception) {
             null
