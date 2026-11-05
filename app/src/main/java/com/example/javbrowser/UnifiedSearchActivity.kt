@@ -420,9 +420,470 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * (label + URL), or null when none resolves — the caller then
      * falls back to WebView. Never throws.
      */
+    /**
+     * Primary javhdporn resolver: direct extraction, no page clicks.
+     * Chain (proven 2026-11-05, no WebView browsing, no ads):
+     * detail HTML (ECH) -> a.srv tokens -> bundled cast.js computes
+     * `sources` -> POST /api/play/ (ECH) -> the handler's own .done()
+     * (binddata) decodes the embed URL -> embed HTML (ECH) -> bundled
+     * embed main.js decodes the vdcdn file URL. Any step failing falls
+     * back to the hidden-WebView click path (resolveJavhdViaClick).
+     */
     private fun tryResolveJavhdRealUrl(
         item: SearchItem,
         sessionId: Long,
+        callback: (List<Pair<String, String>>?) -> Unit,
+    ) {
+        resolveJavhdDirect(item, sessionId) { parts, directFail ->
+            if (parts != null) {
+                callback(parts)
+                return@resolveJavhdDirect
+            }
+            resolveJavhdViaClick(item, sessionId, directFail, callback)
+        }
+    }
+
+    /** ECH form POST via the search ECH client (same client the search
+     * fetcher uses for GET). Returns the response body on HTTP 2xx,
+     * null otherwise. No plaintext fallback here — the caller falls
+     * back to plain postForm when this returns null. */
+    private fun postFormEch(url: String, referer: String, fields: Map<String, String>): String? {
+        return try {
+            val form = FormBody.Builder().apply {
+                fields.forEach { (k, v) -> add(k, v) }
+            }.build()
+            val request = Request.Builder().url(url)
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+                .header("Referer", referer)
+                .header("X-Requested-With", "XMLHttpRequest")
+                .post(form).build()
+            EchH3Router.searchEchClient().newCall(request).execute().use { response ->
+                if (!response.isSuccessful) null else response.body?.string()
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun resolveJavhdDirect(
+        item: SearchItem,
+        sessionId: Long,
+        callback: (List<Pair<String, String>>?, String?) -> Unit,
+    ) {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        var hiddenWebView: android.webkit.WebView? = null
+        var done = false
+        val foundParts = LinkedHashMap<Int, String>()
+        var partLabels: List<String> = emptyList()
+        var tokens: List<String> = emptyList()
+        var jqueryJs: String? = null
+        var driverCastJs: String? = null
+        var castJs: String? = null
+        var driverEmbedJs: String? = null
+        var embedMainJs: String? = null
+        val sourcesByPart = LinkedHashMap<Int, String>()
+        var timeoutRunnable: Runnable by kotlin.properties.Delegates.notNull()
+
+        fun finish(parts: List<Pair<String, String>>?, reason: String?) {
+            if (done) return
+            done = true
+            handler.removeCallbacks(timeoutRunnable)
+            hiddenWebView?.destroy()
+            hiddenWebView = null
+            if (parts != null) {
+                PlaybackDataStore.addCandidates(sessionId, parts.map { (label, url) ->
+                    resolverRecord(url, "resolver-javhd-direct", "$label 直接提取（跳過廣告）")
+                })
+            }
+            callback(parts, reason)
+        }
+
+        fun fail(reason: String) {
+            if (done) return
+            finish(null, reason)
+        }
+
+        timeoutRunnable = Runnable { fail("直取超時") }
+        handler.postDelayed(timeoutRunnable, 75000)
+
+        fun assetText(name: String): String? {
+            return try {
+                assets.open(name).bufferedReader().use { it.readText() }
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        /** One-shot JS eval on the hidden WebView; result is the raw
+         * evaluateJavascript string (JSON-quoted). Never throws. */
+        fun evalJs(js: String, cb: (String?) -> Unit) {
+            if (done) return
+            try {
+                hiddenWebView?.evaluateJavascript(js) { value ->
+                    if (!done) cb(value)
+                } ?: cb(null)
+            } catch (e: Exception) {
+                cb(null)
+            }
+        }
+
+        /** Unquote an evaluateJavascript string result (JSON string). */
+        fun unquoteJs(value: String?): String? {
+            val raw = value?.trim().orEmpty()
+            if (raw.isEmpty() || raw == "null") return null
+            return try {
+                org.json.JSONTokener(raw).nextValue() as? String
+            } catch (e: Exception) {
+                raw.removeSurrounding("\"")
+            }
+        }
+
+        /** Poll a JS expression until it yields a non-empty string. */
+        fun pollJs(expr: String, timeoutMs: Long, cb: (String?) -> Unit) {
+            val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs
+            val poll = object : Runnable {
+                override fun run() {
+                    if (done) return
+                    evalJs(expr) { value ->
+                        if (done) return@evalJs
+                        val s = unquoteJs(value)
+                        if (!s.isNullOrEmpty()) {
+                            cb(s)
+                        } else if (android.os.SystemClock.elapsedRealtime() >= deadline) {
+                            cb(null)
+                        } else {
+                            handler.postDelayed(this, 500)
+                        }
+                    }
+                }
+            }
+            handler.post(poll)
+        }
+
+        /** Per-Part: POST sources, feed the response through the
+         * handler's own .done() (binddata), read the embed URL, then
+         * fetch the embed page and decode the file URL. */
+        fun postAndFeed(partIdx: Int) {
+            if (done) return
+            if (partIdx >= tokens.size) {
+                val parts = foundParts.entries.map { (i, url) ->
+                    (partLabels.getOrNull(i).orEmpty().ifEmpty { "Part${i + 1}" }) to url
+                }
+                finish(parts, null)
+                return
+            }
+            val sources = sourcesByPart[partIdx].orEmpty()
+            if (sources.isEmpty()) {
+                fail("直取失敗：Part${partIdx + 1} sources缺失")
+                return
+            }
+            SearchScheduler.workers.execute {
+                val postJson = postFormEch(
+                    "https://www.javhdporn.net/api/play/", item.detailUrl,
+                    mapOf("sources" to sources, "ver" to "2"),
+                ) ?: postForm(
+                    "https://www.javhdporn.net/api/play/", item.detailUrl,
+                    mapOf("sources" to sources, "ver" to "2"),
+                )
+                if (postJson.isNullOrBlank()) {
+                    handler.post { fail("直取失敗：Part${partIdx + 1} api/play失敗") }
+                    return@execute
+                }
+                val data = try {
+                    val obj = org.json.JSONObject(postJson)
+                    if (!obj.optBoolean("status", false)) null
+                    else obj.optString("data").orEmpty().ifEmpty { null }
+                } catch (e: Exception) {
+                    null
+                }
+                if (data == null) {
+                    handler.post { fail("直取失敗：Part${partIdx + 1} api/play無效") }
+                    return@execute
+                }
+                handler.post { if (!done) feedDoneAndReadVideodata(partIdx, postJson) }
+            }
+        }
+
+        /** Feed the /api/play/ response into the click handler's own
+         * .done() callback (binddata decodes `data` to the embed URL),
+         * then read window.videodata. */
+        fun feedDoneAndReadVideodata(partIdx: Int, postJson: String) {
+            if (done) return
+            val quoted = org.json.JSONObject.quote(postJson)
+            evalJs("window.__javhdDoneCbs && window.__javhdDoneCbs.length > $partIdx ? (window.__javhdDoneCbs[$partIdx](JSON.parse($quoted)), 'fed') : ''") { fed ->
+                if (done) return@evalJs
+                if (unquoteJs(fed).isNullOrEmpty()) {
+                    fail("直取失敗：Part${partIdx + 1} done回調未註冊")
+                    return@evalJs
+                }
+                // binddata runs synchronously inside the callback and
+                // sets window.videodata; poll briefly in case it defers.
+                pollJs("typeof window.videodata === 'string' && window.videodata.indexOf('video.javhdporn.net/p/') !== -1 ? window.videodata : ''", 10000) { videodata ->
+                    if (done) return@pollJs
+                    if (videodata.isNullOrEmpty()) {
+                        fail("直取失敗：Part${partIdx + 1} 嵌頁地址未解出")
+                        return@pollJs
+                    }
+                    fetchEmbedAndDecode(partIdx, videodata)
+                }
+            }
+        }
+
+        /** Fetch the embed page over ECH, pull data-config, and decode
+         * the file URL with the bundled embed main.js. */
+        fun fetchEmbedAndDecode(partIdx: Int, embedUrl: String) {
+            if (done) return
+            SearchScheduler.workers.execute {
+                val site = sites.firstOrNull { it.id == item.siteId }
+                if (site == null) {
+                    handler.post { fail("直取失敗：站點未註冊") }
+                    return@execute
+                }
+                val embed = try {
+                    SearchHttpFetcher().fetch(embedUrl, SearchCancellation(), site)
+                } catch (e: Exception) {
+                    handler.post { fail("直取失敗：Part${partIdx + 1} 嵌頁取不到") }
+                    return@execute
+                }
+                if (embed.transportError != null || embed.statusCode !in 200..299 || embed.body.isBlank()) {
+                    handler.post { fail("直取失敗：Part${partIdx + 1} 嵌頁取不到") }
+                    return@execute
+                }
+                val config = Regex("data-config=\"([^\"]+)\"").find(embed.body)?.groupValues?.getOrNull(1).orEmpty()
+                if (config.isEmpty()) {
+                    handler.post { fail("直取失敗：Part${partIdx + 1} 嵌頁無data-config") }
+                    return@execute
+                }
+                handler.post { if (!done) setupEmbedPage(partIdx, embedUrl, config) }
+            }
+        }
+
+        /** Reuse the hidden WebView for the embed stage: fresh blank
+         * page holding only the jwplayer div, then the embed driver
+         * and the bundled embed main.js. The cast page is no longer
+         * needed (all sources were collected up front). */
+        fun setupEmbedPage(partIdx: Int, embedUrl: String, config: String) {
+            if (done) return
+            val pageHtml = "<html><head></head><body><div id=\"jwplayer\" data-config=\"$config\"></div></body></html>"
+            val client = object : android.webkit.WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: android.webkit.WebView?,
+                    request: android.webkit.WebResourceRequest?,
+                ): android.webkit.WebResourceResponse? {
+                    return android.webkit.WebResourceResponse("text/plain", "utf-8", java.io.ByteArrayInputStream(ByteArray(0)))
+                }
+
+                override fun shouldOverrideUrlLoading(
+                    view: android.webkit.WebView?,
+                    request: android.webkit.WebResourceRequest?,
+                ): Boolean = true
+
+                override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    if (done) return
+                    val driver = driverEmbedJs
+                    val main = embedMainJs
+                    if (driver == null || main == null) {
+                        fail("直取失敗：內置腳本缺失")
+                        return
+                    }
+                    evalJs(driver) {
+                        evalJs(main) {
+                            pollJs("window.__jwSetup ? window.__jwSetup : ''", 10000) { setup ->
+                                if (done) return@pollJs
+                                val fileUrl = try {
+                                    val obj = org.json.JSONObject(unquoteJs(setup).orEmpty())
+                                    obj.optJSONArray("sources")?.optJSONObject(0)?.optString("file").orEmpty()
+                                } catch (e: Exception) {
+                                    ""
+                                }
+                                if (fileUrl.isEmpty() || !(fileUrl.contains("/file.mp4") || fileUrl.contains(".m3u8"))) {
+                                    fail("直取失敗：Part${partIdx + 1} 直鏈未解出")
+                                    return@pollJs
+                                }
+                                foundParts[partIdx] = fileUrl
+                                postAndFeed(partIdx + 1)
+                            }
+                        }
+                    }
+                }
+            }
+            hiddenWebView?.webViewClient = client
+            hiddenWebView?.loadDataWithBaseURL(embedUrl, pageHtml, "text/html", "utf-8", null)
+        }
+
+        /** Trigger every Part's click on the cast page and collect the
+         * `sources` each handler computes (via the overridden
+         * jQuery.ajax). The handler runs synchronously on trigger, so
+         * the capture is readable right after. */
+        fun collectSources(partIdx: Int) {
+            if (done) return
+            if (partIdx >= tokens.size) {
+                postAndFeed(0)
+                return
+            }
+            evalJs("window.__javhdAjaxCalls ? window.__javhdAjaxCalls.length : -1") { before ->
+                if (done) return@evalJs
+                val n0 = before?.trim()?.toIntOrNull() ?: -1
+                if (n0 < 0) {
+                    fail("直取失敗：驅動未就緒")
+                    return@evalJs
+                }
+                evalJs("jQuery('.box-server .srv').eq($partIdx).trigger('click'); 'ok'") {
+                    evalJs("JSON.stringify(window.__javhdAjaxCalls.slice($n0))") { value ->
+                        if (done) return@evalJs
+                        val arrJson = unquoteJs(value).orEmpty()
+                        val sources = try {
+                            val arr = org.json.JSONArray(arrJson)
+                            var found = ""
+                            for (i in 0 until arr.length()) {
+                                val entry = arr.optJSONObject(i) ?: continue
+                                if (entry.optString("url").orEmpty().contains("api/play")) {
+                                    found = entry.optJSONObject("data")?.optString("sources").orEmpty()
+                                    if (found.isNotEmpty()) break
+                                }
+                            }
+                            found
+                        } catch (e: Exception) {
+                            ""
+                        }
+                        if (sources.isEmpty()) {
+                            fail("直取失敗：Part${partIdx + 1} sources未算出")
+                            return@evalJs
+                        }
+                        sourcesByPart[partIdx] = sources
+                        collectSources(partIdx + 1)
+                    }
+                }
+            }
+        }
+
+        /** Cast stage: blank page with the .video-player div and the
+         * .box-server/.srv anchors, then jQuery + driver + cast.js.
+         * The WebView is a pure JS sandbox — every network request is
+         * blocked; the app does all network natively. */
+        fun setupCastPage() {
+            if (done) return
+            val pageHtml = buildString {
+                append("<html><head></head><body>")
+                append("<div class=\"video-player\" data-mpu=\"${tokens.firstOrNull().orEmpty()}\"></div>")
+                append("<div class=\"box-server\">")
+                tokens.forEachIndexed { i, token ->
+                    val label = partLabels.getOrNull(i).orEmpty().ifEmpty { "Part${i + 1}" }
+                    append("<a class=\"srv\" href=\"javascript:void(0)\" data-link=\"$token\" data-type=\"load-fv\">$label</a>")
+                }
+                append("</div></body></html>")
+            }
+            val wv = android.webkit.WebView(this)
+            hiddenWebView = wv
+            wv.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
+            }
+            wv.webViewClient = object : android.webkit.WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: android.webkit.WebView?,
+                    request: android.webkit.WebResourceRequest?,
+                ): android.webkit.WebResourceResponse? {
+                    return android.webkit.WebResourceResponse("text/plain", "utf-8", java.io.ByteArrayInputStream(ByteArray(0)))
+                }
+
+                override fun shouldOverrideUrlLoading(
+                    view: android.webkit.WebView?,
+                    request: android.webkit.WebResourceRequest?,
+                ): Boolean = true
+
+                override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    if (done) return
+                    val jquery = jqueryJs
+                    val driver = driverCastJs
+                    val cast = castJs
+                    if (jquery == null || driver == null || cast == null) {
+                        fail("直取失敗：內置腳本缺失")
+                        return
+                    }
+                    evalJs(jquery) {
+                        evalJs(driver) {
+                            evalJs(cast) {
+                                // jQuery ready callbacks fire on
+                                // injection (document already complete);
+                                // give handler registration a beat.
+                                handler.postDelayed({ if (!done) collectSources(0) }, 500)
+                            }
+                        }
+                    }
+                }
+            }
+            wv.loadDataWithBaseURL("https://www.javhdporn.net/", pageHtml, "text/html", "utf-8", null)
+        }
+
+        // Step 1 (worker): read the bundled site scripts, then fetch
+        // the detail page over ECH and pull the Server-link tokens
+        // out of the HTML. The page itself is never rendered.
+        SearchScheduler.workers.execute {
+            jqueryJs = assetText("javhd_jquery.min.js")
+            driverCastJs = assetText("javhd_driver_cast.js")
+            castJs = assetText("javhd_cast.js")
+            driverEmbedJs = assetText("javhd_driver_embed.js")
+            embedMainJs = assetText("javhd_embed_main.js")
+            if (jqueryJs == null || driverCastJs == null || castJs == null ||
+                driverEmbedJs == null || embedMainJs == null
+            ) {
+                handler.post { fail("直取失敗：內置腳本缺失") }
+                return@execute
+            }
+            val site = sites.firstOrNull { it.id == item.siteId }
+            if (site == null) {
+                handler.post { fail("直取失敗：站點未註冊") }
+                return@execute
+            }
+            val detail = try {
+                SearchHttpFetcher().fetch(item.detailUrl, SearchCancellation(), site)
+            } catch (e: Exception) {
+                handler.post { fail("直取失敗：詳情頁取不到") }
+                return@execute
+            }
+            if (detail.transportError != null || detail.statusCode !in 200..299 || detail.body.isBlank()) {
+                handler.post { fail("直取失敗：詳情頁取不到") }
+                return@execute
+            }
+            // <a class="srv" href="javascript:void(0)" data-link="TOKEN" ...>Part1</a>
+            val srvRe = Regex("<a[^>]*data-link=\"([^\"]+)\"[^>]*>([^<]*)</a>")
+            val found = srvRe.findAll(detail.body).map { m ->
+                m.groupValues.getOrNull(1).orEmpty().trim() to
+                    m.groupValues.getOrNull(2).orEmpty().trim()
+            }.filter { it.first.isNotEmpty() }.toList()
+            val pairs = if (found.isNotEmpty()) found else run {
+                // Fallback: Part1's token is also the data-mpu value.
+                val mpu = Regex("data-mpu=\"([^\"]+)\"").find(detail.body)?.groupValues?.getOrNull(1).orEmpty()
+                if (mpu.isNotEmpty()) listOf(mpu to "Part1") else emptyList()
+            }
+            if (pairs.isEmpty()) {
+                handler.post { fail("直取失敗：詳情頁無令牌") }
+                return@execute
+            }
+            handler.post {
+                if (done) return@post
+                tokens = pairs.map { it.first }
+                partLabels = pairs.mapIndexed { i, (_, label) ->
+                    label.ifEmpty { "Part${i + 1}" }
+                }
+                setupCastPage()
+            }
+        }
+    }
+
+    /** Hidden-WebView click path (live site JS): fallback when the
+     * direct extraction chain fails, e.g. the bundled site JS goes
+     * stale. Kept intact; tryResolveJavhdRealUrl is the primary
+     * direct chain. */
+    private fun resolveJavhdViaClick(
+        item: SearchItem,
+        sessionId: Long,
+        directFailReason: String?,
         callback: (List<Pair<String, String>>?) -> Unit,
     ) {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -511,7 +972,12 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     )
                 })
             } else {
-                PlaybackDataStore.recordFail(sessionId, javhdFailReason())
+                val reason = if (directFailReason != null) {
+                    "直取失敗：$directFailReason；點擊亦失敗：${javhdFailReason()}"
+                } else {
+                    javhdFailReason()
+                }
+                PlaybackDataStore.recordFail(sessionId, reason)
             }
             callback(result)
         }
