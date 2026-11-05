@@ -410,4 +410,32 @@ object VideoExtractor {
             }
         }
     }
+
+    // HentaiMama direct-file extraction (ad-free): the real video only
+    // exists in the dt_embed JWPlayer setup (video domain gdvid.info),
+    // never in static HTML. Chain: episode page -> post id -> admin-ajax
+    // POST get_player_contents -> dt_embed iframe -> JWPlayer file.
+    // The VAST advertising block in the same setup is never executed
+    // when this URL is played directly, so no ad is ever shown.
+
+    /** Post id for the get_player_contents AJAX call, from the episode
+     *  page's inline player script ("get_player_contents',a: '12379'"). */
+    fun extractHentaiMamaPostId(html: String): String? =
+        Regex("""get_player_contents'\s*,\s*a:\s*'(\d+)'""").find(html)?.groupValues?.getOrNull(1)
+
+    /** Embed iframe URL from the get_player_contents JSON response
+     *  (["<iframe ... src="https://host/?dt_embed=rtmp&p=..&ep=.." ...>"]).
+     *  Unescapes the JSON string escapes before matching. */
+    fun extractHentaiMamaEmbedUrl(ajaxJson: String): String? {
+        val unescaped = ajaxJson.replace("\\/", "/").replace("&#038;", "&").replace("\\\"", "\"")
+        return Regex("""https?://[^"\\]*dt_embed=rtmp[^"\\]*""").find(unescaped)?.value
+    }
+
+    /** Direct video file from the dt_embed player page's JWPlayer setup
+     *  (sources: [{"file": "https://gdvid.info/No/....mp4", "type": "mp4"}]). */
+    fun extractHentaiMamaVideoFile(embedHtml: String): String? {
+        val unescaped = embedHtml.replace("\\/", "/").replace("\\\"", "\"")
+        return Regex("""sources:\s*\[\s*\{\s*"file"\s*:\s*"([^"]+)"""").find(unescaped)
+            ?.groupValues?.getOrNull(1)?.takeIf { it.contains(".mp4") || it.contains(".m3u8") }
+    }
 }

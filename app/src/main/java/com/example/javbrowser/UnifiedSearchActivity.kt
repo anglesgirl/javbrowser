@@ -15,6 +15,10 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import okhttp3.FormBody
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.util.concurrent.TimeUnit
 
 /** 九個來源共用的搜尋與結果頁。 */
 class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
@@ -221,6 +225,26 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             }
             return
         }
+        // hentaimama: the real file only exists in the dt_embed JWPlayer
+        // setup (video domain gdvid.info), never in static HTML — static
+        // sniffing only finds snapshot thumbnails. Resolve it over HTTP,
+        // skipping the VAST ad entirely; any failure falls back to WebView.
+        if (item.siteId == SearchSiteIds.HENTAIMAMA) {
+            runOnUiThread {
+                android.widget.Toast.makeText(this,
+                    LanguageManager.text(this, "正在解析真实地址…", "Resolving real video URL…"),
+                    android.widget.Toast.LENGTH_SHORT).show()
+            }
+            tryResolveHentaiMamaRealUrl(item) { realUrl ->
+                if (isDestroyed || isFinishing) return@tryResolveHentaiMamaRealUrl
+                if (realUrl != null) {
+                    showSniffPicker(item, listOf(realUrl to null))
+                } else {
+                    BrowserNavigator.open(this, item.detailUrl)
+                }
+            }
+            return
+        }
         SearchScheduler.workers.execute {
             val candidates = trySniffVideoCandidates(item)
             runOnUiThread {
@@ -349,6 +373,60 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     }
 
     /** Returns sniffed candidates (proven <60s m3u8 ads excluded), or empty to fall back to WebView. Never throws. */
+    /**
+     * Resolves HentaiMama's real file without ever running the player's
+     * VAST ad: episode page (ECH fetch) -> post id -> admin-ajax POST
+     * get_player_contents -> dt_embed iframe -> JWPlayer sources file
+     * (gdvid.info mp4). The ad domains (twinrdengine/marzaent/sacdnssedge)
+     * only appear in the advertising block, which this path never executes.
+     * Callback on the UI thread with the direct URL, or null on any failure
+     * — the caller then falls back to WebView. Never throws.
+     */
+    private fun tryResolveHentaiMamaRealUrl(item: SearchItem, callback: (String?) -> Unit) {
+        SearchScheduler.workers.execute {
+            val realUrl = try { resolveHentaiMamaRealUrl(item) } catch (e: Exception) { null }
+            runOnUiThread { callback(realUrl) }
+        }
+    }
+
+    private fun resolveHentaiMamaRealUrl(item: SearchItem): String? {
+        val site = sites.firstOrNull { it.id == item.siteId } ?: return null
+        val episode = SearchHttpFetcher().fetch(item.detailUrl, SearchCancellation(), site)
+        if (episode.transportError != null || episode.statusCode !in 200..299 || episode.body.isBlank()) return null
+        val postId = VideoExtractor.extractHentaiMamaPostId(episode.body) ?: return null
+        val host = try { java.net.URL(item.detailUrl).host } catch (e: Exception) { return null }
+        val ajaxJson = postForm(
+            "https://$host/wp-admin/admin-ajax.php", item.detailUrl,
+            mapOf("action" to "get_player_contents", "a" to postId, "i" to "0")
+        ) ?: return null
+        val embedUrl = VideoExtractor.extractHentaiMamaEmbedUrl(ajaxJson) ?: return null
+        val embed = SearchHttpFetcher().fetch(embedUrl, SearchCancellation(), site)
+        if (embed.transportError != null || embed.statusCode !in 200..299 || embed.body.isBlank()) return null
+        return VideoExtractor.extractHentaiMamaVideoFile(embed.body)
+    }
+
+    /** Small form-POST helper for the HentaiMama player AJAX (SearchHttpFetcher is GET-only). */
+    private fun postForm(url: String, referer: String, fields: Map<String, String>): String? {
+        return try {
+            val form = FormBody.Builder().apply {
+                fields.forEach { (k, v) -> add(k, v) }
+            }.build()
+            val request = Request.Builder().url(url)
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+                .header("Referer", referer)
+                .post(form).build()
+            val client = OkHttpClient.Builder()
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(15, TimeUnit.SECONDS)
+                .followRedirects(true).build()
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) null else response.body?.string()
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     private fun trySniffVideoCandidates(item: SearchItem): List<Pair<String, Double?>> {
         return try {
             val host = try { java.net.URL(item.detailUrl).host } catch (e: Exception) { return emptyList() }
