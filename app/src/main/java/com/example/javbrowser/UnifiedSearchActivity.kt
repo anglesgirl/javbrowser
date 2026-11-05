@@ -628,10 +628,17 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 }
                 // binddata runs synchronously inside the callback and
                 // sets window.videodata; poll briefly in case it defers.
-                pollJs("typeof window.videodata === 'string' && window.videodata.indexOf('video.javhdporn.net/p/') !== -1 ? window.videodata : ''", 10000) { videodata ->
+                // Accept any http URL: the embed host varies by region
+                // (video.javhdporn.net is not the only one), so do not
+                // hard-code it here.
+                pollJs("typeof window.videodata === 'string' && window.videodata.indexOf('http') === 0 ? window.videodata : ''", 10000) { videodata ->
                     if (done) return@pollJs
                     if (videodata.isNullOrEmpty()) {
-                        fail("直取失敗：Part${partIdx + 1} 嵌頁地址未解出")
+                        // Read back whatever videodata became, so the
+                        // failure message shows what binddata did.
+                        evalJs("typeof window.videodata === 'string' ? window.videodata : (window.videodata === undefined ? 'undefined' : typeof window.videodata)") { actual ->
+                            fail("直取失敗：Part${partIdx + 1} 嵌頁地址未解出（videodata=${unquoteJs(actual).orEmpty().take(80)}）")
+                        }
                         return@pollJs
                     }
                     fetchEmbedFn(partIdx, videodata)
