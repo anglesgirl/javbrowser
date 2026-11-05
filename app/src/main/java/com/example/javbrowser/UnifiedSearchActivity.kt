@@ -446,10 +446,16 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // pageStarted/maxProgress/lastLoadError pin a stalled load:
         // started-but-never-finished with a progress % and the last
         // error is a very different failure from never-started.
+        // jQueryLoaded/domAfterClick/lastClickedPart separate "the
+        // click handler never ran" (jQuery missing / no iframe after
+        // the click) from "the embed request failed".
         var pageFinished = false
         var pageStarted = false
         var maxProgress = 0
         var lastLoadError: String? = null
+        var jQueryLoaded: Boolean? = null
+        var domAfterClick: String? = null
+        var lastClickedPart = 0
         var embedSeen = false
         val mediaHosts = LinkedHashSet<String>()
         val pageSlug = item.detailUrl.trimEnd('/').substringAfterLast('/')
@@ -467,13 +473,22 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         /** Step-level failure reason for the 播放數據 screen. Never throws. */
         fun javhdFailReason(): String {
             val media = if (mediaHosts.isEmpty()) "無" else mediaHosts.take(3).joinToString(",")
+            val err = lastLoadError?.let { "；$it" } ?: ""
+            val jq = when (jQueryLoaded) {
+                true -> "；jQuery已載入"
+                false -> "；jQuery未載入"
+                null -> ""
+            }
+            val dom = domAfterClick?.let { "；點擊後$it" } ?: ""
             return when {
                 !pageStarted -> "javhd解析失敗 [$pageSlug]：頁面未開始加載"
                 !pageFinished -> "javhd解析失敗 [$pageSlug]：頁面未完成加載（進度$maxProgress%" +
                     (lastLoadError?.let { "，$it" } ?: "") + ")"
-                partLabels.isEmpty() -> "javhd解析失敗 [$pageSlug]：頁面已載、無Server連結；媒體host=$media"
-                !embedSeen -> "javhd解析失敗 [$pageSlug]：srv=${partLabels.size} 已點Part${partIdx + 1}、嵌頁未載入；媒體host=$media"
-                else -> "javhd解析失敗 [$pageSlug]：srv=${partLabels.size} 嵌頁已載、未見文件；媒體host=$media"
+                partLabels.isEmpty() -> "javhd解析失敗 [$pageSlug]：頁面已載、無Server連結；媒體host=$media$err$jq"
+                !embedSeen -> "javhd解析失敗 [$pageSlug]：srv=${partLabels.size} " +
+                    (if (lastClickedPart > 0) "已點Part$lastClickedPart、" else "") +
+                    "嵌頁未載入；媒體host=$media$jq$dom$err"
+                else -> "javhd解析失敗 [$pageSlug]：srv=${partLabels.size} 嵌頁已載、未見文件；媒體host=$media$err"
             }
         }
 
@@ -503,12 +518,30 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
 
         fun clickSrv(i: Int) {
             partClicks++
+            lastClickedPart = i + 1
             hiddenWebView?.evaluateJavascript(
                 "(function(){var a=document.querySelectorAll('a.srv');" +
                     "if(a.length>" + i + "){a[" + i + "].click();return 'clicked';}" +
                     "return 'no-srv';})();",
                 null,
             )
+        }
+
+        /** Before giving up, look at the DOM once: an embed iframe in
+         * the page with no network request seen means the handler ran
+         * but the request died before the network; no iframe at all
+         * means the handler never ran. The 75s timeout still calls
+         * finish() directly if this probe never returns. */
+        fun finishWithDomProbe() {
+            hiddenWebView?.evaluateJavascript(
+                "(function(){var f=document.querySelectorAll('iframe').length;" +
+                    "var e=document.querySelector('iframe[src*=\"video.javhdporn.net\"]');" +
+                    "return 'iframes='+f+'|'+(e?'embed':'no-embed');})();",
+            ) { value ->
+                val s = value?.trim()?.removeSurrounding("\"").orEmpty()
+                if (s.isNotEmpty() && s != "null") domAfterClick = s
+                if (!done) finish()
+            }
         }
 
         fun clickLegacyPlay() {
@@ -554,7 +587,19 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         handler.postDelayed({ if (!done) finish() }, 20000)
                     }
                 } else {
-                    checker?.let { handler.post(it) }
+                    // Probe jQuery before clicking: the theme's click
+                    // handler lives in cast.js and needs jQuery (from
+                    // ajax.googleapis.com). If jQuery never loaded, the
+                    // clicks are dead on arrival — that is a different
+                    // failure from a dead embed request.
+                    hiddenWebView?.evaluateJavascript(
+                        "(function(){return (typeof jQuery!=='undefined')?'jq-yes':'jq-no';})();",
+                    ) { value ->
+                        val s = value?.trim()?.removeSurrounding("\"").orEmpty()
+                        if (s == "jq-yes") jQueryLoaded = true
+                        else if (s == "jq-no") jQueryLoaded = false
+                        if (!done) checker?.let { handler.post(it) }
+                    }
                 }
             }
         }
@@ -570,7 +615,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 }
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (partIdx >= partLabels.size) {
-                    finish()
+                    finishWithDomProbe()
                     return
                 }
                 when {
@@ -578,7 +623,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         partIdx++
                         partClicks = 0
                         if (partIdx >= partLabels.size) {
-                            finish()
+                            finishWithDomProbe()
                             return
                         }
                         partStartedAt = now
@@ -593,7 +638,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         partIdx++
                         partClicks = 0
                         if (partIdx >= partLabels.size) {
-                            finish()
+                            finishWithDomProbe()
                             return
                         }
                         partStartedAt = now
