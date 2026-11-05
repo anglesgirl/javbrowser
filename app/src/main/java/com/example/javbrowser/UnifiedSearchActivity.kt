@@ -560,6 +560,15 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             handler.post(poll)
         }
 
+        // Forward references: a local function can only call functions
+        // declared above it, but this chain is cyclic (postAndFeed ->
+        // feedDone -> fetchEmbed -> setupEmbedPage -> postAndFeed).
+        // These vars break the cycle; each is assigned right after its
+        // function is declared, before any of them can run.
+        lateinit var feedDoneFn: (Int, String) -> Unit
+        lateinit var fetchEmbedFn: (Int, String) -> Unit
+        lateinit var setupEmbedFn: (Int, String, String) -> Unit
+
         /** Per-Part: POST sources, feed the response through the
          * handler's own .done() (binddata), read the embed URL, then
          * fetch the embed page and decode the file URL. */
@@ -600,7 +609,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     handler.post { fail("直取失敗：Part${partIdx + 1} api/play無效") }
                     return@execute
                 }
-                handler.post { if (!done) feedDoneAndReadVideodata(partIdx, postJson) }
+                handler.post { if (!done) feedDoneFn(partIdx, postJson) }
             }
         }
 
@@ -624,10 +633,12 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         fail("直取失敗：Part${partIdx + 1} 嵌頁地址未解出")
                         return@pollJs
                     }
-                    fetchEmbedAndDecode(partIdx, videodata)
+                    fetchEmbedFn(partIdx, videodata)
                 }
             }
         }
+
+        feedDoneFn = ::feedDoneAndReadVideodata
 
         /** Fetch the embed page over ECH, pull data-config, and decode
          * the file URL with the bundled embed main.js. */
@@ -654,9 +665,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     handler.post { fail("直取失敗：Part${partIdx + 1} 嵌頁無data-config") }
                     return@execute
                 }
-                handler.post { if (!done) setupEmbedPage(partIdx, embedUrl, config) }
+                handler.post { if (!done) setupEmbedFn(partIdx, embedUrl, config) }
             }
         }
+
+        fetchEmbedFn = ::fetchEmbedAndDecode
 
         /** Reuse the hidden WebView for the embed stage: fresh blank
          * page holding only the jwplayer div, then the embed driver
@@ -711,6 +724,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             hiddenWebView?.webViewClient = client
             hiddenWebView?.loadDataWithBaseURL(embedUrl, pageHtml, "text/html", "utf-8", null)
         }
+
+        setupEmbedFn = ::setupEmbedPage
 
         /** Trigger every Part's click on the cast page and collect the
          * `sources` each handler computes (via the overridden
