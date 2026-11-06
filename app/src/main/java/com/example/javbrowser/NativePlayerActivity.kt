@@ -77,9 +77,21 @@ class NativePlayerActivity : LocalizedActivity() {
 
         val headers = mutableMapOf<String, String>()
         if (referer.isNotEmpty()) headers["Referer"] = referer
+        // Cookies only for the video host itself (or the referer when
+        // it is the SAME host). The old code fell back to the
+        // referer's cookies unconditionally, which sent another
+        // site's cookies to the video CDN — e.g. a javhdporn.net
+        // cf_clearance to vdcdn.xyz, whose Cloudflare edge can reject
+        // a clearance token that belongs to a different zone. The
+        // player then failed with a generic "Source error" while the
+        // same link played fine with no cookies at all.
         val cookieManager = android.webkit.CookieManager.getInstance()
+        val videoHost = try { java.net.URL(videoUrl).host } catch (e: Exception) { "" }
+        val refererHost = try { java.net.URL(referer).host } catch (e: Exception) { "" }
         val cookies = cookieManager.getCookie(videoUrl)?.takeIf { it.isNotEmpty() }
-            ?: cookieManager.getCookie(referer)?.takeIf { it.isNotEmpty() }
+            ?: if (refererHost.isNotEmpty() && refererHost == videoHost) {
+                cookieManager.getCookie(referer)?.takeIf { it.isNotEmpty() }
+            } else null
         if (!cookies.isNullOrEmpty()) headers["Cookie"] = cookies
 
         val dataSourceFactory = DefaultHttpDataSource.Factory()
@@ -96,12 +108,22 @@ class NativePlayerActivity : LocalizedActivity() {
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                // Record the full cause chain, not just the generic
+                // message: "Source error" alone cannot tell a 403
+                // from a timeout from a bad container, and the
+                // playback-data page shows this string. The Toast
+                // keeps the short message.
+                val causeChain = generateSequence(error.cause) { it.cause }
+                    .joinToString(" <- ") { c ->
+                        c.javaClass.simpleName + (c.message?.let { ": $it" } ?: "")
+                    }.takeIf { it.isNotEmpty() } ?: "無 cause"
+                val detail = "code=${error.errorCode} msg=${error.message ?: "?"} | $causeChain"
                 android.util.Log.w(
                     "NATIVE_PLAYER",
-                    "playback failed url=$videoUrl cause=${error.cause}",
+                    "playback failed url=$videoUrl $detail",
                     error
                 )
-                errorMsg = error.message ?: "未知错误"
+                errorMsg = detail
                 // Record immediately: an error may be followed by a fast
                 // exit, and onPause must not overwrite it with a blank.
                 recordOutcome()
