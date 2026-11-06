@@ -26,7 +26,7 @@ object SearchFailure {
         else -> "PARSER_EXCEPTION"
     }
     fun zh(code: String?): String = when (code) {
-        "CF_CHALLENGE" -> "遇到 Cloudflare（CF）人機驗證；尚未取得搜尋結果，請開啟原始搜尋頁完成驗證後重試"
+        "CF_CHALLENGE" -> "遇到 Cloudflare（CF）人機驗證；點下方「去驗證」在瀏覽器完成一次驗證，返回重試後即可搜尋（驗證憑證會保留一段時間）"
         "CF_BLOCKED" -> "遭 Cloudflare（CF）防火牆封鎖；尚未取得搜尋結果，可能需要網站管理員解除限制"
         "HUMAN_VERIFICATION" -> "網站要求人機驗證；尚未取得搜尋結果"
         "LOGIN_REQUIRED" -> "網站要求登入；尚未取得搜尋結果"
@@ -58,7 +58,7 @@ object SearchFailure {
         else -> "搜尋工作未完成"
     }
     fun en(code: String?): String = when (code) {
-        "CF_CHALLENGE" -> "Cloudflare (CF) verification; results have not been retrieved. Open the original page, verify, then retry."
+        "CF_CHALLENGE" -> "Cloudflare (CF) verification; tap “Verify” below to complete it once in the browser, then retry — the clearance is kept for a while."
         "CF_BLOCKED" -> "Blocked by the Cloudflare (CF) firewall; results unavailable. The site owner may need to remove the restriction."
         "HUMAN_VERIFICATION" -> "Human verification required; results not retrieved"
         "LOGIN_REQUIRED" -> "Sign-in required; results not retrieved"

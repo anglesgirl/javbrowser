@@ -2114,7 +2114,9 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     setOnClickListener { click() }
                 }, LinearLayout.LayoutParams(0, dp(48), 1f))
             }
-            action(tr("原始搜尋頁", "Original page")) {
+            action(if (state.status == SearchStatus.NEEDS_USER_ACTION &&
+                state.errorCode in setOf("CF_CHALLENGE", "HUMAN_VERIFICATION", "CF_BLOCKED"))
+                tr("去驗證", "Verify") else tr("原始搜尋頁", "Original page")) {
                 val url = site.buildSearchUrl(snapshot.request.normalizedQuery, state.pendingPageToken)
                 preserveSessionOnStop = true
                 startActivityForResult(android.content.Intent(this, SearchSourceActivity::class.java)
