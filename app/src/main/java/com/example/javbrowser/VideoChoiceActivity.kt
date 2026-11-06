@@ -126,7 +126,32 @@ class VideoChoiceActivity : LocalizedActivity() {
         findViewById<TextView>(R.id.tv_video_choice_subtitle).text =
             tr("选择播放地址", "Choose video URL")
         adapter = ChoiceAdapter(candidates) { index ->
-            finishWith(RESULT_KIND_PICK, index, candidates[index].url)
+            val url = candidates[index].url
+            // Record the pick here: the picker no longer finishes on
+            // pick (it stays alive so back from the player returns to
+            // the list), so the choiceLauncher in UnifiedSearchActivity
+            // never sees this pick.
+            PlaybackDataStore.recordPick(sessionId, url, index)
+            val target = if (siteId == SearchSiteIds.JAVHD || siteId == SearchSiteIds.HENTAIMAMA) {
+                NativePlayerActivity::class.java
+            } else {
+                FullscreenInternalPlayerActivity::class.java
+            }
+            val referer = if (siteId == SearchSiteIds.JAVHD) {
+                UnifiedSearchActivity.javhdEmbedRefererByUrl[url].orEmpty().ifEmpty { detailUrl }
+            } else {
+                detailUrl
+            }
+            startActivity(android.content.Intent(this, target).apply {
+                putExtra(FullscreenInternalPlayerActivity.EXTRA_VIDEO_URL, url)
+                putExtra(FullscreenInternalPlayerActivity.EXTRA_REFERER, referer)
+                putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, detailUrl)
+                putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, title)
+                putExtra(FullscreenInternalPlayerActivity.EXTRA_SESSION_ID, sessionId)
+            })
+            // Do NOT finish: the list stays, and back from the player
+            // returns here instead of losing the list and forcing a
+            // re-tap plus a full re-extraction.
         }
         findViewById<RecyclerView>(R.id.rv_video_choice).apply {
             layoutManager = LinearLayoutManager(this@VideoChoiceActivity)

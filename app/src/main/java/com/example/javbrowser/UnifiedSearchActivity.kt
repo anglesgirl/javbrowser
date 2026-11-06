@@ -27,6 +27,17 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     companion object {
         const val EXTRA_QUERY = "unified_search_query"
         const val EXTRA_FORCE_CODE = "unified_search_force_code"
+
+        /** Embed page per extracted javhd file URL (file URL -> embed
+         * URL). The player sends the embed page as Referer — the video
+         * CDN rejects the detail page as referer (HTTP 403), while the
+         * embed page is the real player referer. Static so
+         * VideoChoiceActivity can launch the player itself (keeping
+         * the picker alive) and look the referer up. Keyed by the
+         * unique file URL (sign is per-extraction), so entries never
+         * collide across videos; not cleared per-sniff so a picker
+         * opened earlier still finds its referer. */
+        val javhdEmbedRefererByUrl = mutableMapOf<String, String>()
     }
 
     private lateinit var queryEdit: EditText
@@ -434,12 +445,6 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * (where it stuck is visible from the gaps). */
     private var javhdTraceT0 = 0L
 
-    /** Embed page per extracted javhd file URL (file URL -> embed
-     * URL). The player sends the embed page as Referer — the video
-     * CDN rejects the detail page as referer (HTTP 403), while the
-     * embed page is the real player referer. Cleared on each sniff. */
-    private val javhdEmbedRefererByUrl = mutableMapOf<String, String>()
-
     /** One trace line for the current javhd sniff, shown in 播放數據
      * under 過程 and copied with it. Never throws. */
     private fun traceJavhd(sessionId: Long, line: String) {
@@ -494,7 +499,6 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         sessionId: Long,
         callback: (List<Pair<String, String>>?, String?) -> Unit,
     ) {
-        javhdEmbedRefererByUrl.clear()
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
         var hiddenWebView: android.webkit.WebView? = null
         var done = false
