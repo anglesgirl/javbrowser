@@ -290,6 +290,16 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // javhdporn: the real file never appears in static HTML (only ads do),
         // so resolve it through a hidden WebView instead of static sniffing.
         if (item.siteId == SearchSiteIds.JAVHD) {
+            // Reuse a recently extracted address: the file URL's sign
+            // lives ~6h, so a sniff from the last 5h is still good —
+            // skip re-extraction. A failed playback invalidates the
+            // page's cache, so the next open re-extracts.
+            val cached = PlaybackDataStore.cachedCandidates(item.detailUrl, 5L * 60 * 60 * 1000)
+            if (cached.isNotEmpty()) {
+                PlaybackDataStore.addCandidates(sessionId, cached)
+                showSniffPicker(item, cached, sessionId)
+                return
+            }
             runOnUiThread {
                 android.widget.Toast.makeText(this,
                     LanguageManager.text(this, "正在解析真实地址…", "Resolving real video URL…"),

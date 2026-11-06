@@ -183,6 +183,14 @@ class NativePlayerActivity : LocalizedActivity() {
                     error = errorMsg,
                 ),
             )
+            // A failed play means the cached direct link is dead
+            // (sign expired or revoked): drop the page's cached
+            // candidates so the next open re-extracts instead of
+            // replaying the dead link.
+            if (errorMsg != null) {
+                val pageUrl = PlaybackDataStore.snapshot().firstOrNull { it.id == sessionId }?.pageUrl.orEmpty()
+                if (pageUrl.isNotEmpty()) PlaybackDataStore.invalidatePage(pageUrl)
+            }
         } catch (e: Exception) {
             // Recording must never break playback.
         }

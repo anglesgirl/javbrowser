@@ -109,6 +109,38 @@ object PlaybackDataStore {
         update(sessionId) { it.copy(candidates = candidates) }
     }
 
+    /** Newest cached direct links for a detail page, if a recent
+     * sniff already extracted them (the file URL's sign lives ~6h,
+     * so only reuse a sniff from the last [maxAgeMs]). Lets a
+     * re-opened video skip re-extraction; a failed playback
+     * invalidates the page's cache via [invalidatePage] so the next
+     * open re-extracts. Never throws. */
+    fun cachedCandidates(pageUrl: String, maxAgeMs: Long): List<SniffCandidateRecord> {
+        val now = System.currentTimeMillis()
+        return synchronized(lock) {
+            sessions.reversed().firstOrNull { s ->
+                s.pageUrl == pageUrl && s.candidates.isNotEmpty() && now - s.timeMs <= maxAgeMs
+            }?.candidates.orEmpty()
+        }
+    }
+
+    /** Drop every cached candidate for a detail page (its links
+     * proved bad — playback failed). The next open re-extracts
+     * instead of replaying the dead links. Never throws. */
+    fun invalidatePage(pageUrl: String) {
+        synchronized(lock) {
+            var changed = false
+            for (i in sessions.indices) {
+                val s = sessions[i]
+                if (s.pageUrl == pageUrl && s.candidates.isNotEmpty()) {
+                    sessions[i] = s.copy(candidates = emptyList())
+                    changed = true
+                }
+            }
+            if (changed) saveLocked()
+        }
+    }
+
     fun recordFail(sessionId: Long, stage: String) {
         update(sessionId) { it.copy(failStage = stage, pickOutcome = "無候選") }
     }
