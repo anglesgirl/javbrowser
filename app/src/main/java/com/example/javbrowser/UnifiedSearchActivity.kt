@@ -434,6 +434,12 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * (where it stuck is visible from the gaps). */
     private var javhdTraceT0 = 0L
 
+    /** Embed page per extracted javhd file URL (file URL -> embed
+     * URL). The player sends the embed page as Referer — the video
+     * CDN rejects the detail page as referer (HTTP 403), while the
+     * embed page is the real player referer. Cleared on each sniff. */
+    private val javhdEmbedRefererByUrl = mutableMapOf<String, String>()
+
     /** One trace line for the current javhd sniff, shown in 播放數據
      * under 過程 and copied with it. Never throws. */
     private fun traceJavhd(sessionId: Long, line: String) {
@@ -488,6 +494,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         sessionId: Long,
         callback: (List<Pair<String, String>>?, String?) -> Unit,
     ) {
+        javhdEmbedRefererByUrl.clear()
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
         var hiddenWebView: android.webkit.WebView? = null
         var done = false
@@ -522,6 +529,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             hiddenWebView = null
             if (parts != null) {
                 traceJavhd(sessionId, "直取完成：${parts.size} 個 Part（${parts.joinToString("，") { it.first }}）")
+                // Remember each file's embed page so the player can
+                // send it as Referer (see javhdEmbedRefererByUrl).
+                for ((i, url) in foundParts) {
+                    embedUrlByPart[i]?.let { javhdEmbedRefererByUrl[url] = it }
+                }
                 PlaybackDataStore.addCandidates(sessionId, parts.map { (label, url) ->
                     resolverRecord(url, "resolver-javhd-direct", "$label 直接提取（跳過廣告）")
                 })
@@ -1493,18 +1505,26 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     private fun playSniffed(item: SearchItem, videoUrl: String, sessionId: Long) {
         // HentaiMama and javhdporn direct files play in the native player:
         // the WebView player stalls on them (plays ~1s, then jumps back),
-        // while the same URL plays fine in a browser. javhdporn's file host
-        // also ignores Range requests (200 with the full body), which the
-        // native player tolerates better. Every other site keeps the
-        // existing internal player.
+        // while the same URL plays fine in a browser. Every other site
+        // keeps the existing internal player.
         val target = if (item.siteId == SearchSiteIds.HENTAIMAMA || item.siteId == SearchSiteIds.JAVHD) {
             NativePlayerActivity::class.java
         } else {
             FullscreenInternalPlayerActivity::class.java
         }
+        // javhd: the video CDN rejects the detail page as referer
+        // (HTTP 403, InvalidResponseCodeException — the 13:09 run).
+        // Send the embed page instead: it is the real player referer,
+        // the one JWPlayer itself sends. Fall back to no referer (a
+        // bare link also plays) when the embed URL wasn't recorded.
+        val referer = if (item.siteId == SearchSiteIds.JAVHD) {
+            javhdEmbedRefererByUrl[videoUrl].orEmpty()
+        } else {
+            item.detailUrl
+        }
         startActivity(android.content.Intent(this, target).apply {
             putExtra(FullscreenInternalPlayerActivity.EXTRA_VIDEO_URL, videoUrl)
-            putExtra(FullscreenInternalPlayerActivity.EXTRA_REFERER, item.detailUrl)
+            putExtra(FullscreenInternalPlayerActivity.EXTRA_REFERER, referer)
             putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, item.detailUrl)
             putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, item.title)
             putExtra(FullscreenInternalPlayerActivity.EXTRA_SESSION_ID, sessionId)
