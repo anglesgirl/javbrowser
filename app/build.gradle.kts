@@ -80,6 +80,11 @@ dependencies {
     // 1.4.1 fits this project's Kotlin 1.9 / AGP 8.2 / compileSdk 34.
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-ui:1.4.1")
+    // OkHttp DataSource for ExoPlayer: lets the native player fetch
+    // video through the app-layer ECH OkHttpClient instead of plain
+    // HttpURLConnection (whose visible SNI gets HTTP 403 from the
+    // video CDN on the user's network).
+    implementation("androidx.media3:media3-datasource-okhttp:1.4.1")
 
     // App-layer ECH (Conscrypt) + HTTP/3 (Cronet) for search/page fetch.
     // OkHttp, AGP, Kotlin and the SDK levels are deliberately NOT upgraded.

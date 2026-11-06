@@ -171,6 +171,18 @@ object EchH3Router {
         newOkHttpClient(10, 15, callSec = 15, followRedirects = true, retryOnConnectionFailure = true)
 
     /**
+     * Video client for the native player (ExoPlayer OkHttpDataSource):
+     * same ECH stack as [searchEchClient], but NO call timeout — a
+     * video stream is long-lived and must not be killed mid-playback
+     * just because 15s elapsed; the 30s read timeout is what bounds
+     * a real stall. The plain-HTTPS player request exposes the SNI
+     * and the carrier answers the video CDN with HTTP 403, while the
+     * same URL over ECH plays — so playback goes through ECH too.
+     */
+    fun videoEchClient(): OkHttpClient =
+        newOkHttpClient(10, 30, callSec = null, followRedirects = true, retryOnConnectionFailure = true)
+
+    /**
      * Rescue-attempt client for the shared Cloudflare ECH config: same
      * shape as [searchEchClient] but the SSL pair injects the given
      * shared config for every host instead of the host's own config

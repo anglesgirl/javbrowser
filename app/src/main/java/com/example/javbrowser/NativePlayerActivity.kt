@@ -9,7 +9,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
-import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
@@ -94,7 +94,13 @@ class NativePlayerActivity : LocalizedActivity() {
             } else null
         if (!cookies.isNullOrEmpty()) headers["Cookie"] = cookies
 
-        val dataSourceFactory = DefaultHttpDataSource.Factory()
+        // Fetch the video through the app-layer ECH client, not plain
+        // HTTPS: the plain request exposes the SNI (us-a2.vdcdn.xyz)
+        // and the carrier answers it with HTTP 403, while the same
+        // URL over ECH (and in Muse) plays. OkHttpDataSource takes
+        // the ECH OkHttpClient directly; videoEchClient has no call
+        // timeout so a long stream is not killed mid-playback.
+        val dataSourceFactory = OkHttpDataSource.Factory(EchH3Router.videoEchClient())
             .setUserAgent("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
             .setDefaultRequestProperties(headers)
         val exoPlayer = ExoPlayer.Builder(this)
