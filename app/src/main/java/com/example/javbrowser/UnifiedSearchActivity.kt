@@ -503,6 +503,15 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         var driverEmbedJs: String? = null
         var embedMainJs: String? = null
         val sourcesByPart = LinkedHashMap<Int, String>()
+        // Phase 1 collects each Part's embed URL here (on the cast
+        // page); Phase 2 decodes them. Split because decoding a Part
+        // navigates the WebView to the embed page, which destroys the
+        // cast page's __javhdDoneCbs — feeding a later Part's done
+        // callback after that always fails ("done回調未註冊").
+        val embedUrlByPart = LinkedHashMap<Int, String>()
+        // Last per-Part failure, kept so the final message can say
+        // which Part failed when nothing at all was decoded.
+        var lastPartFailReason: String? = null
         var timeoutRunnable: Runnable by kotlin.properties.Delegates.notNull()
 
         fun finish(parts: List<Pair<String, String>>?, reason: String?) {
@@ -523,7 +532,20 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         fun fail(reason: String) {
             if (done) return
             traceJavhd(sessionId, "直取失敗：$reason")
-            finish(null, reason)
+            if (foundParts.isNotEmpty()) {
+                // A later Part failed, but earlier Parts already
+                // yielded direct links — surface those instead of
+                // discarding them. (10:03 run: Part1's file URL was
+                // extracted and plays, then Part2 failed and the
+                // whole sniff was reported as "未找到候選".)
+                val parts = foundParts.entries.map { (i, url) ->
+                    (partLabels.getOrNull(i).orEmpty().ifEmpty { "Part${i + 1}" }) to url
+                }
+                traceJavhd(sessionId, "直取部分成功：${parts.size} 個 Part 已解出（$reason）")
+                finish(parts, reason)
+            } else {
+                finish(null, reason)
+            }
         }
 
         timeoutRunnable = Runnable { fail("直取超時") }
@@ -585,28 +607,59 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
 
         // Forward references: a local function can only call functions
         // declared above it, but this chain is cyclic (postAndFeed ->
-        // feedDone -> fetchEmbed -> setupEmbedPage -> postAndFeed).
-        // These vars break the cycle; each is assigned right after its
-        // function is declared, before any of them can run.
+        // feedDone -> postAndFeed, and decodePart -> fetchEmbed ->
+        // setupEmbedPage -> decodePart). These vars break the cycle;
+        // each is assigned right after its function is declared,
+        // before any of them can run.
         lateinit var feedDoneFn: (Int, String) -> Unit
         lateinit var fetchEmbedFn: (Int, String) -> Unit
         lateinit var setupEmbedFn: (Int, String, String) -> Unit
 
-        /** Per-Part: POST sources, feed the response through the
-         * handler's own .done() (binddata), read the embed URL, then
-         * fetch the embed page and decode the file URL. */
-        fun postAndFeed(partIdx: Int) {
+        /** Phase 2: decode each Part's collected embed URL to a file
+         * URL. Runs after Phase 1 fed every Part's done callback on
+         * the cast page, so navigating the WebView to the embed page
+         * here is safe — the cast page (and its __javhdDoneCbs) is
+         * no longer needed. A Part that fails here is skipped; parts
+         * already decoded are kept. */
+        fun decodePart(partIdx: Int) {
             if (done) return
             if (partIdx >= tokens.size) {
+                if (foundParts.isEmpty()) {
+                    fail(lastPartFailReason ?: "直取失敗：無嵌頁地址")
+                    return
+                }
                 val parts = foundParts.entries.map { (i, url) ->
                     (partLabels.getOrNull(i).orEmpty().ifEmpty { "Part${i + 1}" }) to url
                 }
                 finish(parts, null)
                 return
             }
+            val embedUrl = embedUrlByPart[partIdx].orEmpty()
+            if (embedUrl.isEmpty()) {
+                decodePart(partIdx + 1)
+                return
+            }
+            fetchEmbedFn(partIdx, embedUrl)
+        }
+
+        /** Phase 1: per-Part POST sources and feed the response
+         * through the handler's own .done() (binddata), collecting
+         * the embed URL. Stays on the cast page the whole time — no
+         * navigation here, so __javhdDoneCbs survives for every
+         * Part. When every Part is fed, Phase 2 (decodePart) decodes
+         * the collected embed URLs. A Part that fails is skipped, not
+         * fatal: earlier Parts' links are kept. */
+        fun postAndFeed(partIdx: Int) {
+            if (done) return
+            if (partIdx >= tokens.size) {
+                decodePart(0)
+                return
+            }
             val sources = sourcesByPart[partIdx].orEmpty()
             if (sources.isEmpty()) {
-                fail("直取失敗：Part${partIdx + 1} sources缺失")
+                lastPartFailReason = "直取失敗：Part${partIdx + 1} sources缺失"
+                traceJavhd(sessionId, lastPartFailReason!!)
+                postAndFeed(partIdx + 1)
                 return
             }
             SearchScheduler.workers.execute {
@@ -621,7 +674,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 val transport = if (echJson != null) "ECH" else "明文"
                 if (postJson.isNullOrBlank()) {
                     traceJavhd(sessionId, "Part${partIdx + 1} POST api/play：ECH 與明文皆失敗")
-                    handler.post { fail("直取失敗：Part${partIdx + 1} api/play失敗") }
+                    handler.post {
+                        lastPartFailReason = "直取失敗：Part${partIdx + 1} api/play失敗"
+                        postAndFeed(partIdx + 1)
+                    }
                     return@execute
                 }
                 val data = try {
@@ -633,7 +689,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 }
                 if (data == null) {
                     traceJavhd(sessionId, "Part${partIdx + 1} POST api/play（$transport）：回包無效（前 ${postJson.take(80)}）")
-                    handler.post { fail("直取失敗：Part${partIdx + 1} api/play無效") }
+                    handler.post {
+                        lastPartFailReason = "直取失敗：Part${partIdx + 1} api/play無效"
+                        postAndFeed(partIdx + 1)
+                    }
                     return@execute
                 }
                 lastSourcesPreview = sources.take(24) + "…len=" + sources.length
@@ -645,14 +704,20 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
 
         /** Feed the /api/play/ response into the click handler's own
          * .done() callback (binddata decodes `data` to the embed URL),
-         * then read window.videodata. */
+         * then read the embed URL into embedUrlByPart (Phase 1 only
+         * — the embed page is fetched later, in Phase 2). */
         fun feedDoneAndReadVideodata(partIdx: Int, postJson: String) {
             if (done) return
             val quoted = org.json.JSONObject.quote(postJson)
             evalJs("window.__javhdDoneCbs && window.__javhdDoneCbs.length > $partIdx ? (window.__javhdDoneCbs[$partIdx](JSON.parse($quoted)), 'fed') : ''") { fed ->
                 if (done) return@evalJs
                 if (unquoteJs(fed).isNullOrEmpty()) {
-                    fail("直取失敗：Part${partIdx + 1} done回調未註冊")
+                    // Phase 1 runs on the cast page, so this should
+                    // not happen — but skip the Part rather than
+                    // killing the rest.
+                    lastPartFailReason = "直取失敗：Part${partIdx + 1} done回調未註冊"
+                    traceJavhd(sessionId, lastPartFailReason!!)
+                    postAndFeed(partIdx + 1)
                     return@evalJs
                 }
                 traceJavhd(sessionId, "Part${partIdx + 1} 餵回調：已餵")
@@ -675,7 +740,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     val url = unquoteJs(argUrl).orEmpty()
                     if (url.isNotEmpty()) {
                         traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁地址（binddata參數）：$url")
-                        fetchEmbedFn(partIdx, url)
+                        embedUrlByPart[partIdx] = url
+                        postAndFeed(partIdx + 1)
                         return@evalJs
                     }
                     // binddata runs synchronously inside the callback
@@ -695,14 +761,17 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                             evalJs("(window.__javhdAjaxCalls ? window.__javhdAjaxCalls.length : -1) + '/' + (window.__javhdDoneCbs ? window.__javhdDoneCbs.length : -1)") { counts ->
                                 evalJs("typeof window.videodata === 'string' ? window.videodata : (window.videodata === undefined ? 'undefined' : typeof window.videodata)") { actual ->
                                     evalJs("typeof window.__binddataArg === 'undefined' ? 'binddata未調用' : ('binddata參數=' + window.__binddataArg)") { arg ->
-                                        fail("直取失敗：Part${partIdx + 1} 嵌頁地址未解出（videodata=${unquoteJs(actual).orEmpty().take(80)}；${unquoteJs(arg).orEmpty().take(120)}；ajax/done=${unquoteJs(counts).orEmpty()}；src=${lastSourcesPreview}；data=${lastDataPreview}）")
+                                        lastPartFailReason = "直取失敗：Part${partIdx + 1} 嵌頁地址未解出（videodata=${unquoteJs(actual).orEmpty().take(80)}；${unquoteJs(arg).orEmpty().take(120)}；ajax/done=${unquoteJs(counts).orEmpty()}；src=${lastSourcesPreview}；data=${lastDataPreview}）"
+                                        traceJavhd(sessionId, lastPartFailReason!!)
+                                        postAndFeed(partIdx + 1)
                                     }
                                 }
                             }
                             return@pollJs
                         }
                         traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁地址：$videodata")
-                        fetchEmbedFn(partIdx, videodata)
+                        embedUrlByPart[partIdx] = videodata
+                        postAndFeed(partIdx + 1)
                     }
                 }
             }
@@ -724,19 +793,28 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     SearchHttpFetcher().fetch(embedUrl, SearchCancellation(), site)
                 } catch (e: Exception) {
                     traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁 GET：拋錯 ${e.message}")
-                    handler.post { fail("直取失敗：Part${partIdx + 1} 嵌頁取不到") }
+                    handler.post {
+                        lastPartFailReason = "直取失敗：Part${partIdx + 1} 嵌頁取不到"
+                        decodePart(partIdx + 1)
+                    }
                     return@execute
                 }
                 val embedHost = try { java.net.URL(embedUrl).host } catch (e: Exception) { "?" }
                 if (embed.transportError != null || embed.statusCode !in 200..299 || embed.body.isBlank()) {
                     traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁 GET $embedHost：失敗（HTTP ${embed.statusCode}，transport=${embed.transportError ?: "無"}）")
-                    handler.post { fail("直取失敗：Part${partIdx + 1} 嵌頁取不到") }
+                    handler.post {
+                        lastPartFailReason = "直取失敗：Part${partIdx + 1} 嵌頁取不到"
+                        decodePart(partIdx + 1)
+                    }
                     return@execute
                 }
                 val config = Regex("data-config=\"([^\"]+)\"").find(embed.body)?.groupValues?.getOrNull(1).orEmpty()
                 if (config.isEmpty()) {
                     traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁 GET $embedHost：HTTP ${embed.statusCode}，無 data-config（${embed.body.length}字節）")
-                    handler.post { fail("直取失敗：Part${partIdx + 1} 嵌頁無data-config") }
+                    handler.post {
+                        lastPartFailReason = "直取失敗：Part${partIdx + 1} 嵌頁無data-config"
+                        decodePart(partIdx + 1)
+                    }
                     return@execute
                 }
                 traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁 GET $embedHost：HTTP ${embed.statusCode}，data-config 長 ${config.length}")
@@ -798,12 +876,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                                 }
                                 if (fileUrl.isEmpty() || !(fileUrl.contains("/file.mp4") || fileUrl.contains(".m3u8"))) {
                                     traceJavhd(sessionId, "Part${partIdx + 1} 解嵌頁失敗：__jwSetup=${setup.orEmpty().take(120)}")
-                                    fail("直取失敗：Part${partIdx + 1} 直鏈未解出")
+                                    lastPartFailReason = "直取失敗：Part${partIdx + 1} 直鏈未解出"
+                                    decodePart(partIdx + 1)
                                     return@pollJs
                                 }
                                 traceJavhd(sessionId, "Part${partIdx + 1} 直鏈：$fileUrl")
                                 foundParts[partIdx] = fileUrl
-                                postAndFeed(partIdx + 1)
+                                decodePart(partIdx + 1)
                             }
                         }
                     }
