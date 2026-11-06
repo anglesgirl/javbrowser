@@ -779,8 +779,19 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         evalJs(main) {
                             pollJs("window.__jwSetup ? window.__jwSetup : ''", 10000) { setup ->
                                 if (done) return@pollJs
+                                // setup is already unquoted by pollJs
+                                // (it unquotes the evaluateJavascript
+                                // result once). Do NOT unquote it again:
+                                // unquoteJs on a JSON object string
+                                // returns null (JSONTokener yields a
+                                // JSONObject, not a String), so
+                                // JSONObject("") throws and fileUrl
+                                // comes out empty even though __jwSetup
+                                // holds the full config — that is why
+                                // the 08:52 run died here with a valid
+                                // __jwSetup in the trace.
                                 val fileUrl = try {
-                                    val obj = org.json.JSONObject(unquoteJs(setup).orEmpty())
+                                    val obj = org.json.JSONObject(setup.orEmpty())
                                     obj.optJSONArray("sources")?.optJSONObject(0)?.optString("file").orEmpty()
                                 } catch (e: Exception) {
                                     ""
