@@ -519,6 +519,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // Last per-Part failure, kept so the final message can say
         // which Part failed when nothing at all was decoded.
         var lastPartFailReason: String? = null
+        // The picker is launched at most once: surfaceParts() fires
+        // it as soon as the first direct link is decoded (the user
+        // asked: once an address is in hand, play it — do not wait
+        // for the other Parts); finish() must not fire it again.
+        var pickerLaunched = false
         var timeoutRunnable: Runnable by kotlin.properties.Delegates.notNull()
 
         fun finish(parts: List<Pair<String, String>>?, reason: String?) {
@@ -538,7 +543,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     resolverRecord(url, "resolver-javhd-direct", "$label 直接提取（跳過廣告）")
                 })
             }
-            callback(parts, reason)
+            // The picker was already launched by surfaceParts() with
+            // the first decoded Part(s); do not launch a second one
+            // (and do not fall back to the click path — the user is
+            // already choosing).
+            if (!pickerLaunched) {
+                callback(parts, reason)
+            }
         }
 
         fun fail(reason: String) {
@@ -557,6 +568,32 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 finish(parts, reason)
             } else {
                 finish(null, reason)
+            }
+        }
+
+        /** Surface the Parts decoded so far. Called after every
+         * successful decode (Phase 2): the first call launches the
+         * picker with the first direct link — the user asked that a
+         * decoded address be playable immediately instead of waiting
+         * for the remaining Parts. Later calls only refresh the
+         * session's candidate list (the picker polls the store and
+         * appends new rows live); the picker itself is launched at
+         * most once. Never throws. */
+        fun surfaceParts() {
+            if (done || foundParts.isEmpty()) return
+            val parts = foundParts.entries.map { (i, url) ->
+                (partLabels.getOrNull(i).orEmpty().ifEmpty { "Part${i + 1}" }) to url
+            }
+            for ((i, url) in foundParts) {
+                embedUrlByPart[i]?.let { javhdEmbedRefererByUrl[url] = it }
+            }
+            PlaybackDataStore.addCandidates(sessionId, parts.map { (label, url) ->
+                resolverRecord(url, "resolver-javhd-direct", "$label 直接提取（跳過廣告）")
+            })
+            if (!pickerLaunched) {
+                pickerLaunched = true
+                traceJavhd(sessionId, "直取先出：${parts.size} 個 Part 已解出，先出選擇（其餘後台繼續）")
+                callback(parts, null)
             }
         }
 
@@ -894,6 +931,12 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                                 }
                                 traceJavhd(sessionId, "Part${partIdx + 1} 直鏈：$fileUrl")
                                 foundParts[partIdx] = fileUrl
+                                // First address in hand: surface it now
+                                // (picker opens) instead of waiting for
+                                // the remaining Parts; they are appended
+                                // to the same session and the picker
+                                // refreshes live.
+                                surfaceParts()
                                 decodePart(partIdx + 1)
                             }
                         }

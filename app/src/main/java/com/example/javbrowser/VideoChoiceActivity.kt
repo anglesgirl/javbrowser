@@ -104,6 +104,10 @@ class VideoChoiceActivity : LocalizedActivity() {
     private var siteId = ""
     private var detailUrl = ""
     private var title = ""
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var refreshRunnable: Runnable? = null
+    private val candidates = mutableListOf<SniffCandidateRecord>()
+    private var adapter: ChoiceAdapter? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -112,24 +116,50 @@ class VideoChoiceActivity : LocalizedActivity() {
         siteId = intent.getStringExtra(EXTRA_SITE_ID).orEmpty()
         detailUrl = intent.getStringExtra(EXTRA_DETAIL_URL).orEmpty()
         title = intent.getStringExtra(EXTRA_TITLE).orEmpty()
-        val candidates = candidatesFromJson(intent.getStringExtra(EXTRA_CANDIDATES_JSON).orEmpty())
-        if (candidates.isEmpty()) {
+        val initial = candidatesFromJson(intent.getStringExtra(EXTRA_CANDIDATES_JSON).orEmpty())
+        if (initial.isEmpty()) {
             finish()
             return
         }
+        candidates.addAll(initial)
         findViewById<TextView>(R.id.tv_video_choice_title).text = title
         findViewById<TextView>(R.id.tv_video_choice_subtitle).text =
             tr("选择播放地址", "Choose video URL")
+        adapter = ChoiceAdapter(candidates) { index ->
+            finishWith(RESULT_KIND_PICK, index, candidates[index].url)
+        }
         findViewById<RecyclerView>(R.id.rv_video_choice).apply {
             layoutManager = LinearLayoutManager(this@VideoChoiceActivity)
-            adapter = ChoiceAdapter(candidates) { index ->
-                finishWith(RESULT_KIND_PICK, index, candidates[index].url)
-            }
+            adapter = this@VideoChoiceActivity.adapter
         }
         findViewById<Button>(R.id.btn_video_choice_back).setOnClickListener { finish() }
         findViewById<Button>(R.id.btn_video_choice_browser).setOnClickListener {
             finishWith(RESULT_KIND_BROWSER)
         }
+        // The resolver surfaces the first decoded Part immediately
+        // and decodes the rest in the background; refresh this list
+        // from the session store so later Parts appear live instead
+        // of needing a re-tap. Stops in onDestroy.
+        val poll = object : Runnable {
+            override fun run() {
+                val latest = PlaybackDataStore.snapshot().firstOrNull { it.id == sessionId }?.candidates.orEmpty()
+                val known = candidates.map { it.url }.toSet()
+                val fresh = latest.filter { it.url !in known }
+                if (fresh.isNotEmpty()) {
+                    val start = candidates.size
+                    candidates.addAll(fresh)
+                    adapter?.notifyItemRangeInserted(start, fresh.size)
+                }
+                handler.postDelayed(this, 1000)
+            }
+        }
+        refreshRunnable = poll
+        handler.postDelayed(poll, 1000)
+    }
+
+    override fun onDestroy() {
+        refreshRunnable?.let { handler.removeCallbacks(it) }
+        super.onDestroy()
     }
 
     private fun finishWith(kind: String, index: Int = -1, url: String? = null) {
