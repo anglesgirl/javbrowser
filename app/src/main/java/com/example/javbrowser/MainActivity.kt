@@ -1552,6 +1552,21 @@ class MainActivity : LocalizedActivity() {
             }
 
             @android.webkit.JavascriptInterface
+            fun openSiteBrowse(siteId: String, browseUrl: String) {
+                runOnUiThread {
+                    // Only the app-owned landing page may invoke this entry point.
+                    // Opens the site as a native list (standard-app style)
+                    // instead of loading its homepage in the browser.
+                    if (webView.url?.startsWith("https://javbrowser.app/") == true || isOnLandingPage()) {
+                        startActivity(Intent(this@MainActivity, UnifiedSearchActivity::class.java).apply {
+                            putExtra(UnifiedSearchActivity.EXTRA_BROWSE_SITE, siteId)
+                            putExtra(UnifiedSearchActivity.EXTRA_BROWSE_URL, browseUrl)
+                        })
+                    }
+                }
+            }
+
+            @android.webkit.JavascriptInterface
             fun navigateToUrl(url: String) {
                 runOnUiThread {
                     Toast.makeText(this@MainActivity, "Connecting...", Toast.LENGTH_SHORT).show()
@@ -6738,19 +6753,19 @@ class MainActivity : LocalizedActivity() {
                 <div class="divider">$directLinks</div>
                 <div class="site-grid">
                 
-                    <a href="javascript:Android.navigateToUrl('${domainConfig.getMissAvBaseUrl()}')">MissAV</a>
-                    <a href="javascript:Android.navigateToUrl('https://${domainConfig.getJableDomain()}/')">Jable</a>
-                    <a href="javascript:Android.navigateToUrl('https://${domainConfig.getRouVideoDomain()}/home')">Rou.Video</a>
-                    <a href="javascript:Android.navigateToUrl('https://${domainConfig.getAvJoyDomain()}/')">AvJoy</a>
-                    <a href="javascript:Android.navigateToUrl('https://pigav.ws/')">PigAV</a>
-                    <a href="javascript:Android.navigateToUrl('https://avtoday.io/cht/index.html')">AVToday</a>
-                    <a href="javascript:Android.navigateToUrl('https://www.javhdporn.net/')">JavHDPorn</a>
-                    <a href="javascript:Android.navigateToUrl('${domainConfig.get7MmTvBaseUrl()}')">7MMTV</a>
-                    <a href="javascript:Android.navigateToUrl('${domainConfig.getAvpleBaseUrl()}')">Avple</a>
-                    <a href="javascript:Android.navigateToUrl('${domainConfig.getWhosBaseUrl()}')">Whos.tv</a>
-                    <a href="javascript:Android.navigateToUrl('https://javday.app/')">JAVDAY</a>
-                    <a href="javascript:Android.navigateToUrl('https://supjav.com/')">SUPJAV</a>
-                    <a href="javascript:Android.navigateToUrl('https://www.javrate.com/')">JavRate</a>
+                    <a href="javascript:Android.openSiteBrowse('missav', '${domainConfig.getMissAvBaseUrl()}')">MissAV</a>
+                    <a href="javascript:Android.openSiteBrowse('jable', 'https://${domainConfig.getJableDomain()}/')">Jable</a>
+                    <a href="javascript:Android.openSiteBrowse('rou_video', 'https://${domainConfig.getRouVideoDomain()}/home')">Rou.Video</a>
+                    <a href="javascript:Android.openSiteBrowse('avjoy', 'https://${domainConfig.getAvJoyDomain()}/')">AvJoy</a>
+                    <a href="javascript:Android.openSiteBrowse('pigav', 'https://pigav.ws/')">PigAV</a>
+                    <a href="javascript:Android.openSiteBrowse('avtoday', 'https://avtoday.io/cht/index.html')">AVToday</a>
+                    <a href="javascript:Android.openSiteBrowse('javhd', 'https://www.javhdporn.net/')">JavHDPorn</a>
+                    <a href="javascript:Android.openSiteBrowse('7mmtv', '${domainConfig.get7MmTvBaseUrl()}')">7MMTV</a>
+                    <a href="javascript:Android.openSiteBrowse('avple', '${domainConfig.getAvpleBaseUrl()}')">Avple</a>
+                    <a href="javascript:Android.openSiteBrowse('whos', '${domainConfig.getWhosBaseUrl()}')">Whos.tv</a>
+                    <a href="javascript:Android.openSiteBrowse('javday', 'https://javday.app/')">JAVDAY</a>
+                    <a href="javascript:Android.openSiteBrowse('supjav', 'https://supjav.com/')">SUPJAV</a>
+                    <a href="javascript:Android.openSiteBrowse('javrate', 'https://www.javrate.com/')">JavRate</a>
                     <a href="javascript:Android.navigateToUrl('https://javdb.com/')">JavDB</a>
                     <a href="javascript:Android.navigateToUrl('https://javtrailers.com/ja/videos')">JavTrailers</a>
                     <a href="javascript:Android.navigateToUrl('https://zt.stripchat.com/')">Stripchat</a>

@@ -72,7 +72,10 @@ class UnifiedSearchRepository(
         }
         @Synchronized internal fun begin(bypass: Boolean, restored: Boolean) {
             emit()
-            if (!restored) request.siteIds.forEach { submit(it, null, false, bypass) }
+            // Browse mode seeds the first page with the site's own URL
+            // (request.browseUrl); a normal search passes null, which
+            // makes the provider build its search URL as before.
+            if (!restored) request.siteIds.forEach { submit(it, request.browseUrl, false, bypass) }
         }
         @Synchronized fun snapshot(): SearchSnapshot {
             val all = states.values.toList()

@@ -44,7 +44,14 @@ data class SearchRequest(
     val siteIds: List<String>,
     val configKey: String,
     val createdAt: Long = System.currentTimeMillis(),
-    val runMode: SearchRunMode = SearchRunMode.DEEP
+    val runMode: SearchRunMode = SearchRunMode.DEEP,
+    /**
+     * Browse mode: the first page token for the initial fetch. When set,
+     * the provider fetches this URL (a site's own latest/home page)
+     * instead of a search URL, so the site renders as a native list.
+     * Null means a normal search (first page token is null).
+     */
+    val browseUrl: String? = null
 )
 
 enum class SearchMatchType {

@@ -27,6 +27,9 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     companion object {
         const val EXTRA_QUERY = "unified_search_query"
         const val EXTRA_FORCE_CODE = "unified_search_force_code"
+        /** Browse mode: open one site as a native list (standard-app style). */
+        const val EXTRA_BROWSE_SITE = "unified_search_browse_site"
+        const val EXTRA_BROWSE_URL = "unified_search_browse_url"
 
         /** Embed page per extracted javhd file URL (file URL -> embed
          * URL). The player sends the embed page as Referer — the video
@@ -204,8 +207,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 openedSavedKey?.let { openSavedSearch(it) }
             }
         }
+        val browseSiteId = intent.getStringExtra(EXTRA_BROWSE_SITE)
+        val browseSiteUrl = intent.getStringExtra(EXTRA_BROWSE_URL)
         refreshSavedSearches {
-            if (savedInstanceState == null && queryEdit.text.toString().isNotBlank() && lastSnapshot == null) startSearch(false)
+            if (savedInstanceState == null && lastSnapshot == null) {
+                if (browseSiteId != null && browseSiteUrl != null) startBrowse(browseSiteId, browseSiteUrl)
+                else if (queryEdit.text.toString().isNotBlank()) startSearch(false)
+            }
         }
     }
 
@@ -1953,6 +1961,44 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         forceCodeForNextSearch = false
         activeRequestId = request.requestId
         session = repository.start(request, this, bypassCache)
+        hideSearchKeyboard()
+    }
+
+    /**
+     * Browse mode — the standard-app site screen. Lists one site's own
+     * latest/home page as native items, reusing that site's search
+     * provider (the browse URL is the first page token) and the native
+     * result list + tap-to-play flow (openResult). The search box and
+     * site chooser are hidden: this screen is one site, browsed.
+     */
+    private fun startBrowse(siteId: String, browseUrl: String) {
+        val site = sites.firstOrNull { it.id == siteId } ?: return
+        session?.cancel()
+        SearchSessionStore.remove(activeRequestId)
+        repository.close()
+        repository = UnifiedSearchRepository(this)
+        lastSnapshot = null
+        renderedSiteStates = null
+        adapter.setOrderFrozen(false)
+        readAnchor = null
+        restoredAnchor = null
+        openedSavedAt = null
+        openedSavedKey = null
+        panelState = SearchPanelState()
+        renderPanel()
+        adapter.submitItems(emptyList())
+        siteStatuses.removeAllViews()
+        findViewById<android.view.View>(R.id.unified_query_controls)?.visibility = android.view.View.GONE
+        findViewById<android.view.View>(R.id.unified_site_chooser_scroll)?.visibility = android.view.View.GONE
+        findViewById<android.view.View>(R.id.unified_selection_controls)?.visibility = android.view.View.GONE
+        statusText.text = LanguageManager.text(this, "正在載入 ${site.displayName}…", "Loading ${site.displayName}…")
+        val request = SearchRequest(
+            java.util.UUID.randomUUID().toString(), "", "", SearchMode.KEYWORD,
+            listOf(site.id), site.configurationKey,
+            runMode = SearchRunMode.BROWSE, browseUrl = browseUrl
+        )
+        activeRequestId = request.requestId
+        session = repository.start(request, this, true)
         hideSearchKeyboard()
     }
 
