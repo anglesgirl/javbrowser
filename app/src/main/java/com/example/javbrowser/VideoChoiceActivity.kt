@@ -24,7 +24,8 @@ internal fun candidateLabel(c: SniffCandidateRecord): String {
     // tells the rows apart.
     val part = Regex("^Part\\d+").find(c.evidence)?.value
     val prefix = if (part != null) "$part · " else ""
-    return "$prefix$type · $dur · $host · ${c.score}分"
+    val adMark = if (c.evidence.contains("疑似廣告")) "⚠疑似廣告 · " else ""
+    return "$adMark$prefix$type · $dur · $host · ${c.score}分"
 }
 
 /**

@@ -1827,8 +1827,34 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 val score = sc.score + if (duration != null && duration >= 60.0) 20 else 0
                 records += SniffCandidateRecord(sc.url, sc.source, score, evidence, kept, dropReason, duration)
             }
-            PlaybackDataStore.addCandidates(sessionId, records)
-            val kept = records.filter { it.kept }
+            // 自動分析廣告：同一詳情頁裡反覆出現的候選（同 host + 同類型
+            // + 同來源，如 12 個一模一樣的 10 分 mp4）幾乎總是廣告/預告
+            // 片，不是正片。先按 URL 去重，再把數量 ≥3 的簇折疊成一個
+            // 代表（其餘記為疑似廣告並篩掉），避免選擇器被同一條廣告
+            // 刷屏。代表仍保留並打上標記，播不通時可回退。
+            val seenUrls = mutableSetOf<String>()
+            val deduped = records.map { r ->
+                if (r.kept && !seenUrls.add(r.url)) r.copy(kept = false, dropReason = "重複地址")
+                else r
+            }
+            val clusterKey = { r: SniffCandidateRecord ->
+                val host = try { java.net.URL(r.url).host } catch (e: Exception) { "" }
+                val type = if (r.url.lowercase().contains(".m3u8")) "m3u8" else "mp4"
+                "$host|$type|${r.source}"
+            }
+            val clusterCounts = deduped.filter { it.kept }.groupingBy(clusterKey).eachCount()
+            val repSeen = mutableSetOf<String>()
+            val filtered = deduped.map { r ->
+                if (!r.kept) return@map r
+                val key = clusterKey(r)
+                val count = clusterCounts[key] ?: 0
+                if (count >= 3) {
+                    if (repSeen.add(key)) r.copy(evidence = "${r.evidence} · 疑似廣告×$count")
+                    else r.copy(kept = false, dropReason = "重複疑似廣告")
+                } else r
+            }
+            PlaybackDataStore.addCandidates(sessionId, filtered)
+            val kept = filtered.filter { it.kept }
             if (kept.isEmpty()) PlaybackDataStore.recordFail(sessionId, "找到 ${records.size} 個候選，全部被篩掉")
             kept
         } catch (e: Exception) {
