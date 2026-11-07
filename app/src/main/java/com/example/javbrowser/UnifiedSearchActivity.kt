@@ -313,15 +313,28 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     LanguageManager.text(this, "正在解析真实地址…", "Resolving real video URL…"),
                     android.widget.Toast.LENGTH_SHORT).show()
             }
-            tryResolveJavhdRealUrl(item, sessionId) { parts ->
-                if (isDestroyed || isFinishing) return@tryResolveJavhdRealUrl
-                if (parts != null) {
-                    showSniffPicker(item, parts.map { (label, url) ->
-                        resolverRecord(url, "resolver-javhd",
-                            if (label.isEmpty()) "解析直連（跳過廣告）" else "$label 解析直連（跳過廣告）")
-                    }, sessionId)
-                } else {
-                    BrowserNavigator.open(this, item.detailUrl)
+            // Primary: format-agnostic network sniff on the real page.
+            // Falls back to the old direct extraction (then the click
+            // path) when the sniff catches nothing.
+            resolveJavhdViaSniff(item, sessionId) { sniffed ->
+                if (isDestroyed || isFinishing) return@resolveJavhdViaSniff
+                if (sniffed != null) {
+                    val (kept, ads) = sniffed
+                    if (kept.isNotEmpty() || ads.isNotEmpty()) {
+                        showSniffPicker(item, kept, sessionId, ads)
+                        return@resolveJavhdViaSniff
+                    }
+                }
+                tryResolveJavhdRealUrl(item, sessionId) { parts ->
+                    if (isDestroyed || isFinishing) return@tryResolveJavhdRealUrl
+                    if (parts != null) {
+                        showSniffPicker(item, parts.map { (label, url) ->
+                            resolverRecord(url, "resolver-javhd",
+                                if (label.isEmpty()) "解析直連（跳過廣告）" else "$label 解析直連（跳過廣告）")
+                        }, sessionId)
+                    } else {
+                        BrowserNavigator.open(this, item.detailUrl)
+                    }
                 }
             }
             return
@@ -450,18 +463,31 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * falls back to WebView. Never throws.
      */
     /**
-     * Primary javhdporn resolver: direct extraction, no page clicks.
-     * Chain (proven 2026-11-05, no WebView browsing, no ads):
-     * detail HTML (ECH) -> a.srv tokens -> bundled cast.js computes
-     * `sources` -> POST /api/play/ (ECH) -> the handler's own .done()
-     * (binddata) decodes the embed URL -> embed HTML (ECH) -> bundled
-     * embed main.js decodes the vdcdn file URL. Any step failing falls
-     * back to the hidden-WebView click path (resolveJavhdViaClick).
+     * Fallback javhdporn resolver: direct extraction, no page clicks.
+     * (Primary since 2026-11-08 is the network sniff,
+     * resolveJavhdViaSniff; this chain only runs when the sniff
+     * catches nothing.) Chain (proven 2026-11-05, no WebView
+     * browsing, no ads): detail HTML (ECH) -> a.srv tokens -> bundled
+     * cast.js computes `sources` -> POST /api/play/ (ECH) -> the
+     * handler's own .done() (binddata) decodes the embed URL -> embed
+     * HTML (ECH) -> bundled embed main.js decodes the vdcdn file URL.
+     * Any step failing falls back to the hidden-WebView click path
+     * (resolveJavhdViaClick).
      */
     /** Trace clock for the javhd resolve log: reset at the start of
      * each sniff so every trace line carries a relative timestamp
      * (where it stuck is visible from the gaps). */
     private var javhdTraceT0 = 0L
+
+    /** Ad hosts blocked outright in javhd hidden WebViews (popunders,
+     * VAST, the paid-SMS scam creatives). The video file host and the
+     * embed host are NOT in this list. Shared by the click fallback
+     * and the network-sniff path. */
+    private val javhdAdHosts = listOf(
+        "whitetrafsa", "content-sync.xyz", "alaphoid.com", "udzpel.com",
+        "jads.co", "wpadmngr.com", "xlviirdr.com", "xlirdr.com",
+        "javhdporn.live", "javhd-trk.com", "vivodemisrentas.net",
+    )
 
     /** One trace line for the current javhd sniff, shown in 播放數據
      * under 過程 and copied with it. Never throws. */
@@ -487,6 +513,250 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 return@resolveJavhdDirect
             }
             resolveJavhdViaClick(item, sessionId, directFail, callback)
+        }
+    }
+
+    /**
+     * Primary javhdporn resolver (2026-11-08): format-agnostic network
+     * sniff on the real detail page. Loads the page in a hidden ECH
+     * WebView, lets the site's own JS run, and catches whatever video
+     * file (m3u8/mp4) it requests via shouldInterceptRequest — no
+     * token parsing, no bundled cast.js sandbox, no /api/play/ call,
+     * so a site reskin (data-link -> data-mpu -> whatever is next)
+     * cannot break it. The only invariant is the one that never
+     * changes: a video page eventually requests a video file.
+     * A generic player-area click triggers loading when the page does
+     * not auto-load; it never looks for a specific a.srv/Server link.
+     * Caught URLs go through the same filter as static sniffing
+     * (filterSniffCandidates: ad keywords, <60s m3u8, dedupe, repeat
+     * clusters), so the picker's 疑似廣告 folding applies unchanged.
+     * Callback on the UI thread with (kept, ads), or null when nothing
+     * was sniffed — the caller then falls back to the old direct
+     * extraction. Never throws.
+     */
+    private fun resolveJavhdViaSniff(
+        item: SearchItem,
+        sessionId: Long,
+        callback: (Pair<List<SniffCandidateRecord>, List<SniffCandidateRecord>>?) -> Unit,
+    ) {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        var hiddenWebView: android.webkit.WebView? = null
+        var done = false
+        var setupDone = false
+        var pageFinished = false
+        var pageStarted = false
+        var maxProgress = 0
+        var lastLoadError: String? = null
+        var clickCount = 0
+        var finishScheduled = false
+        val foundUrls = LinkedHashSet<String>()
+        val mediaHosts = LinkedHashSet<String>()
+        val pageSlug = item.detailUrl.trimEnd('/').substringAfterLast('/')
+        var timeoutRunnable: Runnable by kotlin.properties.Delegates.notNull()
+        var finishRunnable: Runnable? = null
+        var clickRunnable: Runnable? = null
+
+        /** A real video file: the extension must terminate the path
+         * (query/fragment stripped) so "...Episode-1.mp4_snapshot_
+         * 05.21_....webp" thumbnails never match as mp4 — same rule
+         * as VideoPageSniffer's loose match. */
+        fun isVideoFile(url: String): Boolean {
+            val clean = url.substringBefore('?').substringBefore('#').lowercase()
+            return clean.endsWith(".m3u8") || clean.endsWith(".mp4")
+        }
+
+        fun finish() {
+            if (done) return
+            done = true
+            handler.removeCallbacks(timeoutRunnable)
+            finishRunnable?.let { handler.removeCallbacks(it) }
+            clickRunnable?.let { handler.removeCallbacks(it) }
+            hiddenWebView?.destroy()
+            hiddenWebView = null
+            if (foundUrls.isEmpty()) {
+                val media = if (mediaHosts.isEmpty()) "無" else mediaHosts.take(3).joinToString(",")
+                val err = lastLoadError?.let { "；$it" } ?: ""
+                val reason = "javhd嗅探失敗 [$pageSlug]：未攔到視頻文件；媒體host=$media$err"
+                traceJavhd(sessionId, "嗅探失敗：$reason")
+                PlaybackDataStore.recordFail(sessionId, reason)
+                callback(null)
+                return
+            }
+            traceJavhd(sessionId, "嗅探完成：攔到 ${foundUrls.size} 個視頻地址")
+            val site = sites.firstOrNull { it.id == item.siteId }
+            if (site == null) {
+                callback(null)
+                return
+            }
+            // Filter on a worker thread (m3u8 duration fetches), then
+            // report on the UI thread.
+            val html = foundUrls.joinToString("\n")
+            SearchScheduler.workers.execute {
+                val scored = try {
+                    VideoPageSniffer.sniffScored(html, item.detailUrl, item.code)
+                } catch (e: Exception) {
+                    emptyList()
+                }
+                val result = try {
+                    filterSniffCandidates(scored, site, sessionId)
+                } catch (e: Exception) {
+                    emptyList<SniffCandidateRecord>() to emptyList()
+                }
+                handler.post {
+                    if (isDestroyed || isFinishing) return@post
+                    callback(result)
+                }
+            }
+        }
+
+        /** Grace window: let stragglers (other Parts / qualities)
+         * arrive before filtering. Scheduled at most once. */
+        fun scheduleFinish() {
+            if (done || finishScheduled) return
+            finishScheduled = true
+            finishRunnable = Runnable { finish() }
+            handler.postDelayed(finishRunnable!!, 3000)
+        }
+
+        /** Generic player-area click: tries the video element and the
+         * usual player/play selectors in order. Never looks for a
+         * specific a.srv/Server link — the site's own JS decides what
+         * a play click loads. */
+        fun clickPlayer() {
+            if (done) return
+            clickCount++
+            traceJavhd(sessionId, "嗅探點擊播放器（第 $clickCount 次）")
+            hiddenWebView?.evaluateJavascript(
+                "(function(){" +
+                    "var s=['video','#mainvideo','.video-player','#video-player','[class*=\"video-player\"]','#overlay','[id*=\"play\"]','[class*=\"play\"]'];" +
+                    "for(var i=0;i<s.length;i++){" +
+                    "var el=document.querySelector(s[i]);" +
+                    "if(el){try{if(el.tagName==='VIDEO'){el.play();}else{el.click();}}catch(e){}return 'clicked:'+s[i];}}" +
+                    "return 'no element found';})();",
+            ) { value ->
+                if (!done) {
+                    val s = value?.trim()?.removeSurrounding("\"").orEmpty()
+                    traceJavhd(sessionId, "嗅探點擊結果：$s")
+                }
+            }
+        }
+
+        timeoutRunnable = Runnable { finish() }
+        handler.post {
+            val wv = android.webkit.WebView(this)
+            hiddenWebView = wv
+            wv.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                mediaPlaybackRequiresUserGesture = false
+                // Never serve this page from cache: a page that once failed
+                // sticks dead in the shared WebView cache (known app
+                // behaviour — only clearing the app cache revives it).
+                cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
+            }
+            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+            wv.webChromeClient = object : android.webkit.WebChromeClient() {
+                override fun onProgressChanged(view: android.webkit.WebView?, newProgress: Int) {
+                    if (newProgress > maxProgress) maxProgress = newProgress
+                }
+            }
+            wv.webViewClient = object : android.webkit.WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: android.webkit.WebView?,
+                    request: android.webkit.WebResourceRequest?
+                ): android.webkit.WebResourceResponse? {
+                    val reqUrl = request?.url?.toString() ?: return null
+                    if (javhdAdHosts.any { reqUrl.contains(it) }) {
+                        return android.webkit.WebResourceResponse("text/plain", "utf-8",
+                            java.io.ByteArrayInputStream(ByteArray(0)))
+                    }
+                    if (reqUrl.contains(".mp4") || reqUrl.contains(".m3u8") || reqUrl.contains(".ts")) {
+                        try {
+                            val h = java.net.URL(reqUrl).host
+                            if (mediaHosts.add(h)) traceJavhd(sessionId, "媒體請求：$h")
+                        } catch (e: Exception) { }
+                    }
+                    if (isVideoFile(reqUrl)) {
+                        handler.post {
+                            if (!done && foundUrls.add(reqUrl)) {
+                                traceJavhd(sessionId, "嗅探攔到：${reqUrl.take(120)}")
+                                if (pageFinished) scheduleFinish()
+                            }
+                        }
+                        // Let the request proceed: the page's own player
+                        // needs the bytes, and we only need the URL.
+                        // Fall through to ECH/default below.
+                    }
+                    // ECH: same treatment as the main browser — GET
+                    // requests to hosts with an ECH config ride the
+                    // app-layer stack instead of WebView's plaintext
+                    // TLS. Hosts without a config fall through to
+                    // WebView default as before.
+                    if (request?.method.equals("GET", ignoreCase = true) == true) {
+                        EchH3Router.fetchWebViewResource(
+                            reqUrl, request?.requestHeaders, request?.isForMainFrame == true,
+                        )?.let { return it }
+                    }
+                    return null
+                }
+
+                override fun onPageStarted(view: android.webkit.WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                    super.onPageStarted(view, url, favicon)
+                    if (!pageStarted) traceJavhd(sessionId, "嗅探頁面開始加載：${url?.take(100)}")
+                    pageStarted = true
+                }
+
+                override fun onReceivedError(
+                    view: android.webkit.WebView?,
+                    request: android.webkit.WebResourceRequest?,
+                    error: android.webkit.WebResourceError?,
+                ) {
+                    super.onReceivedError(view, request, error)
+                    if (lastLoadError == null && error != null) {
+                        lastLoadError = "錯誤 ${request?.url?.host ?: "?"} ${error.errorCode} ${error.description}"
+                        traceJavhd(sessionId, "嗅探頁面錯誤：$lastLoadError")
+                    }
+                }
+
+                override fun onReceivedHttpError(
+                    view: android.webkit.WebView?,
+                    request: android.webkit.WebResourceRequest?,
+                    errorResponse: android.webkit.WebResourceResponse?,
+                ) {
+                    super.onReceivedHttpError(view, request, errorResponse)
+                    if (lastLoadError == null && errorResponse != null) {
+                        lastLoadError = "HTTP ${errorResponse.statusCode} ${request?.url?.host ?: "?"}"
+                        traceJavhd(sessionId, "嗅探頁面錯誤：$lastLoadError")
+                    }
+                }
+
+                override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    if (setupDone || done) return
+                    setupDone = true
+                    pageFinished = true
+                    traceJavhd(sessionId, "嗅探頁面完成加載（進度 $maxProgress%）")
+                    // If the player auto-loaded, a candidate may already
+                    // be in hand; otherwise trigger it generically.
+                    handler.postDelayed({
+                        if (done) return@postDelayed
+                        if (foundUrls.isEmpty()) {
+                            clickPlayer()
+                            // One retry: the first click is sometimes a no-op.
+                            clickRunnable = Runnable {
+                                if (!done && foundUrls.isEmpty()) clickPlayer()
+                            }
+                            handler.postDelayed(clickRunnable!!, 8000)
+                        } else {
+                            scheduleFinish()
+                        }
+                    }, 2000)
+                }
+            }
+            wv.loadUrl(item.detailUrl)
+            traceJavhd(sessionId, "嗅探開始：載入 ${item.detailUrl}")
+            handler.postDelayed(timeoutRunnable, 45000)
         }
     }
 
@@ -1229,15 +1499,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         val mediaHosts = LinkedHashSet<String>()
         val pageSlug = item.detailUrl.trimEnd('/').substringAfterLast('/')
 
-        // Ad hosts seen on the detail + embed pages (popunders, VAST,
-        // the paid-SMS scam creatives). Blocked outright in this hidden
-        // WebView so the resolve never runs any of them. The video file
-        // host (vdcdn.xyz) and the embed host are NOT in this list.
-        val adHosts = listOf(
-            "whitetrafsa", "content-sync.xyz", "alaphoid.com", "udzpel.com",
-            "jads.co", "wpadmngr.com", "xlviirdr.com", "xlirdr.com",
-            "javhdporn.live", "javhd-trk.com", "vivodemisrentas.net",
-        )
+        // Ad hosts (see javhdAdHosts) are blocked outright in this
+        // hidden WebView so the resolve never runs any of them.
 
         /** Step-level failure reason for the 播放數據 screen. Never throws. */
         fun javhdFailReason(): String {
@@ -1458,7 +1721,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     request: android.webkit.WebResourceRequest?
                 ): android.webkit.WebResourceResponse? {
                     val reqUrl = request?.url?.toString() ?: return null
-                    if (adHosts.any { reqUrl.contains(it) }) {
+                    if (javhdAdHosts.any { reqUrl.contains(it) }) {
                         return android.webkit.WebResourceResponse("text/plain", "utf-8",
                             java.io.ByteArrayInputStream(ByteArray(0)))
                     }
@@ -1812,61 +2075,79 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 PlaybackDataStore.recordFail(sessionId, "詳情頁為空")
                 return emptyList<SniffCandidateRecord>() to emptyList()
             }
-            val records = mutableListOf<SniffCandidateRecord>()
-            for (sc in VideoPageSniffer.sniffScored(response.body, item.detailUrl, item.code)) {
-                val duration = if (sc.kept) m3u8Duration(sc.url, site) else null
-                val (kept, dropReason, evidence) = when {
-                    !sc.kept -> Triple(false, sc.dropReason, sc.evidence)
-                    duration != null && duration < 60.0 -> Triple(
-                        false, "m3u8時長<60s疑似廣告",
-                        "${sc.evidence} · m3u8 ${duration.toInt()}秒",
-                    )
-                    duration != null -> Triple(
-                        true, null,
-                        "${sc.evidence} · m3u8 ${(duration / 60).toInt()}:${(duration % 60).toInt().toString().padStart(2, '0')}",
-                    )
-                    else -> Triple(true, null, sc.evidence)
-                }
-                val score = sc.score + if (duration != null && duration >= 60.0) 20 else 0
-                records += SniffCandidateRecord(sc.url, sc.source, score, evidence, kept, dropReason, duration)
-            }
-            // 自動分析廣告：同一詳情頁裡反覆出現的候選（同 host + 同類型
-            // + 同來源，如 12 個一模一樣的 10 分 mp4）幾乎總是廣告/預告
-            // 片，不是正片。先按 URL 去重，再把數量 ≥3 的簇整組標為疑似
-            // 廣告，折疊進選擇器的「疑似廣告」分組（點開可取回），避免
-            // 選擇器被同一條廣告刷屏。
-            val seenUrls = mutableSetOf<String>()
-            val deduped = records.map { r ->
-                if (r.kept && !seenUrls.add(r.url)) r.copy(kept = false, dropReason = "重複地址")
-                else r
-            }
-            val clusterKey = { r: SniffCandidateRecord ->
-                val host = try { java.net.URL(r.url).host } catch (e: Exception) { "" }
-                val type = if (r.url.lowercase().contains(".m3u8")) "m3u8" else "mp4"
-                "$host|$type|${r.source}"
-            }
-            val clusterCounts = deduped.filter { it.kept }.groupingBy(clusterKey).eachCount()
-            val filtered = deduped.map { r ->
-                if (!r.kept) return@map r
-                val key = clusterKey(r)
-                val count = clusterCounts[key] ?: 0
-                if (count >= 3) r.copy(
-                    kept = false, dropReason = "重複疑似廣告",
-                    evidence = "${r.evidence} · 疑似廣告×$count",
-                ) else r
-            }
-            PlaybackDataStore.addCandidates(sessionId, filtered)
-            val kept = filtered.filter { it.kept }
-            // Folded ads: dropped as ads (ad keywords, <60s m3u8, or a
-            // repeated low-confidence cluster). The picker shows them
-            // collapsed under 「疑似廣告」 so a wrong call can be undone.
-            val ads = filtered.filter { !it.kept && (it.dropReason?.contains("廣告") == true) }
-            if (kept.isEmpty() && ads.isEmpty()) PlaybackDataStore.recordFail(sessionId, "找到 ${records.size} 個候選，全部被篩掉")
-            kept to ads
+            filterSniffCandidates(
+                VideoPageSniffer.sniffScored(response.body, item.detailUrl, item.code),
+                site, sessionId,
+            )
         } catch (e: Exception) {
             PlaybackDataStore.recordFail(sessionId, "嗅探異常：${e.message}")
             emptyList<SniffCandidateRecord>() to emptyList()
         }
+    }
+
+    /**
+     * Shared candidate filter: m3u8 duration, URL dedupe, repeat-cluster
+     * ad folding. Identical for static HTML sniffing and live network
+     * sniffing, so both paths produce the same (kept, ads) and the
+     * picker's 疑似廣告 folding applies unchanged. Runs on a worker
+     * thread (m3u8Duration fetches). Never throws.
+     */
+    private fun filterSniffCandidates(
+        scored: List<VideoPageSniffer.ScoredCandidate>,
+        site: SearchSite,
+        sessionId: Long,
+    ): Pair<List<SniffCandidateRecord>, List<SniffCandidateRecord>> {
+        val records = mutableListOf<SniffCandidateRecord>()
+        for (sc in scored) {
+            val duration = if (sc.kept) m3u8Duration(sc.url, site) else null
+            val (kept, dropReason, evidence) = when {
+                !sc.kept -> Triple(false, sc.dropReason, sc.evidence)
+                duration != null && duration < 60.0 -> Triple(
+                    false, "m3u8時長<60s疑似廣告",
+                    "${sc.evidence} · m3u8 ${duration.toInt()}秒",
+                )
+                duration != null -> Triple(
+                    true, null,
+                    "${sc.evidence} · m3u8 ${(duration / 60).toInt()}:${(duration % 60).toInt().toString().padStart(2, '0')}",
+                )
+                else -> Triple(true, null, sc.evidence)
+            }
+            val score = sc.score + if (duration != null && duration >= 60.0) 20 else 0
+            records += SniffCandidateRecord(sc.url, sc.source, score, evidence, kept, dropReason, duration)
+        }
+        // 自動分析廣告：同一詳情頁裡反覆出現的候選（同 host + 同類型
+        // + 同來源，如 12 個一模一樣的 10 分 mp4）幾乎總是廣告/預告
+        // 片，不是正片。先按 URL 去重，再把數量 ≥3 的簇整組標為疑似
+        // 廣告，折疊進選擇器的「疑似廣告」分組（點開可取回），避免
+        // 選擇器被同一條廣告刷屏。
+        val seenUrls = mutableSetOf<String>()
+        val deduped = records.map { r ->
+            if (r.kept && !seenUrls.add(r.url)) r.copy(kept = false, dropReason = "重複地址")
+            else r
+        }
+        val clusterKey = { r: SniffCandidateRecord ->
+            val host = try { java.net.URL(r.url).host } catch (e: Exception) { "" }
+            val type = if (r.url.lowercase().contains(".m3u8")) "m3u8" else "mp4"
+            "$host|$type|${r.source}"
+        }
+        val clusterCounts = deduped.filter { it.kept }.groupingBy(clusterKey).eachCount()
+        val filtered = deduped.map { r ->
+            if (!r.kept) return@map r
+            val key = clusterKey(r)
+            val count = clusterCounts[key] ?: 0
+            if (count >= 3) r.copy(
+                kept = false, dropReason = "重複疑似廣告",
+                evidence = "${r.evidence} · 疑似廣告×$count",
+            ) else r
+        }
+        PlaybackDataStore.addCandidates(sessionId, filtered)
+        val kept = filtered.filter { it.kept }
+        // Folded ads: dropped as ads (ad keywords, <60s m3u8, or a
+        // repeated low-confidence cluster). The picker shows them
+        // collapsed under 「疑似廣告」 so a wrong call can be undone.
+        val ads = filtered.filter { !it.kept && (it.dropReason?.contains("廣告") == true) }
+        if (kept.isEmpty() && ads.isEmpty()) PlaybackDataStore.recordFail(sessionId, "找到 ${records.size} 個候選，全部被篩掉")
+        return kept to ads
     }
 
     /**
