@@ -47,19 +47,21 @@ class VideoChoiceActivity : LocalizedActivity() {
         const val EXTRA_DETAIL_URL = "video_choice_detail_url"
         const val EXTRA_SESSION_ID = "video_choice_session_id"
         const val EXTRA_CANDIDATES_JSON = "video_choice_candidates_json"
+        const val EXTRA_AD_CANDIDATES_JSON = "video_choice_ad_candidates_json"
         const val EXTRA_RESULT_KIND = "video_choice_result_kind"
         const val EXTRA_PICKED_INDEX = "video_choice_picked_index"
         const val EXTRA_PICKED_URL = "video_choice_picked_url"
         const val RESULT_KIND_PICK = "pick"
         const val RESULT_KIND_BROWSER = "browser"
 
-        fun intent(context: Context, item: SearchItem, candidates: List<SniffCandidateRecord>, sessionId: Long): Intent =
+        fun intent(context: Context, item: SearchItem, candidates: List<SniffCandidateRecord>, sessionId: Long, ads: List<SniffCandidateRecord> = emptyList()): Intent =
             Intent(context, VideoChoiceActivity::class.java).apply {
                 putExtra(EXTRA_TITLE, item.title)
                 putExtra(EXTRA_SITE_ID, item.siteId)
                 putExtra(EXTRA_DETAIL_URL, item.detailUrl)
                 putExtra(EXTRA_SESSION_ID, sessionId)
                 putExtra(EXTRA_CANDIDATES_JSON, candidatesToJson(candidates))
+                putExtra(EXTRA_AD_CANDIDATES_JSON, candidatesToJson(ads))
             }
 
         fun candidatesToJson(candidates: List<SniffCandidateRecord>): String {
@@ -108,6 +110,8 @@ class VideoChoiceActivity : LocalizedActivity() {
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
     private var refreshRunnable: Runnable? = null
     private val candidates = mutableListOf<SniffCandidateRecord>()
+    private val adCandidates = mutableListOf<SniffCandidateRecord>()
+    private var adsExpanded = false
     private var adapter: ChoiceAdapter? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -118,21 +122,26 @@ class VideoChoiceActivity : LocalizedActivity() {
         detailUrl = intent.getStringExtra(EXTRA_DETAIL_URL).orEmpty()
         title = intent.getStringExtra(EXTRA_TITLE).orEmpty()
         val initial = candidatesFromJson(intent.getStringExtra(EXTRA_CANDIDATES_JSON).orEmpty())
-        if (initial.isEmpty()) {
+        val initialAds = candidatesFromJson(intent.getStringExtra(EXTRA_AD_CANDIDATES_JSON).orEmpty())
+        if (initial.isEmpty() && initialAds.isEmpty()) {
             finish()
             return
         }
         candidates.addAll(initial)
+        adCandidates.addAll(initialAds)
+        // No kept candidate at all: open the folded ads so the user
+        // still sees something playable instead of an empty list.
+        adsExpanded = candidates.isEmpty() && adCandidates.isNotEmpty()
         findViewById<TextView>(R.id.tv_video_choice_title).text = title
         findViewById<TextView>(R.id.tv_video_choice_subtitle).text =
             tr("选择播放地址", "Choose video URL")
-        adapter = ChoiceAdapter(candidates) { index ->
-            val url = candidates[index].url
+        adapter = ChoiceAdapter(candidates, adCandidates, adsExpanded, { record, rank ->
+            val url = record.url
             // Record the pick here: the picker no longer finishes on
             // pick (it stays alive so back from the player returns to
             // the list), so the choiceLauncher in UnifiedSearchActivity
             // never sees this pick.
-            PlaybackDataStore.recordPick(sessionId, url, index)
+            PlaybackDataStore.recordPick(sessionId, url, rank)
             val target = if (siteId == SearchSiteIds.JAVHD || siteId == SearchSiteIds.HENTAIMAMA) {
                 NativePlayerActivity::class.java
             } else {
@@ -153,6 +162,9 @@ class VideoChoiceActivity : LocalizedActivity() {
             // Do NOT finish: the list stays, and back from the player
             // returns here instead of losing the list and forcing a
             // re-tap plus a full re-extraction.
+        }) {
+            adsExpanded = !adsExpanded
+            adapter?.setAdsExpanded(adsExpanded)
         }
         findViewById<RecyclerView>(R.id.rv_video_choice).apply {
             layoutManager = LinearLayoutManager(this@VideoChoiceActivity)
@@ -169,12 +181,23 @@ class VideoChoiceActivity : LocalizedActivity() {
         val poll = object : Runnable {
             override fun run() {
                 val latest = PlaybackDataStore.snapshot().firstOrNull { it.id == sessionId }?.candidates.orEmpty()
-                val known = candidates.map { it.url }.toSet()
+                val known = (candidates + adCandidates).map { it.url }.toSet()
                 val fresh = latest.filter { it.url !in known }
                 if (fresh.isNotEmpty()) {
-                    val start = candidates.size
-                    candidates.addAll(fresh)
-                    adapter?.notifyItemRangeInserted(start, fresh.size)
+                    val freshMain = fresh.filter { it.kept }
+                    val freshAds = fresh.filter { !it.kept && (it.dropReason?.contains("廣告") == true) }
+                    var changed = false
+                    if (freshMain.isNotEmpty()) {
+                        candidates.addAll(freshMain)
+                        changed = true
+                    }
+                    if (freshAds.isNotEmpty()) {
+                        adCandidates.addAll(freshAds)
+                        changed = true
+                    }
+                    // The ad-group header shifts when main grows, so a
+                    // full refresh is the safe notify here.
+                    if (changed) adapter?.notifyDataSetChanged()
                 }
                 handler.postDelayed(this, 1000)
             }
@@ -203,13 +226,41 @@ class VideoChoiceActivity : LocalizedActivity() {
 
     private fun tr(zh: String, en: String) = LanguageManager.text(this, zh, en)
 
+    /**
+     * Main candidates, then one collapsible 「疑似廣告」 header row, then
+     * the folded ad candidates when expanded. Tapping the header folds /
+     * unfolds the group, so a wrong ad call can be undone by picking one
+     * of the folded rows. The ad rows reuse the same row layout and the
+     * same play path as the main rows.
+     */
     private class ChoiceAdapter(
-        private val candidates: List<SniffCandidateRecord>,
-        private val onPick: (Int) -> Unit,
+        private val main: MutableList<SniffCandidateRecord>,
+        private val ads: MutableList<SniffCandidateRecord>,
+        private var adsExpanded: Boolean,
+        private val onPick: (SniffCandidateRecord, Int) -> Unit,
+        private val onToggleAds: () -> Unit,
     ) : RecyclerView.Adapter<ChoiceAdapter.ViewHolder>() {
 
         class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
             val text: TextView = view.findViewById(R.id.tv_choice_row)
+        }
+
+        fun setAdsExpanded(expanded: Boolean) {
+            adsExpanded = expanded
+            notifyDataSetChanged()
+        }
+
+        override fun getItemCount(): Int {
+            if (ads.isEmpty()) return main.size
+            return main.size + 1 + if (adsExpanded) ads.size else 0
+        }
+
+        override fun getItemViewType(position: Int): Int {
+            return when {
+                position < main.size -> 0
+                position == main.size -> 1
+                else -> 2
+            }
         }
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder =
@@ -217,10 +268,24 @@ class VideoChoiceActivity : LocalizedActivity() {
                 .inflate(R.layout.item_choice_row, parent, false))
 
         override fun onBindViewHolder(holder: ViewHolder, position: Int) {
-            holder.text.text = candidateLabel(candidates[position])
-            holder.itemView.setOnClickListener { onPick(position) }
+            when (getItemViewType(position)) {
+                0 -> {
+                    val c = main[position]
+                    holder.text.text = candidateLabel(c)
+                    holder.itemView.setOnClickListener { onPick(c, position) }
+                }
+                1 -> {
+                    holder.text.text = if (adsExpanded) "⚠疑似廣告 (${ads.size}) — 點擊收起"
+                    else "⚠疑似廣告 (${ads.size}) — 點擊展開"
+                    holder.itemView.setOnClickListener { onToggleAds() }
+                }
+                else -> {
+                    val adIndex = position - main.size - 1
+                    val c = ads[adIndex]
+                    holder.text.text = candidateLabel(c)
+                    holder.itemView.setOnClickListener { onPick(c, main.size + adIndex) }
+                }
+            }
         }
-
-        override fun getItemCount(): Int = candidates.size
     }
 }

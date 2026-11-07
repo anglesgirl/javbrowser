@@ -348,12 +348,12 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             return
         }
         SearchScheduler.workers.execute {
-            val candidates = trySniffVideoCandidates(item, sessionId)
+            val (candidates, ads) = trySniffVideoCandidates(item, sessionId)
             runOnUiThread {
-                if (candidates.isEmpty()) {
+                if (candidates.isEmpty() && ads.isEmpty()) {
                     BrowserNavigator.open(this, item.detailUrl)
                 } else {
-                    showSniffPicker(item, candidates, sessionId)
+                    showSniffPicker(item, candidates, sessionId, ads)
                 }
             }
         }
@@ -1597,9 +1597,9 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     }
 
     /** Lists sniffed candidates with their m3u8 duration, score and source — now a full page, not a dialog. Never throws. */
-    private fun showSniffPicker(item: SearchItem, candidates: List<SniffCandidateRecord>, sessionId: Long) {
+    private fun showSniffPicker(item: SearchItem, candidates: List<SniffCandidateRecord>, sessionId: Long, ads: List<SniffCandidateRecord> = emptyList()) {
         if (isDestroyed || isFinishing) return
-        choiceLauncher.launch(VideoChoiceActivity.intent(this, item, candidates, sessionId))
+        choiceLauncher.launch(VideoChoiceActivity.intent(this, item, candidates, sessionId, ads))
     }
 
     /** Returns sniffed candidates (proven <60s m3u8 ads excluded), or empty to fall back to WebView. Never throws. */
@@ -1775,21 +1775,24 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * empty to fall back to WebView. Every candidate — kept and dropped —
      * is recorded against the session with its score, source and drop
      * reason, so the analysis can see which signal actually predicted a
-     * real play. Never throws.
+     * real play. Never throws. The second list is the folded ads: dropped
+     * as ads (ad keywords, <60s m3u8, or a repeated low-confidence
+     * cluster). The picker shows them collapsed under 「疑似廣告」 so a
+     * wrong call can be undone by expanding the group.
      */
-    private fun trySniffVideoCandidates(item: SearchItem, sessionId: Long): List<SniffCandidateRecord> {
+    private fun trySniffVideoCandidates(item: SearchItem, sessionId: Long): Pair<List<SniffCandidateRecord>, List<SniffCandidateRecord>> {
         return try {
             val host = try { java.net.URL(item.detailUrl).host } catch (e: Exception) {
                 PlaybackDataStore.recordFail(sessionId, "詳情頁地址無效")
-                return emptyList()
+                return emptyList<SniffCandidateRecord>() to emptyList()
             }
             if (EchDoh.configFor(host) == null) {
                 PlaybackDataStore.recordFail(sessionId, "無ECH設定，不嗅探")
-                return emptyList()
+                return emptyList<SniffCandidateRecord>() to emptyList()
             }
             val site = sites.firstOrNull { it.id == item.siteId } ?: run {
                 PlaybackDataStore.recordFail(sessionId, "站點未註冊")
-                return emptyList()
+                return emptyList<SniffCandidateRecord>() to emptyList()
             }
             runOnUiThread {
                 android.widget.Toast.makeText(this,
@@ -1799,15 +1802,15 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             val response = SearchHttpFetcher().fetch(item.detailUrl, SearchCancellation(), site)
             if (response.transportError != null) {
                 PlaybackDataStore.recordFail(sessionId, "取詳情頁失敗：${response.transportError}")
-                return emptyList()
+                return emptyList<SniffCandidateRecord>() to emptyList()
             }
             if (response.statusCode !in 200..299) {
                 PlaybackDataStore.recordFail(sessionId, "詳情頁HTTP ${response.statusCode}")
-                return emptyList()
+                return emptyList<SniffCandidateRecord>() to emptyList()
             }
             if (response.body.isBlank()) {
                 PlaybackDataStore.recordFail(sessionId, "詳情頁為空")
-                return emptyList()
+                return emptyList<SniffCandidateRecord>() to emptyList()
             }
             val records = mutableListOf<SniffCandidateRecord>()
             for (sc in VideoPageSniffer.sniffScored(response.body, item.detailUrl, item.code)) {
@@ -1829,9 +1832,9 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             }
             // 自動分析廣告：同一詳情頁裡反覆出現的候選（同 host + 同類型
             // + 同來源，如 12 個一模一樣的 10 分 mp4）幾乎總是廣告/預告
-            // 片，不是正片。先按 URL 去重，再把數量 ≥3 的簇折疊成一個
-            // 代表（其餘記為疑似廣告並篩掉），避免選擇器被同一條廣告
-            // 刷屏。代表仍保留並打上標記，播不通時可回退。
+            // 片，不是正片。先按 URL 去重，再把數量 ≥3 的簇整組標為疑似
+            // 廣告，折疊進選擇器的「疑似廣告」分組（點開可取回），避免
+            // 選擇器被同一條廣告刷屏。
             val seenUrls = mutableSetOf<String>()
             val deduped = records.map { r ->
                 if (r.kept && !seenUrls.add(r.url)) r.copy(kept = false, dropReason = "重複地址")
@@ -1843,23 +1846,26 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 "$host|$type|${r.source}"
             }
             val clusterCounts = deduped.filter { it.kept }.groupingBy(clusterKey).eachCount()
-            val repSeen = mutableSetOf<String>()
             val filtered = deduped.map { r ->
                 if (!r.kept) return@map r
                 val key = clusterKey(r)
                 val count = clusterCounts[key] ?: 0
-                if (count >= 3) {
-                    if (repSeen.add(key)) r.copy(evidence = "${r.evidence} · 疑似廣告×$count")
-                    else r.copy(kept = false, dropReason = "重複疑似廣告")
-                } else r
+                if (count >= 3) r.copy(
+                    kept = false, dropReason = "重複疑似廣告",
+                    evidence = "${r.evidence} · 疑似廣告×$count",
+                ) else r
             }
             PlaybackDataStore.addCandidates(sessionId, filtered)
             val kept = filtered.filter { it.kept }
-            if (kept.isEmpty()) PlaybackDataStore.recordFail(sessionId, "找到 ${records.size} 個候選，全部被篩掉")
-            kept
+            // Folded ads: dropped as ads (ad keywords, <60s m3u8, or a
+            // repeated low-confidence cluster). The picker shows them
+            // collapsed under 「疑似廣告」 so a wrong call can be undone.
+            val ads = filtered.filter { !it.kept && (it.dropReason?.contains("廣告") == true) }
+            if (kept.isEmpty() && ads.isEmpty()) PlaybackDataStore.recordFail(sessionId, "找到 ${records.size} 個候選，全部被篩掉")
+            kept to ads
         } catch (e: Exception) {
             PlaybackDataStore.recordFail(sessionId, "嗅探異常：${e.message}")
-            emptyList()
+            emptyList<SniffCandidateRecord>() to emptyList()
         }
     }
 
