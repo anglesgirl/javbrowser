@@ -489,24 +489,6 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         "javhdporn.live", "javhd-trk.com", "vivodemisrentas.net",
     )
 
-    /** Video hosts whose m3u8/mp4 are ads, never the feature — the
-     * javhd sniff must not return them as candidates. Seeded from
-     * AdFilterRules' ad-host table (BUILTIN_COMMON_BLOCK_OVERRIDES,
-     * AdFilterRules.kt — "streamhls.click" is listed there) and
-     * MainActivity.kt:2028 ("javhdporn.net 的廣告 CDN（如
-     * streamhls.click）也會出 m3u8，跳過避免誤判"). The feature
-     * comes from vdcdn.xyz / tapecontent / streamtape (2026-10-31),
-     * never from these hosts. Used only to exclude candidates — the
-     * requests themselves are NOT blocked, so the embed page's
-     * player flow (ad first, feature after) is not disturbed. */
-    private val javhdAdVideoHosts = listOf(
-        "streamhls.click",
-        "trafficjunky.com", "trafficstars.com", "exoclick.com",
-        "juicyads.com", "ero-advertising.com", "plugrush.com",
-        "adsterra.com", "propellerads.com", "popads.net",
-        "popcash.net", "hilltopads.com",
-    )
-
     /** One trace line for the current javhd sniff, shown in 播放數據
      * under 過程 and copied with it. Never throws. */
     private fun traceJavhd(sessionId: Long, line: String) {
@@ -552,13 +534,6 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * Caught URLs go through the same filter as static sniffing
      * (filterSniffCandidates: ad keywords, <60s m3u8, dedupe, repeat
      * clusters), so the picker's 疑似廣告 folding applies unchanged.
-     * Known ad video hosts (javhdAdVideoHosts — streamhls.click et
-     * al., per AdFilterRules) are excluded from candidates outright:
-     * the embed page plays an ad first and the feature after, so an
-     * ad m3u8 must never be returned as the video. If only ads are
-     * caught by the timeout, the sniff reports null so the caller
-     * falls back to decoding the embed's data-config (vdcdn direct
-     * link) instead of handing out an ad.
      * Callback on the UI thread with (kept, ads), or null when nothing
      * was sniffed — the caller then falls back to the old direct
      * extraction. Never throws.
@@ -580,13 +555,6 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         var finishScheduled = false
         val foundUrls = LinkedHashSet<String>()
         val mediaHosts = LinkedHashSet<String>()
-        // Ad-host video URLs seen (excluded from candidates — the
-        // embed page plays an ad first, then the feature; the ad
-        // must not be returned as the video). Named in the failure
-        // log so "只攔到廣告、未見正片" is distinguishable from
-        // "nothing was requested at all".
-        val adUrlsSeen = LinkedHashSet<String>()
-        val adHostsSeen = LinkedHashSet<String>()
         val pageSlug = item.detailUrl.trimEnd('/').substringAfterLast('/')
         var timeoutRunnable: Runnable by kotlin.properties.Delegates.notNull()
         var finishRunnable: Runnable? = null
@@ -606,15 +574,6 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             return clean.endsWith(".m3u8") || clean.endsWith(".mp4")
         }
 
-        /** True when the URL's host is a known ad video host (see
-         * javhdAdVideoHosts). The request itself is NOT blocked —
-         * only the candidate is dropped, so the player flow is
-         * undisturbed and a later feature request is still caught. */
-        fun isAdVideoHost(url: String): Boolean {
-            val host = try { java.net.URL(url).host.lowercase() } catch (e: Exception) { return false }
-            return javhdAdVideoHosts.any { host == it || host.endsWith(".$it") }
-        }
-
         fun finish() {
             if (done) return
             done = true
@@ -627,15 +586,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 val media = if (mediaHosts.isEmpty()) "無" else mediaHosts.take(3).joinToString(",")
                 val err = lastLoadError?.let { "；$it" } ?: ""
                 val where = if (loadedEmbed) "嵌頁已載、未攔到視頻文件" else "詳情頁已載、未攔到視頻文件"
-                // Only ads were caught (e.g. streamhls.click): say so
-                // plainly and fall back to the data-config decode
-                // (the caller runs the direct extraction) instead of
-                // handing the ad out as the feature.
-                val reason = if (adUrlsSeen.isNotEmpty()) {
-                    "javhd嗅探失敗 [$pageSlug]：只攔到廣告 host（${adHostsSeen.joinToString(",")}，${adUrlsSeen.size} 個），未見正片；回落解 data-config"
-                } else {
-                    "javhd嗅探失敗 [$pageSlug]：$where；媒體host=$media$err"
-                }
+                val reason = "javhd嗅探失敗 [$pageSlug]：$where；媒體host=$media$err"
                 traceJavhd(sessionId, "嗅探失敗：$reason")
                 PlaybackDataStore.recordFail(sessionId, reason)
                 callback(null)
@@ -737,27 +688,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         } catch (e: Exception) { }
                     }
                     if (isVideoFile(reqUrl)) {
-                        // Ad-host video (e.g. streamhls.click): let
-                        // the request proceed so the player flow is
-                        // undisturbed, but never return it as a
-                        // candidate — the feature comes from
-                        // vdcdn/tapecontent/streamtape, not here.
-                        // Keep waiting for a feature URL instead of
-                        // finishing on the ad.
-                        if (isAdVideoHost(reqUrl)) {
-                            handler.post {
-                                if (!done && adUrlsSeen.add(reqUrl)) {
-                                    val h = try { java.net.URL(reqUrl).host } catch (e: Exception) { "?" }
-                                    adHostsSeen.add(h)
-                                    traceJavhd(sessionId, "嗅探攔到廣告：$h ${reqUrl.take(80)}")
-                                }
-                            }
-                        } else {
-                            handler.post {
-                                if (!done && foundUrls.add(reqUrl)) {
-                                    traceJavhd(sessionId, "嗅探攔到：${reqUrl.take(120)}")
-                                    if (pageFinished) scheduleFinish()
-                                }
+                        handler.post {
+                            if (!done && foundUrls.add(reqUrl)) {
+                                traceJavhd(sessionId, "嗅探攔到：${reqUrl.take(120)}")
+                                if (pageFinished) scheduleFinish()
                             }
                         }
                         // Let the request proceed: the page's own player
@@ -2303,13 +2237,34 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             if (r.kept && !seenUrls.add(r.url)) r.copy(kept = false, dropReason = "重複地址")
             else r
         }
+        // Master/variant 併流：一個 master.m3u8 和同目錄下的分
+        // variant（如 index-f1-v1-a1.m3u8）是同一條流，不是兩個
+        // 視頻（2026-11-08 javhd：streamhls.click …/76285967/
+        // master.m3u8 與 …/76285967/index-f1-v1-a1.m3u8 被重複列出
+        // 兩次）。同目錄已有保留的 master 時，分 variant 併入
+        // master，只留一條候選；master 本身沒被保留時不動分
+        // variant（它可能是唯一可播的副本）。
+        val fileName = { url: String ->
+            url.substringAfterLast('/').substringBefore('?').substringBefore('#').lowercase()
+        }
+        val variantOfMaster = deduped.filter { it.kept && it.url.lowercase().contains(".m3u8") }
+            .groupBy { it.url.substringBeforeLast('/') }
+            .flatMap { (_, group) ->
+                val masterKept = group.any { fileName(it.url) == "master.m3u8" }
+                if (!masterKept) emptyList()
+                else group.filter { fileName(it.url) != "master.m3u8" }.map { it.url }
+            }.toSet()
+        val collapsed = deduped.map { r ->
+            if (r.kept && r.url in variantOfMaster) r.copy(kept = false, dropReason = "同流分 variant，已併入 master")
+            else r
+        }
         val clusterKey = { r: SniffCandidateRecord ->
             val host = try { java.net.URL(r.url).host } catch (e: Exception) { "" }
             val type = if (r.url.lowercase().contains(".m3u8")) "m3u8" else "mp4"
             "$host|$type|${r.source}"
         }
-        val clusterCounts = deduped.filter { it.kept }.groupingBy(clusterKey).eachCount()
-        val filtered = deduped.map { r ->
+        val clusterCounts = collapsed.filter { it.kept }.groupingBy(clusterKey).eachCount()
+        val filtered = collapsed.map { r ->
             if (!r.kept) return@map r
             val key = clusterKey(r)
             val count = clusterCounts[key] ?: 0
