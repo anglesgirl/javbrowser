@@ -433,23 +433,19 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
 
     /**
      * Resolves javhdporn's real files through a hidden WebView. The detail
-     * page carries no video URL at all — only an encrypted data-mpu token
-     * and Server links (Part1/Part2, a.srv[data-type="load-fv"]). Clicking
-     * a Server link makes the page's own JS decode the token and load
-     * video.javhdporn.net/p/<code> (signed t/s params), whose JWPlayer
-     * setup decodes data-config into the direct file
-     * https://<region>.vdcdn.xyz/<token>/file.mp4?sign=...&t=... — the
-     * preload fetch is what the interceptor catches (verified 2026-11-05
-     * by running the embed page's own main.js in Node: the setup it
-     * produces has an empty advertising schedule, so the file itself
-     * carries no ad). Playing that file directly skips the whole ad
-     * stack (VAST pre-roll, popunders, the paid-SMS scam ads), and the
-     * hidden WebView also blocks the ad hosts outright.
-     * One part at a time: click a.srv[i], wait for its file (the first
+     * page carries no video URL at all. Older pages expose Server links
+     * (Part1/Part2, a.srv[data-type="load-fv"]); newer pages expose a
+     * data-mpu token on the player. The driver clicks the real Server link
+     * or, when there are no Server links, the real player button. The site
+     * decodes the token and loads a signed embed URL (keep every query
+     * parameter). Its JWPlayer setup may expose an MP4 or HLS source:
+     * EYAN-227 was browser-verified on 2026-11-08 as Maxstream HLS with
+     * duration 8978.636s, not a vdcdn MP4. Candidate filtering excludes
+     * ad sources without rewriting the embed host or source URL.
+     * One part at a time: trigger one real player action, wait for its file (the first
      * click is sometimes a no-op — retry once after 8s), then move to
      * the next part; a part that never produces a file is skipped after
-     * 20s. Old Streamtape videos (no .srv links) keep the legacy path:
-     * generic play click + streamtape/tapecontent interception.
+     * 20s. Old Streamtape videos keep the generic play-click interception path.
      * The hidden WebView gets the same ECH treatment as the main
      * browser (EchH3Router.fetchWebViewResource for GET fall-through),
      * so the detail page loads here exactly the way it loads there.
@@ -466,11 +462,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * Fallback javhdporn resolver: direct extraction, no page clicks.
      * (Primary since 2026-11-08 is the network sniff,
      * resolveJavhdViaSniff; this chain only runs when the sniff
-     * catches nothing.) Chain (proven 2026-11-05, no WebView
-     * browsing, no ads): detail HTML (ECH) -> a.srv tokens -> bundled
-     * cast.js computes `sources` -> POST /api/play/ (ECH) -> the
+     * catches nothing.) Chain: detail HTML (ECH) -> the real Server or
+     * player-button action -> bundled cast.js computes the full form ->
+     * POST /api/play/ (ECH) -> the
      * handler's own .done() (binddata) decodes the embed URL -> embed
-     * HTML (ECH) -> bundled embed main.js decodes the vdcdn file URL.
+     * HTML (ECH) -> bundled embed main.js decodes a non-ad MP4/HLS URL.
      * Any step failing falls back to the hidden-WebView click path
      * (resolveJavhdViaClick).
      */
@@ -494,18 +490,9 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * AdFilterRules' ad-host table (BUILTIN_COMMON_BLOCK_OVERRIDES,
      * AdFilterRules.kt — "streamhls.click" is listed there) and
      * MainActivity.kt:2028 ("javhdporn.net 的廣告 CDN（如
-     * streamhls.click）也會出 m3u8，跳過避免誤判"). The feature
-     * comes from vdcdn.xyz / tapecontent / streamtape (2026-10-31),
-     * never from these hosts. Used only to exclude candidates — the
-     * requests themselves are NOT blocked, so the embed page's
-     * player flow (ad first, feature after) is not disturbed. */
-    private val javhdAdVideoHosts = listOf(
-        "streamhls.click",
-        "trafficjunky.com", "trafficstars.com", "exoclick.com",
-        "juicyads.com", "ero-advertising.com", "plugrush.com",
-        "adsterra.com", "propellerads.com", "popads.net",
-        "popcash.net", "hilltopads.com",
-    )
+     * streamhls.click）也會出 m3u8，跳過避免誤判"). Used only to exclude
+     * candidates — requests are NOT blocked, so player flow is preserved. */
+    private val javhdAdVideoHosts = JavhdMediaRouting.adVideoHosts.toList()
 
     /** One trace line for the current javhd sniff, shown in 播放數據
      * under 過程 and copied with it. Never throws. */
@@ -543,12 +530,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * The video itself is never parsed out of the embed's
      * data-config/JWPlayer — that is the fragile old path. Clicking
      * .video-player alone never started anything (the player is built
-     * by JS and needs /api/play/ first), so it stays only as an
-     * auxiliary trigger. Note `sources` is NOT the raw token — cast.js
-     * decrypts the 488-char token into a 272-char `sources` (raw
-     * token -> /api/play/ 400 "invalid sources"), so the token can
-     * only reach /api/play/ through the cast.js sandbox (synthetic
-     * .srv anchors — the page ships none anymore).
+     * by JS and needs /api/play/ first), so it is used only when the
+     * real detail page has no Server link. The driver calls the real
+     * play button for data-mpu pages and the real .srv link for older
+     * pages. It captures the resulting api/play data and callback index
+     * without synthesizing page elements or rewriting the signed URL.
      * Caught URLs go through the same filter as static sniffing
      * (filterSniffCandidates: ad keywords, <60s m3u8, dedupe, repeat
      * clusters), so the picker's 疑似廣告 folding applies unchanged.
@@ -611,8 +597,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
          * only the candidate is dropped, so the player flow is
          * undisturbed and a later feature request is still caught. */
         fun isAdVideoHost(url: String): Boolean {
-            val host = try { java.net.URL(url).host.lowercase() } catch (e: Exception) { return false }
-            return javhdAdVideoHosts.any { host == it || host.endsWith(".$it") }
+            val requestHost = try { java.net.URL(url).host.lowercase() } catch (_: Exception) { return false }
+            return javhdAdVideoHosts.any { requestHost == it || requestHost.endsWith(".$it") }
         }
 
         fun finish() {
@@ -929,13 +915,17 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         var castJs: String? = null
         var driverEmbedJs: String? = null
         var embedMainJs: String? = null
-        val sourcesByPart = LinkedHashMap<Int, String>()
+        val apiPlayDataByPart = LinkedHashMap<Int, Map<String, String>>()
+        val apiPlayIndexByPart = LinkedHashMap<Int, Int>()
         // Phase 1 collects each Part's embed URL here (on the cast
         // page); Phase 2 decodes them. Split because decoding a Part
         // navigates the WebView to the embed page, which destroys the
         // cast page's __javhdDoneCbs — feeding a later Part's done
         // callback after that always fails ("done回調未註冊").
         val embedUrlByPart = LinkedHashMap<Int, String>()
+        fun rememberEmbedUrl(partIdx: Int, url: String) {
+            embedUrlByPart[partIdx] = url
+        }
         // Last per-Part failure, kept so the final message can say
         // which Part failed when nothing at all was decoded.
         var lastPartFailReason: String? = null
@@ -1088,7 +1078,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // setupEmbedPage -> decodePart). These vars break the cycle;
         // each is assigned right after its function is declared,
         // before any of them can run.
-        lateinit var feedDoneFn: (Int, String) -> Unit
+        lateinit var feedDoneFn: (Int, Int, String) -> Unit
         lateinit var fetchEmbedFn: (Int, String) -> Unit
         lateinit var setupEmbedFn: (Int, String, String) -> Unit
 
@@ -1126,6 +1116,24 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
          * Part. When every Part is fed, Phase 2 (decodePart) decodes
          * the collected embed URLs. A Part that fails is skipped, not
          * fatal: earlier Parts' links are kept. */
+        fun ajaxDataToFormFields(data: Any?): Map<String, String>? = when (data) {
+            is org.json.JSONObject -> {
+                val fields = LinkedHashMap<String, String>()
+                val keys = data.keys()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    val value = data.opt(key)
+                    fields[key] = when (value) {
+                        null, org.json.JSONObject.NULL -> ""
+                        else -> value.toString()
+                    }
+                }
+                fields.takeIf { it.isNotEmpty() }
+            }
+            is String -> JavhdMediaRouting.parseUrlEncodedData(data)
+            else -> null
+        }
+
         fun postAndFeed(partIdx: Int) {
             if (done) return
             if (partIdx >= tokens.size) {
@@ -1150,9 +1158,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 decodePart(0)
                 return
             }
-            val sources = sourcesByPart[partIdx].orEmpty()
-            if (sources.isEmpty()) {
-                lastPartFailReason = "直取失敗：Part${partIdx + 1} sources缺失"
+            val fields = apiPlayDataByPart[partIdx]
+            val playIndex = apiPlayIndexByPart[partIdx]
+            if (fields.isNullOrEmpty() || playIndex == null || playIndex < 0) {
+                lastPartFailReason = "直取失敗：Part${partIdx + 1} api/play data 或 playIndex 缺失"
                 traceJavhd(sessionId, lastPartFailReason!!)
                 postAndFeed(partIdx + 1)
                 return
@@ -1160,11 +1169,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             SearchScheduler.workers.execute {
                 val echJson = postFormEch(
                     "https://www.javhdporn.net/api/play/", item.detailUrl,
-                    mapOf("sources" to sources, "ver" to "2"),
+                    fields,
                 )
                 val postJson = echJson ?: postForm(
                     "https://www.javhdporn.net/api/play/", item.detailUrl,
-                    mapOf("sources" to sources, "ver" to "2"),
+                    fields,
                 )
                 val transport = if (echJson != null) "ECH" else "明文"
                 if (postJson.isNullOrBlank()) {
@@ -1190,10 +1199,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     }
                     return@execute
                 }
+                val sources = fields["sources"].orEmpty()
                 lastSourcesPreview = sources.take(24) + "…len=" + sources.length
                 lastDataPreview = data.take(24) + "…len=" + data.length
                 traceJavhd(sessionId, "Part${partIdx + 1} POST api/play（$transport）：status=true，data長 ${data.length}（前 ${data.take(24)}）")
-                handler.post { if (!done) feedDoneFn(partIdx, postJson) }
+                handler.post { if (!done) feedDoneFn(partIdx, playIndex, postJson) }
             }
         }
 
@@ -1201,10 +1211,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
          * .done() callback (binddata decodes `data` to the embed URL),
          * then read the embed URL into embedUrlByPart (Phase 1 only
          * — the embed page is fetched later, in Phase 2). */
-        fun feedDoneAndReadVideodata(partIdx: Int, postJson: String) {
+        fun feedDoneAndReadVideodata(partIdx: Int, playIndex: Int, postJson: String) {
             if (done) return
             val quoted = org.json.JSONObject.quote(postJson)
-            evalJs("window.__javhdDoneCbs && window.__javhdDoneCbs.length > $partIdx ? (window.__javhdDoneCbs[$partIdx](JSON.parse($quoted)), 'fed') : ''") { fed ->
+            evalJs("window.__javhdDoneCbs && typeof window.__javhdDoneCbs[$playIndex] === 'function' ? (window.__javhdDoneCbs[$playIndex](JSON.parse($quoted)), 'fed') : ''") { fed ->
                 if (done) return@evalJs
                 if (unquoteJs(fed).isNullOrEmpty()) {
                     // Phase 1 runs on the cast page, so this should
@@ -1235,7 +1245,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     val url = unquoteJs(argUrl).orEmpty()
                     if (url.isNotEmpty()) {
                         traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁地址（binddata參數）：$url")
-                        embedUrlByPart[partIdx] = url
+                        rememberEmbedUrl(partIdx, url)
                         postAndFeed(partIdx + 1)
                         return@evalJs
                     }
@@ -1265,7 +1275,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                             return@pollJs
                         }
                         traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁地址：$videodata")
-                        embedUrlByPart[partIdx] = videodata
+                        rememberEmbedUrl(partIdx, videodata)
                         postAndFeed(partIdx + 1)
                     }
                 }
@@ -1289,8 +1299,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 } catch (e: Exception) {
                     traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁 GET：拋錯 ${e.message}")
                     handler.post {
-                        lastPartFailReason = "直取失敗：Part${partIdx + 1} 嵌頁取不到"
-                        decodePart(partIdx + 1)
+                        lastPartFailReason = "嵌頁 GET 拋錯"
+                        if (!done) decodePart(partIdx + 1)
                     }
                     return@execute
                 }
@@ -1298,8 +1308,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 if (embed.transportError != null || embed.statusCode !in 200..299 || embed.body.isBlank()) {
                     traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁 GET $embedHost：失敗（HTTP ${embed.statusCode}，transport=${embed.transportError ?: "無"}）")
                     handler.post {
-                        lastPartFailReason = "直取失敗：Part${partIdx + 1} 嵌頁取不到"
-                        decodePart(partIdx + 1)
+                        lastPartFailReason = "嵌頁 HTTP ${embed.statusCode} 或空回應"
+                        if (!done) decodePart(partIdx + 1)
                     }
                     return@execute
                 }
@@ -1307,8 +1317,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 if (config.isEmpty()) {
                     traceJavhd(sessionId, "Part${partIdx + 1} 嵌頁 GET $embedHost：HTTP ${embed.statusCode}，無 data-config（${embed.body.length}字節）")
                     handler.post {
-                        lastPartFailReason = "直取失敗：Part${partIdx + 1} 嵌頁無data-config"
-                        decodePart(partIdx + 1)
+                        lastPartFailReason = "嵌頁沒有 data-config"
+                        if (!done) decodePart(partIdx + 1)
                     }
                     return@execute
                 }
@@ -1363,15 +1373,28 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                                 // holds the full config — that is why
                                 // the 08:52 run died here with a valid
                                 // __jwSetup in the trace.
-                                val fileUrl = try {
-                                    val obj = org.json.JSONObject(setup.orEmpty())
-                                    obj.optJSONArray("sources")?.optJSONObject(0)?.optString("file").orEmpty()
-                                } catch (e: Exception) {
-                                    ""
+                                val sources = try {
+                                    org.json.JSONObject(setup.orEmpty()).optJSONArray("sources")
+                                } catch (_: Exception) {
+                                    null
                                 }
-                                if (fileUrl.isEmpty() || !(fileUrl.contains("/file.mp4") || fileUrl.contains(".m3u8"))) {
-                                    traceJavhd(sessionId, "Part${partIdx + 1} 解嵌頁失敗：__jwSetup=${setup.orEmpty().take(120)}")
-                                    lastPartFailReason = "直取失敗：Part${partIdx + 1} 直鏈未解出"
+                                val fileUrls = sources?.let { array ->
+                                    (0 until array.length()).mapNotNull { index ->
+                                        array.optJSONObject(index)?.optString("file")?.takeIf { it.isNotBlank() }
+                                    }
+                                }.orEmpty()
+                                val fileUrl = JavhdMediaRouting.firstNonAdVideoUrl(fileUrls).orEmpty()
+                                if (fileUrl.isEmpty()) {
+                                    val adHosts = fileUrls.filter { JavhdMediaRouting.isAdVideoUrl(it) }
+                                        .mapNotNull { try { java.net.URL(it).host } catch (_: Exception) { null } }
+                                        .distinct()
+                                    val reason = if (adHosts.isNotEmpty()) {
+                                        "data-config 只有廣告來源（${adHosts.joinToString(",")}）"
+                                    } else {
+                                        "data-config 沒有可用 MP4/HLS 來源"
+                                    }
+                                    traceJavhd(sessionId, "Part${partIdx + 1} 解嵌頁失敗：$reason；__jwSetup=${setup.orEmpty().take(120)}")
+                                    lastPartFailReason = reason
                                     decodePart(partIdx + 1)
                                     return@pollJs
                                 }
@@ -1421,38 +1444,46 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     fail("直取失敗：驅動未就緒")
                     return@evalJs
                 }
-            // Clicking the already-active server is a no-op (the
-            // handler skips it), and the first server is active by
-            // default — clear the marker before every trigger so each
-            // Part's handler actually runs.
-            evalJs("jQuery('.box-server .srv').removeClass('default-srv'); 'ok'") {
-                evalJs("jQuery('.box-server .srv').eq($partIdx).trigger('click'); 'ok'") {
-                    evalJs("JSON.stringify(window.__javhdAjaxCalls.slice($n0))") { value ->
-                        if (done) return@evalJs
-                        val arrJson = unquoteJs(value).orEmpty()
-                        val sources = try {
-                            val arr = org.json.JSONArray(arrJson)
-                            var found = ""
-                            for (i in 0 until arr.length()) {
-                                val entry = arr.optJSONObject(i) ?: continue
-                                if (entry.optString("url").orEmpty().contains("api/play")) {
-                                    found = entry.optJSONObject("data")?.optString("sources").orEmpty()
-                                    if (found.isNotEmpty()) break
-                                }
-                            }
-                            found
-                        } catch (e: Exception) {
-                            ""
+            evalJs("typeof window.__javhdTriggerPart === 'function' ? window.__javhdTriggerPart($partIdx) : 'driver-not-ready'") triggerCallback@{ triggerResult ->
+                val trigger = unquoteJs(triggerResult).orEmpty()
+                if (trigger.isEmpty() || trigger.startsWith("no-") || trigger == "driver-not-ready" || trigger == "server-index-out-of-range") {
+                    traceJavhd(sessionId, "Part${partIdx + 1} 觸發失敗：${trigger.ifEmpty { "無回應" }}")
+                    fail("直取失敗：Part${partIdx + 1} 無法觸發播放（$trigger）")
+                    return@triggerCallback
+                }
+                evalJs("JSON.stringify(window.__javhdAjaxCalls.slice($n0))") captureCallback@{ value ->
+                    if (done) return@captureCallback
+                    val arrJson = unquoteJs(value).orEmpty()
+                    var requestData: Map<String, String>? = null
+                    var requestPlayIndex: Int? = null
+                    try {
+                        val arr = org.json.JSONArray(arrJson)
+                        for (i in 0 until arr.length()) {
+                            val entry = arr.optJSONObject(i) ?: continue
+                            if (!entry.optString("url").contains("api/play", ignoreCase = true)) continue
+                            val playIndex = entry.optInt("playIndex", -1)
+                            if (playIndex < 0) continue
+                            val fields = ajaxDataToFormFields(entry.opt("data")) ?: continue
+                            requestData = fields
+                            requestPlayIndex = playIndex
+                            break
                         }
-                        if (sources.isEmpty()) {
-                            traceJavhd(sessionId, "Part${partIdx + 1} 點擊：ajax新增 ${try { org.json.JSONArray(arrJson).length() } catch (e: Exception) { -1 }} 個，sources 未算出")
-                            fail("直取失敗：Part${partIdx + 1} sources未算出")
-                            return@evalJs
-                        }
-                        traceJavhd(sessionId, "Part${partIdx + 1} 點擊：ajax新增 ${try { org.json.JSONArray(arrJson).length() } catch (e: Exception) { -1 }} 個，sources長 ${sources.length}（前 ${sources.take(24)}）")
-                        sourcesByPart[partIdx] = sources
-                        collectSources(partIdx + 1)
+                    } catch (_: Exception) {
+                        requestData = null
                     }
+                    val fields = requestData
+                    val playIndex = requestPlayIndex
+                    if (fields.isNullOrEmpty() || playIndex == null) {
+                        val count = try { org.json.JSONArray(arrJson).length() } catch (_: Exception) { -1 }
+                        traceJavhd(sessionId, "Part${partIdx + 1} 點擊：$trigger，ajax新增 $count 個，無有效 api/play data/playIndex")
+                        fail("直取失敗：Part${partIdx + 1} api/play data未捕獲")
+                        return@captureCallback
+                    }
+                    val sources = fields["sources"].orEmpty()
+                    traceJavhd(sessionId, "Part${partIdx + 1} 點擊：$trigger，捕獲 api/play playIndex=$playIndex，字段=${fields.keys.joinToString(",")}，sources長 ${sources.length}")
+                    apiPlayDataByPart[partIdx] = fields
+                    apiPlayIndexByPart[partIdx] = playIndex
+                    collectSources(partIdx + 1)
                 }
             }
             }
@@ -1602,30 +1633,9 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     label.ifEmpty { "Part${i + 1}" }
                 }
                 detailHtml = stripScripts(detail.body)
-                // The site no longer ships .srv anchors (the token
-                // moved to data-mpu on #video-player, no Server links
-                // at all) — cast.js has nothing to bind to, so no
-                // `sources` is ever computed. Build synthetic anchors
-                // from the extracted tokens so the handler can run.
-                // Both data-link and data-mpu carry the token: cast.js
-                // reads whichever it uses. (Verified 2026-11-08 in
-                // Node: synthetic anchor -> handler bound -> click ->
-                // 272-char sources -> /api/play/ status true.)
-                if (!detailHtml.contains("class=\"srv\"") && !detailHtml.contains("class='srv'")) {
-                    val anchors = tokens.mapIndexed { i, tok ->
-                        val label = partLabels.getOrNull(i).orEmpty().ifEmpty { "Part${i + 1}" }
-                        val esc = tok.replace("&", "&amp;").replace("\"", "&quot;")
-                        "<a class=\"srv\" data-link=\"$esc\" data-mpu=\"$esc\"><i></i> $label</a>"
-                    }.joinToString("")
-                    val box = "<div class=\"box-server\">$anchors</div>"
-                    val bodyIdx = detailHtml.indexOf("</body>", ignoreCase = true)
-                    detailHtml = if (bodyIdx >= 0) {
-                        detailHtml.substring(0, bodyIdx) + box + detailHtml.substring(bodyIdx)
-                    } else {
-                        detailHtml + box
-                    }
-                    traceJavhd(sessionId, "沙盒頁：無 Server 連結，注入 ${tokens.size} 個合成 .srv 錨點")
-                }
+                // Keep the real page markup unchanged: legacy .srv links
+                // remain available, while data-mpu pages use their real
+                // player button through __javhdTriggerPart.
                 traceJavhd(sessionId, "沙盒頁：去 script 後 ${detailHtml.length}字節")
                 setupCastPage()
             }
