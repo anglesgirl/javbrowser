@@ -851,7 +851,38 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         val embedUrl = embeds[0].second
                         loadedEmbed = true
                         traceJavhd(sessionId, "嗅探觸發：載入嵌頁 ${embedUrl.take(120)}")
-                        wv.loadUrl(embedUrl)
+                        // WebView's own main-frame request to video1 can reset even
+                        // though SearchHttpFetcher (the app's ECH route) can fetch it.
+                        // Load that exact response under the signed embed origin so its
+                        // original scripts and relative player requests still run here.
+                        SearchScheduler.workers.execute {
+                            val site = sites.firstOrNull { it.id == item.siteId }
+                            val embed = try {
+                                site?.let {
+                                    SearchHttpFetcher().fetch(embedUrl, SearchCancellation(), it)
+                                }
+                            } catch (e: Exception) {
+                                null
+                            }
+                            handler.post {
+                                if (done) return@post
+                                if (embed != null && embed.transportError == null &&
+                                    embed.statusCode in 200..299 && embed.body.isNotBlank()
+                                ) {
+                                    val baseUrl = embed.finalUrl.ifBlank { embedUrl }
+                                    traceJavhd(
+                                        sessionId,
+                                        "嗅探嵌頁 ECH 預載：HTTP ${embed.statusCode}，${embed.body.length}字節；交由 WebView 執行原頁腳本",
+                                    )
+                                    wv.loadDataWithBaseURL(baseUrl, embed.body, "text/html", "utf-8", baseUrl)
+                                } else {
+                                    val reason = embed?.transportError
+                                        ?: "HTTP ${embed?.statusCode ?: 0} 或空回應"
+                                    traceJavhd(sessionId, "嗅探嵌頁 ECH 預載失敗（$reason），回退 WebView 直載")
+                                    wv.loadUrl(embedUrl)
+                                }
+                            }
+                        }
                     }
                     handler.postDelayed(timeoutRunnable, 45000)
                 },
