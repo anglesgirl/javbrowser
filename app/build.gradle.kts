@@ -31,6 +31,14 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
+    // AGP 8.2 cannot emit 16 KB-aligned ZIP offsets for uncompressed JNI
+    // libraries. Compress them so Android extracts the already 16 KB-aligned
+    // ELF libraries at install time (official workaround for AGP <= 8.5).
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
