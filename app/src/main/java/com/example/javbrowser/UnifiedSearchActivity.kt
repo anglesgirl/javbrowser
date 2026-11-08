@@ -507,26 +507,30 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     ) {
         javhdTraceT0 = android.os.SystemClock.elapsedRealtime()
         traceJavhd(sessionId, "嗅探開始：${item.detailUrl}")
-        resolveJavhdDirect(item, sessionId) { parts, directFail ->
+        resolveJavhdDirect(item, sessionId, callback = { parts, directFail ->
             if (parts != null) {
                 callback(parts)
                 return@resolveJavhdDirect
             }
             resolveJavhdViaClick(item, sessionId, directFail, callback)
-        }
+        })
     }
 
     /**
-     * Primary javhdporn resolver (2026-11-08): format-agnostic network
-     * sniff on the real detail page. Loads the page in a hidden ECH
-     * WebView, lets the site's own JS run, and catches whatever video
-     * file (m3u8/mp4) it requests via shouldInterceptRequest — no
-     * token parsing, no bundled cast.js sandbox, no /api/play/ call,
-     * so a site reskin (data-link -> data-mpu -> whatever is next)
-     * cannot break it. The only invariant is the one that never
-     * changes: a video page eventually requests a video file.
-     * A generic player-area click triggers loading when the page does
-     * not auto-load; it never looks for a specific a.srv/Server link.
+     * Primary javhdporn resolver (2026-11-08): network sniff on the
+     * embed page. Trigger: the data-mpu token -> cast.js computes
+     * `sources` -> POST /api/play/ (ECH) -> embed URL, then the embed
+     * page loads in a hidden ECH WebView and whatever video file
+     * (m3u8/mp4) it requests is caught via shouldInterceptRequest.
+     * The video itself is never parsed out of the embed's
+     * data-config/JWPlayer — that is the fragile old path. Clicking
+     * .video-player alone never started anything (the player is built
+     * by JS and needs /api/play/ first), so it stays only as an
+     * auxiliary trigger. Note `sources` is NOT the raw token — cast.js
+     * decrypts the 488-char token into a 272-char `sources` (raw
+     * token -> /api/play/ 400 "invalid sources"), so the token can
+     * only reach /api/play/ through the cast.js sandbox (synthetic
+     * .srv anchors — the page ships none anymore).
      * Caught URLs go through the same filter as static sniffing
      * (filterSniffCandidates: ad keywords, <60s m3u8, dedupe, repeat
      * clusters), so the picker's 疑似廣告 folding applies unchanged.
@@ -555,6 +559,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         var timeoutRunnable: Runnable by kotlin.properties.Delegates.notNull()
         var finishRunnable: Runnable? = null
         var clickRunnable: Runnable? = null
+        // Which page the sniff WebView ended up loading: the embed
+        // URL from /api/play/, or the detail page (trigger failed).
+        // The failure reason names it so "嵌頁里没拦到视频" and
+        // "详情页里没拦到视频" are distinguishable.
+        var loadedEmbed = false
 
         /** A real video file: the extension must terminate the path
          * (query/fragment stripped) so "...Episode-1.mp4_snapshot_
@@ -576,7 +585,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             if (foundUrls.isEmpty()) {
                 val media = if (mediaHosts.isEmpty()) "無" else mediaHosts.take(3).joinToString(",")
                 val err = lastLoadError?.let { "；$it" } ?: ""
-                val reason = "javhd嗅探失敗 [$pageSlug]：未攔到視頻文件；媒體host=$media$err"
+                val where = if (loadedEmbed) "嵌頁已載、未攔到視頻文件" else "詳情頁已載、未攔到視頻文件"
+                val reason = "javhd嗅探失敗 [$pageSlug]：$where；媒體host=$media$err"
                 traceJavhd(sessionId, "嗅探失敗：$reason")
                 PlaybackDataStore.recordFail(sessionId, reason)
                 callback(null)
@@ -754,9 +764,47 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     }, 2000)
                 }
             }
-            wv.loadUrl(item.detailUrl)
-            traceJavhd(sessionId, "嗅探開始：載入 ${item.detailUrl}")
-            handler.postDelayed(timeoutRunnable, 45000)
+            // Trigger: token -> /api/play/ -> embed URL, then load
+            // the embed page here and sniff the video out of it.
+            // Clicking .video-player never started anything — the
+            // player is built by JS and needs /api/play/ first, and
+            // the token sits unused in the page. The video itself is
+            // still caught by sniffing (never by parsing the embed's
+            // data-config/JWPlayer), and the player-area click stays
+            // as an auxiliary trigger in onPageFinished below.
+            javhdTraceT0 = android.os.SystemClock.elapsedRealtime()
+            traceJavhd(sessionId, "嗅探開始：${item.detailUrl}")
+            traceJavhd(sessionId, "嗅探觸發：取令牌 → /api/play/ → 嵌頁")
+            resolveJavhdDirect(
+                item, sessionId,
+                callback = { _, _ -> },
+                onEmbed = { embeds, reason ->
+                    if (done) return@resolveJavhdDirect
+                    if (embeds.isNullOrEmpty()) {
+                        // Say which step died: token / api/play /
+                        // embed decode — not just "嗅探失敗".
+                        val step = when {
+                            reason == null -> "嗅探觸發：未拿到嵌頁地址"
+                            reason.contains("無令牌") -> "嗅探觸發：令牌沒取到"
+                            reason.contains("sources") -> "嗅探觸發：令牌有、sources 未算出"
+                            reason.contains("api/play") -> "嗅探觸發：/api/play/ 沒回嵌頁"
+                            reason.contains("嵌頁地址") -> "嗅探觸發：嵌頁地址未解出"
+                            reason.contains("超時") -> "嗅探觸發：取嵌頁超時"
+                            else -> "嗅探觸發失敗：$reason"
+                        }
+                        traceJavhd(sessionId, step)
+                        traceJavhd(sessionId, "嗅探開始：載入詳情頁（改點播放器） ${item.detailUrl}")
+                        wv.loadUrl(item.detailUrl)
+                    } else {
+                        val embedUrl = embeds[0].second
+                        loadedEmbed = true
+                        traceJavhd(sessionId, "嗅探觸發：載入嵌頁 ${embedUrl.take(120)}")
+                        wv.loadUrl(embedUrl)
+                    }
+                    handler.postDelayed(timeoutRunnable, 45000)
+                },
+                timeoutMs = 30000,
+            )
         }
     }
 
@@ -786,6 +834,20 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         item: SearchItem,
         sessionId: Long,
         callback: (List<Pair<String, String>>?, String?) -> Unit,
+        // Embed-only mode (sniff trigger): when non-null, Phase 1
+        // returns the embed URLs through onEmbed and skips Phase 2
+        // (no data-config/JWPlayer decode — the video is caught by
+        // sniffing the embed page instead). The second argument is
+        // the failure reason when no embed URL was produced.
+        // `sources` is NOT the raw token — cast.js decrypts the
+        // data-mpu token into it (verified 2026-11-08 in Node:
+        // raw token -> /api/play/ 400 "invalid sources"; cast.js
+        // click -> 272-char sources -> status true), so the token
+        // can only reach /api/play/ through the cast.js sandbox.
+        onEmbed: ((List<Pair<String, String>>?, String?) -> Unit)? = null,
+        // Overall bound for the chain; the sniff trigger passes a
+        // shorter one so the whole sniff stays within its window.
+        timeoutMs: Long = 75000,
     ) {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
         var hiddenWebView: android.webkit.WebView? = null
@@ -824,6 +886,14 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             handler.removeCallbacks(timeoutRunnable)
             hiddenWebView?.destroy()
             hiddenWebView = null
+            if (onEmbed != null) {
+                // Embed-only mode (sniff trigger): the
+                // direct-extraction callback and picker are not used.
+                // finish is only reached here on failure — success
+                // returns earlier from postAndFeed.
+                onEmbed(null, reason)
+                return
+            }
             if (parts != null) {
                 traceJavhd(sessionId, "直取完成：${parts.size} 個 Part（${parts.joinToString("，") { it.first }}）")
                 // Remember each file's embed page so the player can
@@ -890,7 +960,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         }
 
         timeoutRunnable = Runnable { fail("直取超時") }
-        handler.postDelayed(timeoutRunnable, 75000)
+        handler.postDelayed(timeoutRunnable, timeoutMs)
 
         fun assetText(name: String): String? {
             return try {
@@ -993,6 +1063,24 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         fun postAndFeed(partIdx: Int) {
             if (done) return
             if (partIdx >= tokens.size) {
+                if (onEmbed != null) {
+                    // Embed-only mode: Phase 1 is done — hand the
+                    // embed URLs back and stop (no Phase 2 decode).
+                    val embeds = embedUrlByPart.entries.sortedBy { it.key }.map { (i, url) ->
+                        (partLabels.getOrNull(i).orEmpty().ifEmpty { "Part${i + 1}" }) to url
+                    }
+                    done = true
+                    handler.removeCallbacks(timeoutRunnable)
+                    hiddenWebView?.destroy()
+                    hiddenWebView = null
+                    if (embeds.isEmpty()) {
+                        onEmbed(null, lastPartFailReason ?: "api/play 未回嵌頁")
+                    } else {
+                        traceJavhd(sessionId, "嗅探觸發：拿到 ${embeds.size} 個嵌頁地址")
+                        onEmbed(embeds, null)
+                    }
+                    return
+                }
                 decodePart(0)
                 return
             }
@@ -1448,6 +1536,30 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     label.ifEmpty { "Part${i + 1}" }
                 }
                 detailHtml = stripScripts(detail.body)
+                // The site no longer ships .srv anchors (the token
+                // moved to data-mpu on #video-player, no Server links
+                // at all) — cast.js has nothing to bind to, so no
+                // `sources` is ever computed. Build synthetic anchors
+                // from the extracted tokens so the handler can run.
+                // Both data-link and data-mpu carry the token: cast.js
+                // reads whichever it uses. (Verified 2026-11-08 in
+                // Node: synthetic anchor -> handler bound -> click ->
+                // 272-char sources -> /api/play/ status true.)
+                if (!detailHtml.contains("class=\"srv\"") && !detailHtml.contains("class='srv'")) {
+                    val anchors = tokens.mapIndexed { i, tok ->
+                        val label = partLabels.getOrNull(i).orEmpty().ifEmpty { "Part${i + 1}" }
+                        val esc = tok.replace("&", "&amp;").replace("\"", "&quot;")
+                        "<a class=\"srv\" data-link=\"$esc\" data-mpu=\"$esc\"><i></i> $label</a>"
+                    }.joinToString("")
+                    val box = "<div class=\"box-server\">$anchors</div>"
+                    val bodyIdx = detailHtml.indexOf("</body>", ignoreCase = true)
+                    detailHtml = if (bodyIdx >= 0) {
+                        detailHtml.substring(0, bodyIdx) + box + detailHtml.substring(bodyIdx)
+                    } else {
+                        detailHtml + box
+                    }
+                    traceJavhd(sessionId, "沙盒頁：無 Server 連結，注入 ${tokens.size} 個合成 .srv 錨點")
+                }
                 traceJavhd(sessionId, "沙盒頁：去 script 後 ${detailHtml.length}字節")
                 setupCastPage()
             }
