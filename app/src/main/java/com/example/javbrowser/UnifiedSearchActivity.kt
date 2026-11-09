@@ -479,17 +479,17 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * VAST, the paid-SMS scam creatives). The video file host and the
      * embed host are NOT in this list. Shared by the click fallback
      * and the network-sniff path.
-     * tsyndicate.com (2026-11-09): the VAST pre-roll tag host
-     * (#vast-pre data-attr). It is the only real gate — JWPlayer
-     * requests the feature file only after the 5s pre-roll is
-     * skipped, so a hidden WebView that never skips it never sees
-     * the feature. Blocking the tag makes JWPlayer fall through to
-     * the feature directly. */
+     * NOTE (2026-11-10): tsyndicate.com (VAST pre-roll tag) was
+     * blocked here in vc140, but the user confirmed on-device that
+     * blocking it breaks playback — the Skip button never appears
+     * and the feature never plays ("跳过广告必须出现才行"). The
+     * VAST tag must load so the Skip button appears; the sniff
+     * auto-clicks Skip instead (see skipAd below). Do NOT re-add
+     * the VAST host to this list. */
     private val javhdAdHosts = listOf(
         "whitetrafsa", "content-sync.xyz", "alaphoid.com", "udzpel.com",
         "jads.co", "wpadmngr.com", "xlviirdr.com", "xlirdr.com",
         "javhdporn.live", "javhd-trk.com", "vivodemisrentas.net",
-        "tsyndicate.com",
     )
 
     /** Video hosts whose m3u8/mp4 are ads, never the feature — the
@@ -584,6 +584,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         var timeoutRunnable: Runnable by kotlin.properties.Delegates.notNull()
         var finishRunnable: Runnable? = null
         var clickRunnable: Runnable? = null
+        var skipRunnable: Runnable? = null
+        var skipCount = 0
         // Which page the sniff WebView ended up loading: the embed
         // URL from /api/play/, or the detail page (trigger failed).
         // The failure reason names it so "嵌頁里没拦到视频" and
@@ -614,6 +616,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             handler.removeCallbacks(timeoutRunnable)
             finishRunnable?.let { handler.removeCallbacks(it) }
             clickRunnable?.let { handler.removeCallbacks(it) }
+            skipRunnable?.let { handler.removeCallbacks(it) }
             hiddenWebView?.destroy()
             hiddenWebView = null
             if (foundUrls.isEmpty()) {
@@ -668,6 +671,42 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             finishScheduled = true
             finishRunnable = Runnable { finish() }
             handler.postDelayed(finishRunnable!!, 3000)
+        }
+
+        /** Auto-skip the JWPlayer VAST pre-roll. The feature file is
+         * only requested after the pre-roll is skipped, and the Skip
+         * button must actually appear for that to happen — blocking
+         * the VAST tag (vc140) breaks playback entirely, so the tag
+         * loads and this clicks Skip instead. Tries the JWPlayer API
+         * first, then the .jw-skip button, then any element whose text
+         * is Skip / 跳过. Re-polls every 2s until a video URL is
+         * found (the interceptor then schedules finish) or the sniff
+         * times out. Never throws. */
+        fun skipAd() {
+            if (done || foundUrls.isNotEmpty()) return
+            skipCount++
+            hiddenWebView?.evaluateJavascript(
+                "(function(){" +
+                    "try{if(typeof jwplayer!=='undefined'){var p=jwplayer();if(p&&typeof p.skipAd==='function'){p.skipAd();return 'jwplayer.skipAd()';}}}catch(e){}" +
+                    "var el=document.querySelector('.jw-skip');" +
+                    "if(el){try{el.click();return 'clicked:.jw-skip';}catch(e){}}" +
+                    "var els=document.querySelectorAll('button,div,span,a');" +
+                    "for(var i=0;i<els.length;i++){" +
+                    "var t=(els[i].textContent||'').trim();" +
+                    "if(t==='Skip Ad'||t==='Skip'||t==='跳过'||t==='跳過'){try{els[i].click();return 'clicked:text:'+t;}catch(e){}}}" +
+                    "return 'no skip button';})();",
+            ) { value ->
+                if (done || foundUrls.isNotEmpty()) return@evaluateJavascript
+                val s = value?.trim()?.removeSurrounding("\"").orEmpty()
+                if (s != "no skip button") {
+                    traceJavhd(sessionId, "嗅探跳過廣告（第 $skipCount 次）：$s")
+                }
+                // Keep polling: the Skip button only appears a few
+                // seconds into the pre-roll, and the ad may be
+                // 30s long — re-check until the feature URL arrives.
+                skipRunnable = Runnable { skipAd() }
+                handler.postDelayed(skipRunnable!!, 2000)
+            }
         }
 
         /** Generic player-area click: tries the video element and the
@@ -817,6 +856,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                                 if (!done && foundUrls.isEmpty()) clickPlayer()
                             }
                             handler.postDelayed(clickRunnable!!, 8000)
+                            // The VAST pre-roll must load and show its
+                            // Skip button — start polling for it once
+                            // playback is triggered; skipAd re-polls
+                            // itself until the feature URL arrives.
+                            handler.postDelayed({ if (!done) skipAd() }, 5000)
                         } else {
                             scheduleFinish()
                         }
