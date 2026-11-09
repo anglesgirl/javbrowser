@@ -478,11 +478,18 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     /** Ad hosts blocked outright in javhd hidden WebViews (popunders,
      * VAST, the paid-SMS scam creatives). The video file host and the
      * embed host are NOT in this list. Shared by the click fallback
-     * and the network-sniff path. */
+     * and the network-sniff path.
+     * tsyndicate.com (2026-11-09): the VAST pre-roll tag host
+     * (#vast-pre data-attr). It is the only real gate — JWPlayer
+     * requests the feature file only after the 5s pre-roll is
+     * skipped, so a hidden WebView that never skips it never sees
+     * the feature. Blocking the tag makes JWPlayer fall through to
+     * the feature directly. */
     private val javhdAdHosts = listOf(
         "whitetrafsa", "content-sync.xyz", "alaphoid.com", "udzpel.com",
         "jads.co", "wpadmngr.com", "xlviirdr.com", "xlirdr.com",
         "javhdporn.live", "javhd-trk.com", "vivodemisrentas.net",
+        "tsyndicate.com",
     )
 
     /** Video hosts whose m3u8/mp4 are ads, never the feature — the
