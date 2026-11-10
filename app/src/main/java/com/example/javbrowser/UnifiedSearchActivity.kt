@@ -305,48 +305,26 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // pick, and the real playback outcome are recorded against it, so
         // the analysis can later say which path actually plays.
         val sessionId = PlaybackDataStore.startSession(item.siteId, item.detailUrl)
-        // javhdporn: the real file never appears in static HTML (only ads do),
-        // so resolve it through a hidden WebView instead of static sniffing.
+        // javhdporn（2026-11-10 改走嵌頁直播）：嗅探取直鏈 + 原生播放器走不通
+        // （播放器 onCreate 跑了、正片就是不出），改把 /api/play/ 拿到的嵌頁
+        // 直接裝進全螢幕 WebView，用站方 JWPlayer 原頁播，廣告攔掉、VAST 自動
+        // 點跳過。拿不到嵌頁才回退舊的嗅探/選擇器流程。
         if (item.siteId == SearchSiteIds.JAVHD) {
-            // Reuse a recently extracted address: the file URL's sign
-            // lives ~6h, so a sniff from the last 5h is still good —
-            // skip re-extraction. A failed playback invalidates the
-            // page's cache, so the next open re-extracts.
-            val cached = PlaybackDataStore.cachedCandidates(item.detailUrl, 5L * 60 * 60 * 1000)
-            if (cached.isNotEmpty()) {
-                PlaybackDataStore.addCandidates(sessionId, cached)
-                showSniffPicker(item, cached, sessionId)
-                return
-            }
             runOnUiThread {
                 android.widget.Toast.makeText(this,
-                    LanguageManager.text(this, "正在解析真实地址…", "Resolving real video URL…"),
+                    LanguageManager.text(this, "正在取得播放頁…", "Loading player page…"),
                     android.widget.Toast.LENGTH_SHORT).show()
             }
-            // Primary: format-agnostic network sniff on the real page.
-            // Falls back to the old direct extraction (then the click
-            // path) when the sniff catches nothing.
-            resolveJavhdViaSniff(item, sessionId) { sniffed ->
-                if (isDestroyed || isFinishing) return@resolveJavhdViaSniff
-                if (sniffed != null) {
-                    val (kept, ads) = sniffed
-                    if (kept.isNotEmpty() || ads.isNotEmpty()) {
-                        showSniffPicker(item, kept, sessionId, ads)
-                        return@resolveJavhdViaSniff
-                    }
+            resolveJavhdDirect(item, sessionId, callback = { _, _ -> }, onEmbed = { embeds, _ ->
+                if (isDestroyed || isFinishing) return@resolveJavhdDirect
+                val embedUrl = embeds?.firstOrNull()?.second.orEmpty()
+                if (embedUrl.isNotBlank()) {
+                    PlaybackDataStore.addTrace(sessionId, "嵌頁播放器：拿到嵌頁 ${embedUrl.take(100)}")
+                    startActivity(JavhdEmbedPlayerActivity.intent(this, embedUrl, sessionId, item.detailUrl, item.title))
+                    return@resolveJavhdDirect
                 }
-                tryResolveJavhdRealUrl(item, sessionId) { parts ->
-                    if (isDestroyed || isFinishing) return@tryResolveJavhdRealUrl
-                    if (parts != null) {
-                        showSniffPicker(item, parts.map { (label, url) ->
-                            resolverRecord(url, "resolver-javhd",
-                                if (label.isEmpty()) "解析直連（跳過廣告）" else "$label 解析直連（跳過廣告）")
-                        }, sessionId)
-                    } else {
-                        BrowserNavigator.open(this, item.detailUrl)
-                    }
-                }
-            }
+                openJavhdLegacy(item, sessionId)
+            })
             return
         }
         // hentaimama: the real file only exists in the dt_embed JWPlayer
@@ -377,6 +355,47 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     BrowserNavigator.open(this, item.detailUrl)
                 } else {
                     showSniffPicker(item, candidates, sessionId, ads)
+                }
+            }
+        }
+    }
+
+    /**
+     * javhd 舊流程（嵌頁拿不到時的回退）：快取候選 → 嗅探 → 直取 → 瀏覽器。
+     * 嵌頁直播為主路後，只在取不到嵌頁時走這裡。
+     */
+    private fun openJavhdLegacy(item: SearchItem, sessionId: Long) {
+        // Reuse a recently extracted address: the file URL's sign
+        // lives ~6h, so a sniff from the last 5h is still good —
+        // skip re-extraction. A failed playback invalidates the
+        // page's cache, so the next open re-extracts.
+        val cached = PlaybackDataStore.cachedCandidates(item.detailUrl, 5L * 60 * 60 * 1000)
+        if (cached.isNotEmpty()) {
+            PlaybackDataStore.addCandidates(sessionId, cached)
+            showSniffPicker(item, cached, sessionId)
+            return
+        }
+        // Primary: format-agnostic network sniff on the real page.
+        // Falls back to the old direct extraction (then the click
+        // path) when the sniff catches nothing.
+        resolveJavhdViaSniff(item, sessionId) { sniffed ->
+            if (isDestroyed || isFinishing) return@resolveJavhdViaSniff
+            if (sniffed != null) {
+                val (kept, ads) = sniffed
+                if (kept.isNotEmpty() || ads.isNotEmpty()) {
+                    showSniffPicker(item, kept, sessionId, ads)
+                    return@resolveJavhdViaSniff
+                }
+            }
+            tryResolveJavhdRealUrl(item, sessionId) { parts ->
+                if (isDestroyed || isFinishing) return@tryResolveJavhdRealUrl
+                if (parts != null) {
+                    showSniffPicker(item, parts.map { (label, url) ->
+                        resolverRecord(url, "resolver-javhd",
+                            if (label.isEmpty()) "解析直連（跳過廣告）" else "$label 解析直連（跳過廣告）")
+                    }, sessionId)
+                } else {
+                    BrowserNavigator.open(this, item.detailUrl)
                 }
             }
         }
