@@ -1009,6 +1009,15 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // cast page's __javhdDoneCbs — feeding a later Part's done
         // callback after that always fails ("done回調未註冊").
         val embedUrlByPart = LinkedHashMap<Int, String>()
+        // video1 re-roll count per Part: the site now serves two
+        // embed hosts per /api/play/ call — video.* (data-config
+        // holds the feature) and video1.* (668 chars, data-config
+        // holds only the ad source). The host is fixed per sources
+        // token (re-POSTing the same sources returns the same host —
+        // verified 2026-11-10: 8 POSTs, same sources, embed-data
+        // prefix identical), so a video1 embed can only be escaped
+        // by re-fetching the detail page for a fresh token.
+        var detailRefetchCount = 0
         fun rememberEmbedUrl(partIdx: Int, url: String) {
             embedUrlByPart[partIdx] = url
         }
@@ -1167,6 +1176,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         lateinit var feedDoneFn: (Int, Int, String) -> Unit
         lateinit var fetchEmbedFn: (Int, String) -> Unit
         lateinit var setupEmbedFn: (Int, String, String) -> Unit
+        lateinit var refetchDetailFn: () -> Unit
 
         /** Phase 2: decode each Part's collected embed URL to a file
          * URL. Runs after Phase 1 fed every Part's done callback on
@@ -1229,6 +1239,20 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     val embeds = embedUrlByPart.entries.sortedBy { it.key }.map { (i, url) ->
                         (partLabels.getOrNull(i).orEmpty().ifEmpty { "Part${i + 1}" }) to url
                     }
+                    // video1-only result: the embed host is fixed per
+                    // sources token, so re-fetch the detail page for
+                    // a fresh token and re-run Phase 1 (up to 2
+                    // times) instead of handing back an embed whose
+                    // data-config holds only the ad.
+                    if (embeds.isNotEmpty() && embeds.all { (_, u) ->
+                            try { java.net.URL(u).host.contains("video1.") } catch (e: Exception) { false }
+                        } && detailRefetchCount < 2
+                    ) {
+                        detailRefetchCount++
+                        traceJavhd(sessionId, "嵌頁全是 video1（只含廣告源），重取詳情頁換令牌（第 $detailRefetchCount 次）")
+                        handler.post { if (!done) refetchDetailFn() }
+                        return
+                    }
                     done = true
                     handler.removeCallbacks(timeoutRunnable)
                     hiddenWebView?.destroy()
@@ -1239,6 +1263,18 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         traceJavhd(sessionId, "嗅探觸發：拿到 ${embeds.size} 個嵌頁地址")
                         onEmbed(embeds, null)
                     }
+                    return
+                }
+                // Direct path: same video1 re-roll before decoding —
+                // a video1 data-config holds only the ad, so decoding
+                // it can never yield the feature.
+                val allVideo1 = embedUrlByPart.isNotEmpty() && embedUrlByPart.values.all { u ->
+                    try { java.net.URL(u).host.contains("video1.") } catch (e: Exception) { false }
+                }
+                if (allVideo1 && detailRefetchCount < 2) {
+                    detailRefetchCount++
+                    traceJavhd(sessionId, "嵌頁全是 video1（只含廣告源），重取詳情頁換令牌（第 $detailRefetchCount 次）")
+                    handler.post { if (!done) refetchDetailFn() }
                     return
                 }
                 decodePart(0)
@@ -1653,79 +1689,97 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // Step 1 (worker): read the bundled site scripts, then fetch
         // the detail page over ECH and pull the Server-link tokens
         // out of the HTML. The page itself is never rendered.
-        SearchScheduler.workers.execute {
-            jqueryJs = assetText("javhd_jquery.min.js")
-            driverCastJs = assetText("javhd_driver_cast.js")
-            castJs = assetText("javhd_cast.js")
-            driverEmbedJs = assetText("javhd_driver_embed.js")
-            embedMainJs = assetText("javhd_embed_main.js")
-            if (jqueryJs == null || driverCastJs == null || castJs == null ||
-                driverEmbedJs == null || embedMainJs == null
-            ) {
-                handler.post { fail("直取失敗：內置腳本缺失") }
-                return@execute
-            }
-            val site = sites.firstOrNull { it.id == item.siteId }
-            if (site == null) {
-                handler.post { fail("直取失敗：站點未註冊") }
-                return@execute
-            }
-            val detail = try {
-                SearchHttpFetcher().fetch(item.detailUrl, SearchCancellation(), site)
-            } catch (e: Exception) {
-                traceJavhd(sessionId, "詳情頁 GET：拋錯 ${e.message}")
-                handler.post { fail("直取失敗：詳情頁取不到") }
-                return@execute
-            }
-            if (detail.transportError != null || detail.statusCode !in 200..299 || detail.body.isBlank()) {
-                traceJavhd(sessionId, "詳情頁 GET：失敗（HTTP ${detail.statusCode}，transport=${detail.transportError ?: "無"}）")
-                handler.post { fail("直取失敗：詳情頁取不到") }
-                return@execute
-            }
-            val detailRoute = try {
-                EchH3Router.route(java.net.URL(item.detailUrl).host).toString()
-            } catch (e: Exception) {
-                "?"
-            }
-            traceJavhd(sessionId, "詳情頁：HTTP ${detail.statusCode}，${detail.body.length}字節，最終=${detail.finalUrl}，路由=$detailRoute")
-            // <a class="srv" ... data-link="TOKEN" ...><i ...></i> Part1</a>
-            // The anchor content holds an <i> icon, so the label cannot
-            // be captured with ([^<]*); take the token from the opening
-            // tag and the label leniently after any nested tags.
-            val tokenRe = Regex("<a[^>]*data-link=\"([^\"]+)\"[^>]*>")
-            val labelRe = Regex("<a[^>]*data-link=\"[^\"]+\"[^>]*>(?:<[^>]*>)*\\s*([^<]*)</a>")
-            val labels = labelRe.findAll(detail.body).map { it.groupValues.getOrNull(1).orEmpty().trim() }.toList()
-            val found = tokenRe.findAll(detail.body).mapIndexed { i, m ->
-                m.groupValues.getOrNull(1).orEmpty().trim() to labels.getOrNull(i).orEmpty()
-            }.filter { it.first.isNotEmpty() }.toList()
-            val pairs = if (found.isNotEmpty()) found else run {
-                // Fallback: Part1's token is also the data-mpu value.
-                val mpu = Regex("data-mpu=\"([^\"]+)\"").find(detail.body)?.groupValues?.getOrNull(1).orEmpty()
-                if (mpu.isNotEmpty()) listOf(mpu to "Part1") else emptyList()
-            }
-            if (pairs.isEmpty()) {
-                handler.post { fail("直取失敗：詳情頁無令牌") }
-                return@execute
-            }
-            traceJavhd(
-                sessionId,
-                "令牌：${pairs.size} 個（${pairs.joinToString("，") { it.second.ifEmpty { "?" } }}），長 ${pairs.joinToString("/") { it.first.length.toString() }}" +
-                    if (found.isEmpty()) "（正則 0 個，改用 data-mpu）" else "",
-            )
-            handler.post {
-                if (done) return@post
-                tokens = pairs.map { it.first }
-                partLabels = pairs.mapIndexed { i, (_, label) ->
-                    label.ifEmpty { "Part${i + 1}" }
+        // Re-runnable: when Phase 1 hands back only video1 embeds,
+        // the trigger re-fetches the detail page for a fresh token
+        // (the host is fixed per token) and re-runs Phase 1.
+        fun fetchDetailAndSetupCast() {
+            SearchScheduler.workers.execute {
+                if (jqueryJs == null) jqueryJs = assetText("javhd_jquery.min.js")
+                if (driverCastJs == null) driverCastJs = assetText("javhd_driver_cast.js")
+                if (castJs == null) castJs = assetText("javhd_cast.js")
+                if (driverEmbedJs == null) driverEmbedJs = assetText("javhd_driver_embed.js")
+                if (embedMainJs == null) embedMainJs = assetText("javhd_embed_main.js")
+                if (jqueryJs == null || driverCastJs == null || castJs == null ||
+                    driverEmbedJs == null || embedMainJs == null
+                ) {
+                    handler.post { fail("直取失敗：內置腳本缺失") }
+                    return@execute
                 }
-                detailHtml = stripScripts(detail.body)
-                // Keep the real page markup unchanged: legacy .srv links
-                // remain available, while data-mpu pages use their real
-                // player button through __javhdTriggerPart.
-                traceJavhd(sessionId, "沙盒頁：去 script 後 ${detailHtml.length}字節")
-                setupCastPage()
+                val site = sites.firstOrNull { it.id == item.siteId }
+                if (site == null) {
+                    handler.post { fail("直取失敗：站點未註冊") }
+                    return@execute
+                }
+                val detail = try {
+                    SearchHttpFetcher().fetch(item.detailUrl, SearchCancellation(), site)
+                } catch (e: Exception) {
+                    traceJavhd(sessionId, "詳情頁 GET：拋錯 ${e.message}")
+                    handler.post { fail("直取失敗：詳情頁取不到") }
+                    return@execute
+                }
+                if (detail.transportError != null || detail.statusCode !in 200..299 || detail.body.isBlank()) {
+                    traceJavhd(sessionId, "詳情頁 GET：失敗（HTTP ${detail.statusCode}，transport=${detail.transportError ?: "無"}）")
+                    handler.post { fail("直取失敗：詳情頁取不到") }
+                    return@execute
+                }
+                val detailRoute = try {
+                    EchH3Router.route(java.net.URL(item.detailUrl).host).toString()
+                } catch (e: Exception) {
+                    "?"
+                }
+                traceJavhd(sessionId, "詳情頁：HTTP ${detail.statusCode}，${detail.body.length}字節，最終=${detail.finalUrl}，路由=$detailRoute")
+                // <a class="srv" ... data-link="TOKEN" ...><i ...></i> Part1</a>
+                // The anchor content holds an <i> icon, so the label cannot
+                // be captured with ([^<]*); take the token from the opening
+                // tag and the label leniently after any nested tags.
+                val tokenRe = Regex("<a[^>]*data-link=\"([^\"]+)\"[^>]*>")
+                val labelRe = Regex("<a[^>]*data-link=\"[^\"]+\"[^>]*>(?:<[^>]*>)*\\s*([^<]*)</a>")
+                val labels = labelRe.findAll(detail.body).map { it.groupValues.getOrNull(1).orEmpty().trim() }.toList()
+                val found = tokenRe.findAll(detail.body).mapIndexed { i, m ->
+                    m.groupValues.getOrNull(1).orEmpty().trim() to labels.getOrNull(i).orEmpty()
+                }.filter { it.first.isNotEmpty() }.toList()
+                val pairs = if (found.isNotEmpty()) found else run {
+                    // Fallback: Part1's token is also the data-mpu value.
+                    val mpu = Regex("data-mpu=\"([^\"]+)\"").find(detail.body)?.groupValues?.getOrNull(1).orEmpty()
+                    if (mpu.isNotEmpty()) listOf(mpu to "Part1") else emptyList()
+                }
+                if (pairs.isEmpty()) {
+                    handler.post { fail("直取失敗：詳情頁無令牌") }
+                    return@execute
+                }
+                traceJavhd(
+                    sessionId,
+                    "令牌：${pairs.size} 個（${pairs.joinToString("，") { it.second.ifEmpty { "?" } }}），長 ${pairs.joinToString("/") { it.first.length.toString() }}" +
+                        if (found.isEmpty()) "（正則 0 個，改用 data-mpu）" else "",
+                )
+                handler.post {
+                    if (done) return@post
+                    // Fresh attempt: drop the previous round's
+                    // per-Part captures and its cast WebView so the
+                    // new token's sources do not mix with the old.
+                    if (detailRefetchCount > 0) {
+                        apiPlayDataByPart.clear()
+                        apiPlayIndexByPart.clear()
+                        embedUrlByPart.clear()
+                        try { hiddenWebView?.destroy() } catch (_: Exception) { }
+                        hiddenWebView = null
+                    }
+                    tokens = pairs.map { it.first }
+                    partLabels = pairs.mapIndexed { i, (_, label) ->
+                        label.ifEmpty { "Part${i + 1}" }
+                    }
+                    detailHtml = stripScripts(detail.body)
+                    // Keep the real page markup unchanged: legacy .srv links
+                    // remain available, while data-mpu pages use their real
+                    // player button through __javhdTriggerPart.
+                    traceJavhd(sessionId, "沙盒頁：去 script 後 ${detailHtml.length}字節")
+                    setupCastPage()
+                }
             }
         }
+
+        refetchDetailFn = ::fetchDetailAndSetupCast
+        fetchDetailAndSetupCast()
     }
 
     /** Hidden-WebView click path (live site JS): fallback when the
