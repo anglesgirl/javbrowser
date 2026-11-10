@@ -71,6 +71,7 @@ class NativePlayerActivity : LocalizedActivity() {
         intent.getStringExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME)
             ?.takeIf { it.isNotBlank() }?.let { title = it }
         if (videoUrl.isBlank()) {
+            Toast.makeText(this, "播放器：地址為空", Toast.LENGTH_LONG).show()
             finish()
             return
         }
@@ -100,12 +101,19 @@ class NativePlayerActivity : LocalizedActivity() {
         // URL over ECH (and in Muse) plays. OkHttpDataSource takes
         // the ECH OkHttpClient directly; videoEchClient has no call
         // timeout so a long stream is not killed mid-playback.
-        val dataSourceFactory = OkHttpDataSource.Factory(EchH3Router.videoEchClient())
-            .setUserAgent("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
-            .setDefaultRequestProperties(headers)
-        val exoPlayer = ExoPlayer.Builder(this)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
-            .build()
+        val exoPlayer = try {
+            val dataSourceFactory = OkHttpDataSource.Factory(EchH3Router.videoEchClient())
+                .setUserAgent("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+                .setDefaultRequestProperties(headers)
+            ExoPlayer.Builder(this)
+                .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
+                .build()
+        } catch (e: Exception) {
+            Toast.makeText(this, "播放器啟動失敗：${e.javaClass.simpleName} ${e.message}", Toast.LENGTH_LONG).show()
+            android.util.Log.e("NATIVE_PLAYER", "player setup failed url=$videoUrl", e)
+            finish()
+            return
+        }
         exoPlayer.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_READY && exoPlayer.playWhenReady) {

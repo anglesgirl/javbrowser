@@ -141,24 +141,30 @@ class VideoChoiceActivity : LocalizedActivity() {
             // pick (it stays alive so back from the player returns to
             // the list), so the choiceLauncher in UnifiedSearchActivity
             // never sees this pick.
-            PlaybackDataStore.recordPick(sessionId, url, rank)
-            val target = if (siteId == SearchSiteIds.JAVHD || siteId == SearchSiteIds.HENTAIMAMA) {
-                NativePlayerActivity::class.java
-            } else {
-                FullscreenInternalPlayerActivity::class.java
+            try {
+                PlaybackDataStore.recordPick(sessionId, url, rank)
+                val target = if (siteId == SearchSiteIds.JAVHD || siteId == SearchSiteIds.HENTAIMAMA) {
+                    NativePlayerActivity::class.java
+                } else {
+                    FullscreenInternalPlayerActivity::class.java
+                }
+                val referer = if (siteId == SearchSiteIds.JAVHD) {
+                    UnifiedSearchActivity.javhdEmbedRefererByUrl[url].orEmpty().ifEmpty { detailUrl }
+                } else {
+                    detailUrl
+                }
+                android.widget.Toast.makeText(this, "正在打開播放器…", android.widget.Toast.LENGTH_SHORT).show()
+                startActivity(android.content.Intent(this, target).apply {
+                    putExtra(FullscreenInternalPlayerActivity.EXTRA_VIDEO_URL, url)
+                    putExtra(FullscreenInternalPlayerActivity.EXTRA_REFERER, referer)
+                    putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, detailUrl)
+                    putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, title)
+                    putExtra(FullscreenInternalPlayerActivity.EXTRA_SESSION_ID, sessionId)
+                })
+            } catch (e: Exception) {
+                android.widget.Toast.makeText(this, "打開播放器失敗：${e.javaClass.simpleName} ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                android.util.Log.e("VIDEO_CHOICE", "pick failed url=$url", e)
             }
-            val referer = if (siteId == SearchSiteIds.JAVHD) {
-                UnifiedSearchActivity.javhdEmbedRefererByUrl[url].orEmpty().ifEmpty { detailUrl }
-            } else {
-                detailUrl
-            }
-            startActivity(android.content.Intent(this, target).apply {
-                putExtra(FullscreenInternalPlayerActivity.EXTRA_VIDEO_URL, url)
-                putExtra(FullscreenInternalPlayerActivity.EXTRA_REFERER, referer)
-                putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, detailUrl)
-                putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, title)
-                putExtra(FullscreenInternalPlayerActivity.EXTRA_SESSION_ID, sessionId)
-            })
             // Do NOT finish: the list stays, and back from the player
             // returns here instead of losing the list and forcing a
             // re-tap plus a full re-extraction.
