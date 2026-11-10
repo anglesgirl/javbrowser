@@ -41,6 +41,16 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
          * collide across videos; not cleared per-sniff so a picker
          * opened earlier still finds its referer. */
         val javhdEmbedRefererByUrl = mutableMapOf<String, String>()
+        /** Mobile UA used by the javhd hidden WebViews and as the
+         * default for form POSTs. */
+        const val JAVHD_MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        /** Desktop UA for the javhd /api/play/ POST only. The site
+         * picks the embed host by this request's UA (verified
+         * 2026-11-10): desktop UA -> video.javhdporn.net, whose
+         * data-config holds the feature; mobile UA -> video1.*,
+         * whose data-config holds only the ad source. The detail
+         * page fetch's UA does not matter — only this POST's. */
+        const val JAVHD_DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     }
 
     private lateinit var queryEdit: EditText
@@ -950,13 +960,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * fetcher uses for GET). Returns the response body on HTTP 2xx,
      * null otherwise. No plaintext fallback here — the caller falls
      * back to plain postForm when this returns null. */
-    private fun postFormEch(url: String, referer: String, fields: Map<String, String>): String? {
+    private fun postFormEch(url: String, referer: String, fields: Map<String, String>, userAgent: String = JAVHD_MOBILE_UA): String? {
         return try {
             val form = FormBody.Builder().apply {
                 fields.forEach { (k, v) -> add(k, v) }
             }.build()
             val request = Request.Builder().url(url)
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+                .header("User-Agent", userAgent)
                 .header("Referer", referer)
                 .header("X-Requested-With", "XMLHttpRequest")
                 .post(form).build()
@@ -1289,13 +1299,16 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 return
             }
             SearchScheduler.workers.execute {
+                // Desktop UA here: the embed host is picked by this
+                // POST's UA (desktop -> video.*, feature in
+                // data-config; mobile -> video1.*, ad only).
                 val echJson = postFormEch(
                     "https://www.javhdporn.net/api/play/", item.detailUrl,
-                    fields,
+                    fields, JAVHD_DESKTOP_UA,
                 )
                 val postJson = echJson ?: postForm(
                     "https://www.javhdporn.net/api/play/", item.detailUrl,
-                    fields,
+                    fields, JAVHD_DESKTOP_UA,
                 )
                 val transport = if (echJson != null) "ECH" else "明文"
                 if (postJson.isNullOrBlank()) {
@@ -2334,13 +2347,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     }
 
     /** Small form-POST helper for the HentaiMama player AJAX (SearchHttpFetcher is GET-only). */
-    private fun postForm(url: String, referer: String, fields: Map<String, String>): String? {
+    private fun postForm(url: String, referer: String, fields: Map<String, String>, userAgent: String = JAVHD_MOBILE_UA): String? {
         return try {
             val form = FormBody.Builder().apply {
                 fields.forEach { (k, v) -> add(k, v) }
             }.build()
             val requestBuilder = Request.Builder().url(url)
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+                .header("User-Agent", userAgent)
                 .header("Referer", referer)
             // CF clearance: the app's WebView may already hold __cf_bm for
             // this host (from browsing the episode page); send it so the
