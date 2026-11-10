@@ -601,6 +601,14 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // The failure reason names it so "嵌頁里没拦到视频" and
         // "详情页里没拦到视频" are distinguishable.
         var loadedEmbed = false
+        // The embed URL currently loaded in the sniff WebView. A
+        // caught media URL must be remembered with this embed as
+        // its Referer (javhdEmbedRefererByUrl): the CDN rejects
+        // the detail page as referer (HTTP 403) and only accepts
+        // the embed page. The direct path records this in its
+        // finish()/fail(); the sniff path must do the same here,
+        // or playback of a sniffed URL always 403s.
+        var sniffEmbedUrl: String? = null
 
         /** A real video file: the extension must terminate the path
          * (query/fragment stripped) so "...Episode-1.mp4_snapshot_
@@ -801,6 +809,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         } else {
                             handler.post {
                                 if (!done && foundUrls.add(reqUrl)) {
+                                    // Record the embed page as this
+                                    // file's Referer so the player
+                                    // sends it (not the detail page,
+                                    // which the CDN 403s).
+                                    sniffEmbedUrl?.let { javhdEmbedRefererByUrl[reqUrl] = it }
                                     traceJavhd(sessionId, "嗅探攔到：${reqUrl.take(120)}")
                                     if (pageFinished) scheduleFinish()
                                 }
@@ -915,6 +928,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     } else {
                         val embedUrl = embeds[0].second
                         loadedEmbed = true
+                        sniffEmbedUrl = embedUrl
                         traceJavhd(sessionId, "嗅探觸發：載入嵌頁 ${embedUrl.take(120)}")
                         // WebView's own main-frame request to video1 can reset even
                         // though SearchHttpFetcher (the app's ECH route) can fetch it.
