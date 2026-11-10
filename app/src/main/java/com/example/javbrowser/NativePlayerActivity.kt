@@ -70,7 +70,9 @@ class NativePlayerActivity : LocalizedActivity() {
             intent.getStringExtra(FullscreenInternalPlayerActivity.EXTRA_REFERER).orEmpty()
         intent.getStringExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME)
             ?.takeIf { it.isNotBlank() }?.let { title = it }
+        PlaybackDataStore.addTrace(sessionId, "播放器 onCreate：url=${videoUrl.take(80)} referer=${referer.take(60)}")
         if (videoUrl.isBlank()) {
+            PlaybackDataStore.addTrace(sessionId, "播放器：地址為空，直接退出")
             Toast.makeText(this, "播放器：地址為空", Toast.LENGTH_LONG).show()
             finish()
             return

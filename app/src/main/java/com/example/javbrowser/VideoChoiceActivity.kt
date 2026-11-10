@@ -153,6 +153,7 @@ class VideoChoiceActivity : LocalizedActivity() {
                 } else {
                     detailUrl
                 }
+                PlaybackDataStore.addTrace(sessionId, "點候選：啟動播放器 ${target.simpleName} url=${url.take(80)} referer=${referer.take(60)}")
                 android.widget.Toast.makeText(this, "正在打開播放器…", android.widget.Toast.LENGTH_SHORT).show()
                 startActivity(android.content.Intent(this, target).apply {
                     putExtra(FullscreenInternalPlayerActivity.EXTRA_VIDEO_URL, url)
@@ -161,7 +162,9 @@ class VideoChoiceActivity : LocalizedActivity() {
                     putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, title)
                     putExtra(FullscreenInternalPlayerActivity.EXTRA_SESSION_ID, sessionId)
                 })
-            } catch (e: Exception) {
+                PlaybackDataStore.addTrace(sessionId, "點候選：startActivity 已調用")
+            } catch (e: Throwable) {
+                PlaybackDataStore.addTrace(sessionId, "點候選失敗：${e.javaClass.simpleName} ${e.message}")
                 android.widget.Toast.makeText(this, "打開播放器失敗：${e.javaClass.simpleName} ${e.message}", android.widget.Toast.LENGTH_LONG).show()
                 android.util.Log.e("VIDEO_CHOICE", "pick failed url=$url", e)
             }
