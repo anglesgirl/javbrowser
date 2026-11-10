@@ -118,6 +118,14 @@ class NativePlayerActivity : LocalizedActivity() {
         }
         exoPlayer.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
+                val name = when (playbackState) {
+                    Player.STATE_IDLE -> "IDLE"
+                    Player.STATE_BUFFERING -> "BUFFERING"
+                    Player.STATE_READY -> "READY"
+                    Player.STATE_ENDED -> "ENDED"
+                    else -> playbackState.toString()
+                }
+                PlaybackDataStore.addTrace(sessionId, "播放器狀態：$name")
                 if (playbackState == Player.STATE_READY && exoPlayer.playWhenReady) {
                     started = true
                 }
@@ -134,6 +142,7 @@ class NativePlayerActivity : LocalizedActivity() {
                         c.javaClass.simpleName + (c.message?.let { ": $it" } ?: "")
                     }.takeIf { it.isNotEmpty() } ?: "無 cause"
                 val detail = "code=${error.errorCode} msg=${error.message ?: "?"} | $causeChain"
+                PlaybackDataStore.addTrace(sessionId, "播放器錯誤：$detail")
                 android.util.Log.w(
                     "NATIVE_PLAYER",
                     "playback failed url=$videoUrl $detail",
@@ -151,9 +160,17 @@ class NativePlayerActivity : LocalizedActivity() {
             }
         })
         playerView.player = exoPlayer
-        exoPlayer.setMediaItem(MediaItem.fromUri(videoUrl))
-        exoPlayer.playWhenReady = true
-        exoPlayer.prepare()
+        try {
+            exoPlayer.setMediaItem(MediaItem.fromUri(videoUrl))
+            exoPlayer.playWhenReady = true
+            exoPlayer.prepare()
+            PlaybackDataStore.addTrace(sessionId, "播放器：已 prepare，等待首幀")
+        } catch (e: Throwable) {
+            PlaybackDataStore.addTrace(sessionId, "播放器 prepare 失敗：${e.javaClass.simpleName} ${e.message}")
+            Toast.makeText(this, "播放器啟動失敗：${e.javaClass.simpleName} ${e.message}", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
         player = exoPlayer
     }
 
@@ -164,6 +181,7 @@ class NativePlayerActivity : LocalizedActivity() {
 
     override fun onPause() {
         super.onPause()
+        PlaybackDataStore.addTrace(sessionId, "播放器 onPause：started=$started positionMs=${player?.currentPosition ?: 0}")
         player?.pause()
         recordOutcome()
     }
@@ -208,6 +226,7 @@ class NativePlayerActivity : LocalizedActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        PlaybackDataStore.addTrace(sessionId, "播放器 onDestroy")
         player?.release()
         player = null
     }
