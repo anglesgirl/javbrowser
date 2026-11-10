@@ -677,23 +677,27 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
          * only requested after the pre-roll is skipped, and the Skip
          * button must actually appear for that to happen — blocking
          * the VAST tag (vc140) breaks playback entirely, so the tag
-         * loads and this clicks Skip instead. Tries the JWPlayer API
-         * first, then the .jw-skip button, then any element whose text
-         * is Skip / 跳过. Re-polls every 2s until a video URL is
-         * found (the interceptor then schedules finish) or the sniff
-         * times out. Never throws. */
+         * loads and this clicks Skip instead. Clicks the real
+         * .jw-skip BUTTON first (the same action the user does in a
+         * browser); the jwplayer.skipAd() API is only a fallback.
+         * vc141 tried the API first and it returned "success" 10
+         * times while the feature never loaded — the API call is a
+         * no-op when the ad is not in a skippable state, so it must
+         * never shadow the button. Re-polls every 2s until a video
+         * URL is found (the interceptor then schedules finish) or
+         * the sniff times out. Never throws. */
         fun skipAd() {
             if (done || foundUrls.isNotEmpty()) return
             skipCount++
             hiddenWebView?.evaluateJavascript(
                 "(function(){" +
-                    "try{if(typeof jwplayer!=='undefined'){var p=jwplayer();if(p&&typeof p.skipAd==='function'){p.skipAd();return 'jwplayer.skipAd()';}}}catch(e){}" +
-                    "var el=document.querySelector('.jw-skip');" +
-                    "if(el){try{el.click();return 'clicked:.jw-skip';}catch(e){}}" +
+                    "var btn=document.querySelector('.jw-skip');" +
+                    "if(btn){try{btn.click();return 'clicked:.jw-skip';}catch(e){return 'jw-skip click err';}}" +
                     "var els=document.querySelectorAll('button,div,span,a');" +
                     "for(var i=0;i<els.length;i++){" +
                     "var t=(els[i].textContent||'').trim();" +
                     "if(t==='Skip Ad'||t==='Skip'||t==='跳过'||t==='跳過'){try{els[i].click();return 'clicked:text:'+t;}catch(e){}}}" +
+                    "try{if(typeof jwplayer!=='undefined'){var p=jwplayer();if(p&&typeof p.skipAd==='function'){p.skipAd();return 'api:skipAd() no-button';}}}catch(e){}" +
                     "return 'no skip button';})();",
             ) { value ->
                 if (done || foundUrls.isNotEmpty()) return@evaluateJavascript
