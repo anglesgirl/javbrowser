@@ -155,9 +155,6 @@ class JavhdEmbedPlayerActivity : LocalizedActivity() {
             JavhdGeckoExtension.detachFromSession(geckoSession)
             geckoSession.close()
         }
-        if (::geckoView.isInitialized) {
-            geckoView.setSession(null)
-        }
         super.onDestroy()
     }
 }

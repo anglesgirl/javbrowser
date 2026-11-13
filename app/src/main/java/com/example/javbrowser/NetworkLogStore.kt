@@ -48,7 +48,7 @@ object NetworkLogStore {
     }
 
     /** Newest first, for display. */
-    fun snapshot(): List<NetworkLogEntry> = synchronized(lock) { entries.reversed() }
+    fun snapshot(): List<NetworkLogEntry> = synchronized(lock) { entries.toList().reversed() }
 
     fun clear() {
         synchronized(lock) { entries.clear() }
