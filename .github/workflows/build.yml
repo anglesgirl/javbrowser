@@ -46,7 +46,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: javbrowser-debug
-          path: app/build/outputs/apk/debug/app-debug-arm64.apk
+          # Split APK 名隨 AGP 而異（app-debug-arm64-v8a.apk 等），用 glob
+          # 抓實際產出；if-no-files-found 用 error，缺 APK 就直接失敗，
+          # 別只警告然後讓 release 找不到 artifact。
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
 
   release:
     name: Publish release
@@ -69,6 +73,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
+          # 分片 APK 名随 AGP 而异，统一名为 app-debug-arm64.apk，
+          # 与交付镜像 URL 口径一致。
+          APK_FILE=$(ls apks/*.apk | head -n 1)
+          if [ "$APK_FILE" != "apks/app-debug-arm64.apk" ]; then
+            mv "$APK_FILE" apks/app-debug-arm64.apk
+          fi
+          ls -la apks/
           TAG="build-$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
           SUBJECT="$(git log -1 --pretty=%s)"
           gh release create "$TAG" apks/app-debug-arm64.apk \
