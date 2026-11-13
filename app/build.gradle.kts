@@ -14,7 +14,8 @@ android {
 
     defaultConfig {
         applicationId = "com.example.javbrowser"
-        minSdk = 24
+        // GeckoView 151 要求 minSdk 26（manifest merger 强制）。
+        minSdk = 26
         targetSdk = 34
         versionCode = 150
         versionName = "1.2.2-gecko"
