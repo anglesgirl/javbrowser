@@ -23,10 +23,11 @@ jobs:
 
       # The repo has no Unix gradlew (only gradlew.bat), so Gradle is
       # installed by the action instead of running a wrapper script.
-      - name: Set up Gradle 8.2
+      # AGP 8.9.1 needs Gradle 8.11+ (GeckoView 151 forces AGP 8.9.1+).
+      - name: Set up Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.2"
+          gradle-version: "8.11.1"
 
       # The repo gitignores google-services.json (upstream never shipped
       # one), and the google-services plugin fails without it. Write a
