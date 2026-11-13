@@ -8,8 +8,9 @@ plugins {
 android {
     namespace = "com.example.javbrowser"
     // GeckoView 151 的传递依赖（media3 1.9.3、androidx.core 1.18.0）
-    // 要求 compileSdk 至少 35。targetSdk 保持 34（不新开运行时行为）。
-    compileSdk = 35
+    // 要求 compileSdk 至少 36（core 1.18.0 要 36，media3 要 35）。
+    // targetSdk 保持 34（不新开运行时行为）。
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.example.javbrowser"
