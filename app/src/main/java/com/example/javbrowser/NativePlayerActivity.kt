@@ -13,6 +13,8 @@ import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
 
 /**
  * Native fullscreen player (Media3/ExoPlayer) for direct video files.
@@ -97,14 +99,19 @@ class NativePlayerActivity : LocalizedActivity() {
             } else null
         if (!cookies.isNullOrEmpty()) headers["Cookie"] = cookies
 
-        // Fetch the video through the app-layer ECH client, not plain
-        // HTTPS: the plain request exposes the SNI (us-a2.vdcdn.xyz)
-        // and the carrier answers it with HTTP 403, while the same
-        // URL over ECH (and in Muse) plays. OkHttpDataSource takes
-        // the ECH OkHttpClient directly; videoEchClient has no call
-        // timeout so a long stream is not killed mid-playback.
+        // GeckoView 遷移後：ECH 基建已刪，直鏈改走 plain OkHttp。
+        // 明文 SNI 在用戶網絡上可能被視頻 CDN 回 403（原先走 ECH 才通），
+        // javhd 主路已是嵌頁播放器（GeckoView），不受影響。
+        // 保留無 call timeout：長串流不能因 15 秒到就被掐斷。
+        val videoClient = OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .retryOnConnectionFailure(true)
+            .build()
         val exoPlayer = try {
-            val dataSourceFactory = OkHttpDataSource.Factory(EchH3Router.videoEchClient())
+            val dataSourceFactory = OkHttpDataSource.Factory(videoClient)
                 .setUserAgent("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
                 .setDefaultRequestProperties(headers)
             ExoPlayer.Builder(this)

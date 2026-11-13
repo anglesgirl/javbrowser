@@ -289,14 +289,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     }
 
     /**
-     * Opens a search result. For hosts that publish an ECH config
-     * (the app-layer fetch works while WebView is the blocked leg),
-     * sniff the detail page HTML fetched over ECH and list the
-     * candidate video URLs for the user to pick (auto-pick proved
-     * unreliable: it kept landing on ads or unplayable URLs); the
-     * user taps one to play it in the internal player, or chooses
-     * the browser to fall back to WebView. No candidates, or a
-     * non-ECH host, goes straight to WebView (current behavior).
+     * Opens a search result. Sniff the detail page HTML fetched
+     * (plain OkHttp) and list the candidate video URLs for the user
+     * to pick (auto-pick proved unreliable: it kept landing on ads
+     * or unplayable URLs); the user taps one to play it in the
+     * internal player, or chooses the browser to fall back to
+     * WebView. No candidates goes straight to WebView (current
+     * behavior).
      */
     private fun openResult(item: SearchItem) {
         rememberReadAnchor()
@@ -420,7 +419,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     }
 
     /**
-     * Series intro page (/tvshows/): fetch its episode list over ECH,
+     * Series intro page (/tvshows/): fetch its episode list,
      * then resolve the chosen episode. One episode resolves directly;
      * several show an episode picker. No episodes, or a fetch failure,
      * falls back to WebView. Never throws.
@@ -475,9 +474,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * click is sometimes a no-op — retry once after 8s), then move to
      * the next part; a part that never produces a file is skipped after
      * 20s. Old Streamtape videos keep the generic play-click interception path.
-     * The hidden WebView gets the same ECH treatment as the main
-     * browser (EchH3Router.fetchWebViewResource for GET fall-through),
-     * so the detail page loads here exactly the way it loads there.
+     * The hidden WebView loads plain now (ECH 攔截已隨 GeckoView
+     * 遷移刪除，見 docs/geckoview-migration.md).
      * The file host is geo-selected (us-a2 in the sandbox run), so the
      * interceptor also accepts any /file.mp4 path, not just vdcdn.xyz.
      * On failure the recorded reason carries the step that died
@@ -491,11 +489,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * Fallback javhdporn resolver: direct extraction, no page clicks.
      * (Primary since 2026-11-08 is the network sniff,
      * resolveJavhdViaSniff; this chain only runs when the sniff
-     * catches nothing.) Chain: detail HTML (ECH) -> the real Server or
+     * catches nothing.) Chain: detail HTML (明文) -> the real Server or
      * player-button action -> bundled cast.js computes the full form ->
-     * POST /api/play/ (ECH) -> the
+     * POST /api/play/ (明文) -> the
      * handler's own .done() (binddata) decodes the embed URL -> embed
-     * HTML (ECH) -> bundled embed main.js decodes a non-ad MP4/HLS URL.
+     * HTML (明文) -> bundled embed main.js decodes a non-ad MP4/HLS URL.
      * Any step failing falls back to the hidden-WebView click path
      * (resolveJavhdViaClick).
      */
@@ -560,8 +558,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     /**
      * Primary javhdporn resolver (2026-11-08): network sniff on the
      * embed page. Trigger: the data-mpu token -> cast.js computes
-     * `sources` -> POST /api/play/ (ECH) -> embed URL, then the embed
-     * page loads in a hidden ECH WebView and whatever video file
+     * `sources` -> POST /api/play/ (明文) -> embed URL, then the embed
+     * page loads in a hidden WebView and whatever video file
      * (m3u8/mp4) it requests is caught via shouldInterceptRequest.
      * The video itself is never parsed out of the embed's
      * data-config/JWPlayer — that is the fragile old path. Clicking
@@ -840,18 +838,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         }
                         // Let the request proceed: the page's own player
                         // needs the bytes, and we only need the URL.
-                        // Fall through to ECH/default below.
+                        // Fall through to default below.
                     }
-                    // ECH: same treatment as the main browser — GET
-                    // requests to hosts with an ECH config ride the
-                    // app-layer stack instead of WebView's plaintext
-                    // TLS. Hosts without a config fall through to
-                    // WebView default as before.
-                    if (request?.method.equals("GET", ignoreCase = true) == true) {
-                        EchH3Router.fetchWebViewResource(
-                            reqUrl, request?.requestHeaders, request?.isForMainFrame == true,
-                        )?.let { return it }
-                    }
+                    // GeckoView 遷移後：ECH 攔截已刪，這個隱藏 WebView
+                    // 走明文載入（見 docs/geckoview-migration.md）。
                     return null
                 }
 
@@ -950,7 +940,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         sniffEmbedUrl = embedUrl
                         traceJavhd(sessionId, "嗅探觸發：載入嵌頁 ${embedUrl.take(120)}")
                         // WebView's own main-frame request to video1 can reset even
-                        // though SearchHttpFetcher (the app's ECH route) can fetch it.
+                        // though SearchHttpFetcher can fetch it.
                         // Load that exact response under the signed embed origin so its
                         // original scripts and relative player requests still run here.
                         SearchScheduler.workers.execute {
@@ -970,13 +960,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                                     val baseUrl = embed.finalUrl.ifBlank { embedUrl }
                                     traceJavhd(
                                         sessionId,
-                                        "嗅探嵌頁 ECH 預載：HTTP ${embed.statusCode}，${embed.body.length}字節；交由 WebView 執行原頁腳本",
+                                        "嗅探嵌頁預載：HTTP ${embed.statusCode}，${embed.body.length}字節；交由 WebView 執行原頁腳本",
                                     )
                                     wv.loadDataWithBaseURL(baseUrl, embed.body, "text/html", "utf-8", baseUrl)
                                 } else {
                                     val reason = embed?.transportError
                                         ?: "HTTP ${embed?.statusCode ?: 0} 或空回應"
-                                    traceJavhd(sessionId, "嗅探嵌頁 ECH 預載失敗（$reason），回退 WebView 直載")
+                                    traceJavhd(sessionId, "嗅探嵌頁預載失敗（$reason），回退 WebView 直載")
                                     wv.loadUrl(embedUrl)
                                 }
                             }
@@ -986,28 +976,6 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 },
                 timeoutMs = 30000,
             )
-        }
-    }
-
-    /** ECH form POST via the search ECH client (same client the search
-     * fetcher uses for GET). Returns the response body on HTTP 2xx,
-     * null otherwise. No plaintext fallback here — the caller falls
-     * back to plain postForm when this returns null. */
-    private fun postFormEch(url: String, referer: String, fields: Map<String, String>, userAgent: String = JAVHD_MOBILE_UA): String? {
-        return try {
-            val form = FormBody.Builder().apply {
-                fields.forEach { (k, v) -> add(k, v) }
-            }.build()
-            val request = Request.Builder().url(url)
-                .header("User-Agent", userAgent)
-                .header("Referer", referer)
-                .header("X-Requested-With", "XMLHttpRequest")
-                .post(form).build()
-            EchH3Router.searchEchClient().newCall(request).execute().use { response ->
-                if (!response.isSuccessful) null else response.body?.string()
-            }
-        } catch (e: Exception) {
-            null
         }
     }
 
@@ -1335,17 +1303,15 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 // Desktop UA here: the embed host is picked by this
                 // POST's UA (desktop -> video.*, feature in
                 // data-config; mobile -> video1.*, ad only).
-                val echJson = postFormEch(
+                // GeckoView 遷移後：ECH 已刪，/api/play/ 直接走明文 postForm
+                //（原先 ECH 失敗就回落明文，現在只剩明文一路）。
+                val postJson = postForm(
                     "https://www.javhdporn.net/api/play/", item.detailUrl,
                     fields, JAVHD_DESKTOP_UA,
                 )
-                val postJson = echJson ?: postForm(
-                    "https://www.javhdporn.net/api/play/", item.detailUrl,
-                    fields, JAVHD_DESKTOP_UA,
-                )
-                val transport = if (echJson != null) "ECH" else "明文"
+                val transport = "明文"
                 if (postJson.isNullOrBlank()) {
-                    traceJavhd(sessionId, "Part${partIdx + 1} POST api/play：ECH 與明文皆失敗")
+                    traceJavhd(sessionId, "Part${partIdx + 1} POST api/play：明文失敗")
                     handler.post {
                         lastPartFailReason = "直取失敗：Part${partIdx + 1} api/play失敗"
                         postAndFeed(partIdx + 1)
@@ -1452,7 +1418,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
 
         feedDoneFn = ::feedDoneAndReadVideodata
 
-        /** Fetch the embed page over ECH, pull data-config, and decode
+        /** Fetch the embed page, pull data-config, and decode
          * the file URL with the bundled embed main.js. */
         fun fetchEmbedAndDecode(partIdx: Int, embedUrl: String) {
             if (done) return
@@ -1733,7 +1699,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         }
 
         // Step 1 (worker): read the bundled site scripts, then fetch
-        // the detail page over ECH and pull the Server-link tokens
+        // the detail page and pull the Server-link tokens
         // out of the HTML. The page itself is never rendered.
         // Re-runnable: when Phase 1 hands back only video1 embeds,
         // the trigger re-fetches the detail page for a fresh token
@@ -1768,12 +1734,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     handler.post { fail("直取失敗：詳情頁取不到") }
                     return@execute
                 }
-                val detailRoute = try {
-                    EchH3Router.route(java.net.URL(item.detailUrl).host).toString()
-                } catch (e: Exception) {
-                    "?"
-                }
-                traceJavhd(sessionId, "詳情頁：HTTP ${detail.statusCode}，${detail.body.length}字節，最終=${detail.finalUrl}，路由=$detailRoute")
+                traceJavhd(sessionId, "詳情頁：HTTP ${detail.statusCode}，${detail.body.length}字節，最終=${detail.finalUrl}，路由=OkHttp")
                 // <a class="srv" ... data-link="TOKEN" ...><i ...></i> Part1</a>
                 // The anchor content holds an <i> icon, so the label cannot
                 // be captured with ([^<]*); take the token from the opening
@@ -2142,18 +2103,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         return android.webkit.WebResourceResponse("text/plain", "utf-8",
                             java.io.ByteArrayInputStream(ByteArray(0)))
                     }
-                    // ECH: same treatment as the main browser — GET
-                    // requests to hosts with an ECH config ride the
-                    // app-layer stack instead of WebView's plaintext
-                    // TLS. Without this the hidden WebView can hang on
-                    // page load while the main browser opens the same
-                    // URL fine; hosts without a config fall through to
-                    // WebView default as before.
-                    if (request?.method.equals("GET", ignoreCase = true) == true) {
-                        EchH3Router.fetchWebViewResource(
-                            reqUrl, request?.requestHeaders, request?.isForMainFrame == true,
-                        )?.let { return it }
-                    }
+                    // GeckoView 遷移後：ECH 攔截已刪，這個隱藏 WebView
+                    // 走明文載入（見 docs/geckoview-migration.md）。
                     return null
                 }
 
@@ -2242,7 +2193,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     /** Returns sniffed candidates (proven <60s m3u8 ads excluded), or empty to fall back to WebView. Never throws. */
     /**
      * Resolves HentaiMama's real file without ever running the player's
-     * VAST ad: episode page (ECH fetch) -> post id -> admin-ajax POST
+     * VAST ad: episode page -> post id -> admin-ajax POST
      * get_player_contents -> dt_embed iframe -> JWPlayer sources file
      * (gdvid.info mp4). The ad domains (twinrdengine/marzaent/sacdnssedge)
      * only appear in the advertising block, which this path never executes.
@@ -2269,7 +2220,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * Resolves HentaiMama's real file through a hidden WebView: load the
      * episode page (CF clearance happens like a browser), click the mirror
      * tab so the page itself runs get_player_contents, read the injected
-     * dt_embed iframe src, then fetch the embed page over ECH and parse
+     * dt_embed iframe src, then fetch the embed page and parse
      * the JWPlayer file. Callback on the UI thread with the URL, or null
      * on timeout (15s) / failure — the caller then falls back to WebView.
      * Never throws.
@@ -2419,14 +2370,12 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      */
     private fun trySniffVideoCandidates(item: SearchItem, sessionId: Long): Pair<List<SniffCandidateRecord>, List<SniffCandidateRecord>> {
         return try {
-            val host = try { java.net.URL(item.detailUrl).host } catch (e: Exception) {
+            try { java.net.URL(item.detailUrl) } catch (e: Exception) {
                 PlaybackDataStore.recordFail(sessionId, "詳情頁地址無效")
                 return emptyList<SniffCandidateRecord>() to emptyList()
             }
-            if (EchDoh.configFor(host) == null) {
-                PlaybackDataStore.recordFail(sessionId, "無ECH設定，不嗅探")
-                return emptyList<SniffCandidateRecord>() to emptyList()
-            }
+            // GeckoView 遷移後：ECH 設定門已刪（EchDoh 不再存在），
+            // 嗅探直接走明文 SearchHttpFetcher 取詳情頁。
             val site = sites.firstOrNull { it.id == item.siteId } ?: run {
                 PlaybackDataStore.recordFail(sessionId, "站點未註冊")
                 return emptyList<SniffCandidateRecord>() to emptyList()

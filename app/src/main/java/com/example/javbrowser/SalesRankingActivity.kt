@@ -27,6 +27,7 @@ import androidx.work.WorkerParameters
 import com.bumptech.glide.Glide
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
@@ -303,15 +304,16 @@ private class SalesRankingAdapter(
 
 class SalesRankingRepository(private val context: Context) {
     // Same timeouts as before (15s connect / 25s read / followRedirects),
-    // now built through the EchH3 factory: hosts with an ECH config get
-    // Conscrypt ECH, others get plain TLS via the same client. A failed
-    // ECH handshake degrades to this source's empty section through the
+    // now plain OkHttp: ECH 基建（EchH3Router）已隨 GeckoView 遷移刪除。
+    // A failed fetch degrades to this source's empty section through the
     // existing per-source try/catch, never a crash.
-    private val client = EchH3Router.newOkHttpClient(
-        connectSec = 15,
-        readSec = 25,
-        followRedirects = true,
-    )
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .retryOnConnectionFailure(true)
+        .build()
 
     fun fetchAll(): List<SalesSection> = listOf(
         source("proclivity", "Proclivity-DB｜FANZA 女優月榜", SalesCategory.ONLINE,

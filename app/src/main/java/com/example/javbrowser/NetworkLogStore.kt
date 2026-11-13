@@ -5,17 +5,12 @@ import java.util.ArrayDeque
 import java.util.Locale
 
 /**
- * In-app transport event log: what the user needs to see whether ECH/H3
- * actually worked, without adb. Search fetch paths (SearchHttpFetcher and
- * EchH3Router's Cronet path) append one entry per transport attempt.
+ * In-app transport event log: what the user needs to see whether a fetch
+ * actually worked, without adb. Search fetch paths (SearchHttpFetcher,
+ * plain OkHttp) append one entry per transport attempt. Browser loads
+ * (GeckoView, native ECH/DoH) are not logged here.
  *
- * - route "ECH" + no error = ECH handshake succeeded (ECH effective).
- * - route "ECH" + source "共享" = the official shared Cloudflare
- *   config was used (rescue attempt), not the host's own config;
- *   source "Gateway+共享" = resolve-time merge (addresses from
- *   that endpoint, ech shared).
- * - route "Cronet" + negotiated "h3" = HTTP/3 negotiated (H3 effective).
- * - route "Cronet" with no ECH config = the site publishes no ECH config.
+ * - route "OkHttp" + no error = plain-OkHttp fetch succeeded.
  * - any entry with an error = that attempt failed; the error text is the
  *   real transport reason, not the generic UI wording.
  *
@@ -59,12 +54,11 @@ object NetworkLogStore {
         synchronized(lock) { entries.clear() }
     }
 
-    data class Summary(val echSuccess: Int, val cronetH3: Int, val failures: Int, val total: Int)
+    data class Summary(val okHttpSuccess: Int, val failures: Int, val total: Int)
 
     fun summary(): Summary = synchronized(lock) {
         Summary(
-            echSuccess = entries.count { it.route == "ECH" && it.error == null },
-            cronetH3 = entries.count { it.route == "Cronet" && it.negotiated == "h3" && it.error == null },
+            okHttpSuccess = entries.count { it.route == "OkHttp" && it.error == null },
             failures = entries.count { it.error != null },
             total = entries.size,
         )
@@ -74,18 +68,15 @@ object NetworkLogStore {
         SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(java.util.Date(timeMs))
 
     fun formatEntry(e: NetworkLogEntry): String {
-        val configPart = if (e.hasEchConfig) "有 ECH 設定" else "無 ECH 設定"
-        val sourcePart = e.dohSource.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""
         val base = "${formatTime(e.timeMs)} ${e.host} ${e.route}" +
-            (e.negotiated?.let { " $it" } ?: "") +
-            "（$configPart$sourcePart）"
+            (e.negotiated?.let { " $it" } ?: "")
         return if (e.error == null) "$base 成功" else "$base 失敗：${e.error}"
     }
 
     fun formatAll(): String {
         val s = summary()
         val header = "傳輸事件（最近 ${s.total} 筆）\n" +
-            "ECH 成功 ${s.echSuccess} 次 · Cronet h3 ${s.cronetH3} 次 · 失敗 ${s.failures} 次\n"
+            "OkHttp 成功 ${s.okHttpSuccess} 次 · 失敗 ${s.failures} 次\n"
         val list = snapshot()
         return if (list.isEmpty()) header + "尚無傳輸事件"
         else header + list.joinToString("\n") { formatEntry(it) }

@@ -2057,21 +2057,10 @@ class MainActivity : LocalizedActivity() {
                     }
                 }
                 
-                // ECH: GET requests to hosts with an ECH config ride the
-                // app-layer ECH stack (hidden SNI) instead of WebView's
-                // plaintext TLS. This sits last on purpose: ad-block,
-                // media sniff-block and site rules above keep their
-                // behavior, and only requests that would otherwise fall
-                // through to WebView default get ECH treatment. POST and
-                // other methods are never intercepted here
-                // (shouldInterceptRequest cannot see POST bodies) and
-                // fall through, as do hosts without a config. An ECH
-                // failure returns an error page (fail-closed), never a
-                // plaintext fallback.
-                if (request?.method.equals("GET", ignoreCase = true) == true) {
-                    EchH3Router.fetchWebViewResource(url, request?.requestHeaders, isMainFrame)
-                        ?.let { return it }
-                }
+                // GeckoView 遷移後：ECH 攔截已刪（EchH3Router 不再存在）。
+                // 這個 WebView 目前走明文載入，見 docs/geckoview-migration.md。
+                // POST 和其他方法本來就不攔（shouldInterceptRequest 看不到
+                // POST body），直接放行。
 
                 return super.shouldInterceptRequest(view, request)
             }

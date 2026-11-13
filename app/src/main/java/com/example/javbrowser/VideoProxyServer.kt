@@ -8,6 +8,7 @@ import java.net.URI
 import java.net.URL
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPInputStream
 import java.util.zip.InflaterInputStream
 import okhttp3.OkHttpClient
@@ -70,22 +71,19 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
     )
 
     /**
-     * Shared ECH client for proxy upstream fetches. Shared (not
+     * Shared plain-OkHttp client for proxy upstream fetches. Shared (not
      * per-request) so video Range requests reuse connections instead of
-     * re-handshaking every segment. Built only after [EchH3Router.route]
-     * has already verified Conscrypt is up for an ECH host, so the
-     * newOkHttpClient plain-fallback trap (Conscrypt unavailable ->
-     * silent plain client) cannot fire here: route() returns Ech only
-     * when ensureProvider() is true. No call timeout (see fetchViaEch).
+     * re-handshaking every segment. GeckoView 遷移後：ECH 基建已刪，
+     * 上游改走明文 OkHttp（原先的 ECH client 同超時、無 call timeout）。
      */
-    private val echClient: OkHttpClient by lazy {
-        EchH3Router.newOkHttpClient(
-            connectSec = 15,
-            readSec = 30,
-            callSec = null,
-            followRedirects = true,
-            retryOnConnectionFailure = true,
-        )
+    private val okHttpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .retryOnConnectionFailure(true)
+            .build()
     }
 
     /**
@@ -155,13 +153,8 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
     }
 
     /**
-     * Picks the upstream transport. HTTPS + an ECH config for the host
-     * ([EchH3Router.route] == Ech) goes through the ECH client; anything
-     * else (plain HTTP, no config, DoH failure) keeps the old
-     * HttpURLConnection path byte-for-byte. The gate itself never
-     * breaks playback: if DoH fails we cannot know the config, and the
-     * ECH client could not have fetched a config either, so plain is
-     * the only possible transport anyway.
+     * Picks the upstream transport. GeckoView 遷移後：ECH 已刪，
+     * HTTPS 一律走 plain OkHttp，HTTP 走舊的 HttpURLConnection。
      */
     private fun fetchUpstream(
         realUrl: String,
@@ -171,11 +164,10 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
         isRouStream: Boolean,
     ): Upstream {
         val host = hostForUrl(realUrl)
-        val useEch = host != null &&
-            realUrl.startsWith("https://", ignoreCase = true) &&
-            runCatching { EchH3Router.route(host) == EchH3Router.Route.Ech }.getOrDefault(false)
-        return if (useEch) {
-            fetchViaEch(realUrl, referer, outboundCookies, rangeHeader, isRouStream)
+        val useOkHttp = host != null &&
+            realUrl.startsWith("https://", ignoreCase = true)
+        return if (useOkHttp) {
+            fetchViaOkHttp(realUrl, referer, outboundCookies, rangeHeader, isRouStream)
         } else {
             fetchViaHttpUrlConnection(realUrl, referer, outboundCookies, rangeHeader, isRouStream)
         }
@@ -248,7 +240,7 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
      * Conscrypt's own design, not a fallback added here: a redirect
      * hop to a host without a config goes plain exactly as before.)
      */
-    private fun fetchViaEch(
+    private fun fetchViaOkHttp(
         realUrl: String,
         referer: String,
         outboundCookies: String,
@@ -275,7 +267,7 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
         if (!rangeHeader.isNullOrEmpty() && !isRouStream) {
             requestBuilder.header("Range", rangeHeader)
         }
-        val response = echClient.newCall(requestBuilder.build()).execute()
+        val response = okHttpClient.newCall(requestBuilder.build()).execute()
         // This OkHttp declares body nullable; an upstream response with
         // no body is an error, not an empty stream (fail-closed to 500).
         val body = response.body ?: run {
@@ -292,7 +284,7 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
             setCookies = response.headers("Set-Cookie"),
             body = body.byteStream(),
             finalUrl = response.request.url.toString(),
-            via = "ECH",
+            via = "OkHttp",
             close = { response.close() },
         )
     }

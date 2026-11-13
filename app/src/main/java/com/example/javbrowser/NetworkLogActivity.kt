@@ -8,10 +8,11 @@ import android.widget.TextView
 import android.widget.Toast
 
 /**
- * In-app transport event log: whether ECH/H3 worked and why a fetch failed,
+ * In-app transport event log: whether the fetch worked and why it failed,
  * visible and copyable here — no adb needed. Events come from
- * [NetworkLogStore], written by SearchHttpFetcher and EchH3Router's
- * Cronet path; the buffer is memory-only and holds no query, URL path,
+ * [NetworkLogStore], written by SearchHttpFetcher (plain OkHttp now;
+ * ECH/H3 基建已隨 GeckoView 遷移刪除，瀏覽器載入走 Gecko 原生 ECH/DoH);
+ * the buffer is memory-only and holds no query, URL path,
  * or cookie (host only).
  */
 class NetworkLogActivity : LocalizedActivity() {
@@ -47,9 +48,9 @@ class NetworkLogActivity : LocalizedActivity() {
         val summary = NetworkLogStore.summary()
         summaryText.text = tr(
             "傳輸事件（最近 ${summary.total} 筆）\n" +
-                "ECH 成功 ${summary.echSuccess} 次 · Cronet h3 ${summary.cronetH3} 次 · 失敗 ${summary.failures} 次",
+                "OkHttp 成功 ${summary.okHttpSuccess} 次 · 失敗 ${summary.failures} 次",
             "Transport events (latest ${summary.total})\n" +
-                "ECH success ${summary.echSuccess} · Cronet h3 ${summary.cronetH3} · Failures ${summary.failures}",
+                "OkHttp success ${summary.okHttpSuccess} · Failures ${summary.failures}",
         )
         val entries = NetworkLogStore.snapshot()
         entriesText.text = if (entries.isEmpty()) {

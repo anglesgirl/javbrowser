@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feat/ech-h3-applayer
+      - feat/geckoview
   workflow_dispatch:
 
 jobs:
@@ -44,7 +45,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: javbrowser-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: app/build/outputs/apk/debug/app-debug-arm64.apk
 
   release:
     name: Publish release
@@ -69,7 +70,7 @@ jobs:
           set -e
           TAG="build-$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
           SUBJECT="$(git log -1 --pretty=%s)"
-          gh release create "$TAG" apks/app-debug.apk \
+          gh release create "$TAG" apks/app-debug-arm64.apk \
             --title "构建版 $TAG" \
-            --notes "feat/ech-h3-applayer 自动构建：$SUBJECT" \
+            --notes "feat/geckoview 自动构建：$SUBJECT" \
             --target "$GITHUB_SHA"

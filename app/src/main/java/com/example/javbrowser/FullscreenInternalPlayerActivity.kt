@@ -224,25 +224,14 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                 return super.onConsoleMessage(consoleMessage)
             }
         }
-        // ECH: bypass-host video (supjav and friends) skips the local
-        // proxy and is fetched directly by this WebView — without
-        // interception it would use plaintext TLS and get reset on
-        // filtered networks, exactly like the browser did before vc134.
-        // Same rule as the browser: GET https with an ECH config rides
-        // the ECH stack, everything else falls through to WebView
-        // default (localhost proxy URLs are http and never match).
+        // GeckoView 遷移後：不再攔截。ECH 基建（EchH3Router）已刪，
+        // 這裡的 WebView 走明文載入（見 docs/geckoview-migration.md）。
+        // localhost 代理 URL 是 http，本來就不會被攔。
         webView.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
                 view: WebView?,
                 request: WebResourceRequest?
             ): WebResourceResponse? {
-                if (request?.method.equals("GET", ignoreCase = true) == true) {
-                    EchH3Router.fetchWebViewResource(
-                        request?.url.toString(),
-                        request?.requestHeaders,
-                        request?.isForMainFrame ?: false,
-                    )?.let { return it }
-                }
                 return super.shouldInterceptRequest(view, request)
             }
         }

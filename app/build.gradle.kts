@@ -13,10 +13,21 @@ android {
         applicationId = "com.example.javbrowser"
         minSdk = 24
         targetSdk = 34
-        versionCode = 149
-        versionName = "1.2.1"
+        versionCode = 150
+        versionName = "1.2.2-gecko"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    // GeckoView ships one native lib set per ABI; arm64-only keeps the
+    // APK (and the release asset name) small. Produces app-debug-arm64.apk.
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a")
+            isUniversalApk = false
+        }
     }
 
     buildTypes {
@@ -78,6 +89,11 @@ dependencies {
     // LocalBroadcastManager for in-app event notification
     implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
 
+    // GeckoView (Firefox engine) is the rendering base now: native DoH +
+    // ECH, so the app-layer ECH/DoH stack (Conscrypt + Cronet) is gone.
+    // Same version as hyper-browser (verified working there).
+    implementation("org.mozilla.geckoview:geckoview:151.0.20260525130955")
+
     // WebKit extras: addDocumentStartJavaScript (inject before page JS)
     implementation("androidx.webkit:webkit:1.10.0")
     implementation("androidx.documentfile:documentfile:1.0.1")
@@ -88,16 +104,12 @@ dependencies {
     // 1.4.1 fits this project's Kotlin 1.9 / AGP 8.2 / compileSdk 34.
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-ui:1.4.1")
-    // OkHttp DataSource for ExoPlayer: lets the native player fetch
-    // video through the app-layer ECH OkHttpClient instead of plain
-    // HttpURLConnection (whose visible SNI gets HTTP 403 from the
-    // video CDN on the user's network).
+    // OkHttp DataSource for ExoPlayer: plain OkHttp now (the app-layer
+    // ECH client is gone with the GeckoView migration; direct-file
+    // playback on ECH-only CDNs may 403 — the javhd main path is the
+    // GeckoView embed player and is unaffected).
     implementation("androidx.media3:media3-datasource-okhttp:1.4.1")
 
-    // App-layer ECH (Conscrypt) + HTTP/3 (Cronet) for search/page fetch.
-    // OkHttp, AGP, Kotlin and the SDK levels are deliberately NOT upgraded.
-    implementation("org.conscrypt:conscrypt-android:2.7.0")
-    implementation("org.chromium.net:cronet-embedded:143.7445.0")
     implementation("org.mp4parser:muxer:1.9.56")
     implementation("androidx.work:work-runtime-ktx:2.9.0")
     
