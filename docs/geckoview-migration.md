@@ -269,3 +269,21 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
   入口在 GeckoBrowserActivity 失败页“最小测试”按钮：若默认设置
   下 about:blank 能加载，问题在主进程配置；若也加载不了，问题在
   更底层（打包 / native 库 / 运行环境），与 config 无关。
+
+## 1.2.8-gecko（vc156，2026-11-14 晚）——最小测试按钮点了没反应
+- 用户真机 18:18 报：1.2.7 仍是同款“会话未就绪，加载请求被丢弃”，
+  自检 about:blank 5 秒无动静——删 useLegacyPackaging 没修好，
+  打包不是根因。失败页“最小测试”按钮点了没反应。
+- 根因：GeckoMinimalTestActivity 在 manifest 里带
+  android:process=":geckotest"，独立进程启动时
+  JavBrowserApplication.onCreate() 会再跑一遍，调
+  AppTelemetry.initialize() 初始化 Firebase Analytics 与
+  Crashlytics；Firebase 默认不是多进程安全的，在次要进程里
+  初始化会崩/挂，导致 :geckotest 进程起不来、Activity 出不来。
+- 修法：①删掉 manifest 里的 android:process=":geckotest"，最小
+  测试改回主进程（仍用全新默认 runtime，照样能二分 config 还是
+  更底层）；②JavBrowserApplication.onCreate() 加进程守卫，非主
+  进程时跳过 AppTelemetry.initialize() 与生命周期回调注册
+  （Application.getProcessName()，API 28 以下走 ActivityManager
+  回退），防以后再有独立进程 Activity 踩同一个坑。
+- 待用户真机验：点“最小测试”应进测试页，8 秒后出结论并截图发回。

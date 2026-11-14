@@ -31,14 +31,20 @@ import org.mozilla.geckoview.WebRequestError
  * 未压缩、直接从 APK 加载）。1.2.7 已把该设置删掉与 hyper-browser
  * 对齐；本 Activity 用于二分定位，以防删掉后仍不行：
  *
- * 本 Activity 跑在独立进程（:geckotest，见 manifest），用
- * GeckoRuntime.create(context) 建一个默认 runtime——不写 config
- * 文件、不设 DoH、不设 ECH、不走 GeckoRuntimeProvider 单例，
- * 只加载 about:blank，并把每一步写进屏幕日志，8 秒后出结论：
+ * 本 Activity 跑在主进程，用 GeckoRuntime.create(context) 建一个
+ * 默认 runtime——不写 config 文件、不设 DoH、不设 ECH、不走
+ * GeckoRuntimeProvider 单例，只加载 about:blank，并把每一步写进
+ * 屏幕日志，8 秒后出结论：
  * - 通过：默认设置下 about:blank 能加载 → 内核本身正常，问题在
  *   主进程的配置（config/DoH/ECH）或单例 runtime。
  * - 失败：默认设置下 about:blank 也无法加载 → 问题在更底层
  *   （打包 / native 库 / 运行环境），与 config 无关。
+ *
+ * 注意：1.2.7 曾把它放进独立进程 :geckotest，但独立进程启动时
+ * Application.onCreate() 会再跑一遍，Firebase 在次要进程初始化
+ * 会挂，导致“最小测试”按钮点了没反应。1.2.8 起改回主进程
+ * （诊断价值在“默认 runtime”，不在“独立进程”）；Application
+ * 侧也加了进程守卫，防以后再有独立进程 Activity 踩同一个坑。
  *
  * 入口：GeckoBrowserActivity 失败页上的“最小测试”按钮。
  * 这是诊断工具，不是正式功能；根因确认后可以删掉。
@@ -120,7 +126,7 @@ class GeckoMinimalTestActivity : LocalizedActivity() {
         root.addView(closeButton)
         setContentView(root)
 
-        log("进程：${android.os.Process.myPid()}（独立 :geckotest 进程）")
+        log("进程：${android.os.Process.myPid()}（主进程）")
         log("开始：创建默认 GeckoRuntime（无 config、无 DoH、无 ECH）")
         val runtime = try {
             GeckoRuntime.create(this)
