@@ -1,5 +1,7 @@
 package com.example.javbrowser
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -8,6 +10,7 @@ import android.graphics.drawable.GradientDrawable
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -24,6 +27,8 @@ import org.mozilla.geckoview.GeckoView
 import org.mozilla.geckoview.WebRequestError
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.Space
 import android.widget.TextView
 import android.widget.Toast
@@ -107,6 +112,31 @@ class MainActivity : LocalizedActivity() {
     private lateinit var btnBlockElement: Button
     private var domBlockPickerActive = false
     private lateinit var progressBar: android.widget.ProgressBar
+    // 首页加载诊断（1.2.14-gecko）：事件时间用 elapsedRealtime（单调时钟）。
+    private var landingDiagOverlay: LinearLayout? = null
+    private var landingDiagStatus: TextView? = null
+    private var landingDiagProgress: ProgressBar? = null
+    private var landingDiagMessage: TextView? = null
+    private var landingDiagButtonRow: LinearLayout? = null
+    private var landingDiagRetryBtn: Button? = null
+    private var landingDiagSelfCheckBtn: Button? = null
+    private var landingDiagCopyBtn: Button? = null
+    private var landingLoadActive = false
+    private var landingLoadIssuedAt = 0L
+    private var landingPageStartAt: Long? = null
+    private var landingPageStopAt: Long? = null
+    private var landingPageStopSuccess: Boolean? = null
+    private var landingLoadErrorAt: Long? = null
+    private var landingLoadErrorCode: Int? = null
+    private var landingBridgeProbe = "未测"
+    private val landingDiagLog = mutableListOf<String>()
+    private var landingProbeSession: GeckoSession? = null
+    private var landingProbeRunning = false
+    private var landingProbeStarted = false
+    private val landingWatchdogRunnable = Runnable { onLandingWatchdog() }
+    private val landingProbeTimeoutRunnable = Runnable {
+        if (landingProbeRunning && !landingProbeStarted) finishLandingSelfCheck(false, "about:blank 5 秒内没有开始加载")
+    }
     private lateinit var favoritesManager: FavoritesManager
     private lateinit var privacySettings: PrivacySettings
     private lateinit var biometricHelper: BiometricHelper
@@ -300,6 +330,10 @@ class MainActivity : LocalizedActivity() {
     private var timeoutHandler: android.os.Handler? = null
     private var timeoutRunnable: Runnable? = null
     private val TIMEOUT_DURATION = 30000L // 30 seconds
+    // 首页加载诊断（1.2.14-gecko 诊断版，只加可见性，不改加载机制）。
+    private val LANDING_WATCHDOG_MS = 5_000L
+    private val LANDING_PROBE_TIMEOUT_MS = 5_000L
+    private val LANDING_BRIDGE_PROBE_TIMEOUT_MS = 5_000L
     private var backPressedTime: Long = 0
     // 儲存每個 URL 對應的滾動位置，格式為 url -> Pair(scrollX, scrollY)
     private val scrollPositionMap = HashMap<String, Pair<Int, Int>>()
@@ -2591,12 +2625,14 @@ class MainActivity : LocalizedActivity() {
                 android.util.Log.w("GeckoMain", "内容进程崩溃：$geckoCurrentUrl")
                 cancelLoadTimeout()
                 progressBar.visibility = View.GONE
+                onLandingContentDied("崩溃")
             }
 
             override fun onKill(session: GeckoSession) {
                 android.util.Log.w("GeckoMain", "内容进程被系统结束：$geckoCurrentUrl")
                 cancelLoadTimeout()
                 progressBar.visibility = View.GONE
+                onLandingContentDied("被系统结束")
             }
         }
         geckoSession.progressDelegate = object : GeckoSession.ProgressDelegate {
@@ -2605,6 +2641,7 @@ class MainActivity : LocalizedActivity() {
                 // onGeckoPageStart 里的 isOnLandingPage() 才能读到新页。
                 mapGeckoUrl(url)?.let { geckoCurrentUrl = it }
                 onGeckoPageStart(geckoCurrentUrl)
+                onLandingPageStarted()
             }
 
             override fun onProgressChange(session: GeckoSession, progress: Int) {
@@ -2619,6 +2656,7 @@ class MainActivity : LocalizedActivity() {
                     progressBar.visibility = View.GONE
                     cancelLoadTimeout()
                 }
+                onLandingPageStopped(success)
             }
         }
         geckoSession.navigationDelegate = object : GeckoSession.NavigationDelegate {
@@ -2674,6 +2712,7 @@ class MainActivity : LocalizedActivity() {
                 )
                 progressBar.visibility = View.GONE
                 cancelLoadTimeout()
+                onLandingLoadError(error.code)
                 // 返回 null：不显示 Gecko 默认错误页（旧 WebView 会显示
                 // 系统错误页；这里先保持空白，真机验证时再决定要不要
                 // 做一个本地错误页）。
@@ -7353,8 +7392,388 @@ class MainActivity : LocalizedActivity() {
         geckoCurrentUrl = LANDING_URL
         landingDataShown = true
         geckoSession.load(GeckoSession.Loader().data(landingHtml, "text/html"))
+        // 1.2.14 诊断：记录加载发出时间，亮起加载状态，启动 5 秒看门狗。
+        // 只加可见性，不改加载机制（仍走 Loader().data()）。
+        landingLoadIssuedAt = SystemClock.elapsedRealtime()
+        landingPageStartAt = null
+        landingPageStopAt = null
+        landingPageStopSuccess = null
+        landingLoadErrorAt = null
+        landingLoadErrorCode = null
+        landingBridgeProbe = "未测"
+        landingLoadActive = true
+        landingDiagLog.clear()
+        landingDiagLogLine("发出首页加载（Loader().data()，HTML 约 ${landingHtml.length} 字符）")
+        showLandingLoading()
+        armLandingWatchdog()
     }
     
+    // ── 首页加载诊断（1.2.14-gecko 诊断版）──────────────────────────────
+    // 只加可见性，不改加载机制。回答两个问题：
+    // ① 首页 data: 加载到底有没有开始（onPageStart 来没来）；
+    // ② 桥（window.Android）在 data: 页上跑不跑。
+    // 诊断版不修加载：白屏修法是第二步，按这版的诊断结果再定。
+
+    /** 当前回调是否属于本次首页加载（data: 载入映射后的地址正是 LANDING_URL）。 */
+    private fun isLandingLoadEvent(): Boolean = landingLoadActive && geckoCurrentUrl == LANDING_URL
+
+    /** 诊断事件记一行（带相对时间），进日志与“复制诊断”。 */
+    private fun landingDiagLogLine(msg: String) {
+        val rel = if (landingLoadIssuedAt == 0L) "" else "（+${SystemClock.elapsedRealtime() - landingLoadIssuedAt}ms）"
+        val line = "$msg$rel"
+        landingDiagLog.add(line)
+        android.util.Log.i("GeckoLanding", line)
+    }
+
+    private fun armLandingWatchdog() {
+        geckoMainHandler.removeCallbacks(landingWatchdogRunnable)
+        geckoMainHandler.postDelayed(landingWatchdogRunnable, LANDING_WATCHDOG_MS)
+    }
+
+    private fun cancelLandingWatchdog() {
+        geckoMainHandler.removeCallbacks(landingWatchdogRunnable)
+    }
+
+    /** 看门狗：发出后 5 秒 onPageStart 还没来，加载被静默丢弃。 */
+    private fun onLandingWatchdog() {
+        if (!landingLoadActive) return
+        if (landingPageStartAt != null) return
+        landingDiagLogLine("看门狗：发出后 5 秒 onPageStart 仍未到")
+        // 不清 landingLoadActive：加载若晚到，onPageStart 还能把失败页顶掉。
+        showLandingFailure("首页没有开始加载：浏览器会话未就绪，加载请求被丢弃")
+    }
+
+    /** 首页 onPageStart：加载真正开始了，加载态可以撤了。 */
+    private fun onLandingPageStarted() {
+        if (!isLandingLoadEvent()) return
+        landingPageStartAt = SystemClock.elapsedRealtime()
+        landingDiagLogLine("onPageStart")
+        cancelLandingWatchdog()
+        hideLandingDiagOverlay()
+    }
+
+    /** 首页 onPageStop：成功走桥探针，失败进失败页。 */
+    private fun onLandingPageStopped(success: Boolean) {
+        if (!isLandingLoadEvent()) return
+        landingPageStopAt = SystemClock.elapsedRealtime()
+        landingPageStopSuccess = success
+        landingDiagLogLine("onPageStop（success=$success）")
+        cancelLandingWatchdog()
+        landingLoadActive = false
+        if (success) {
+            runLandingBridgeProbe()
+        } else {
+            showLandingFailure("首页加载失败：页面停止时报告失败")
+        }
+    }
+
+    /** 首页 onLoadError：记下错误码，进失败页。 */
+    private fun onLandingLoadError(code: Int) {
+        if (!isLandingLoadEvent()) return
+        landingLoadErrorAt = SystemClock.elapsedRealtime()
+        landingLoadErrorCode = code
+        landingDiagLogLine("onLoadError（code=$code）")
+        cancelLandingWatchdog()
+        landingLoadActive = false
+        showLandingFailure("首页加载失败：错误码 $code")
+    }
+
+    /** 首页加载期间内容进程死了：进失败页。 */
+    private fun onLandingContentDied(how: String) {
+        if (!isLandingLoadEvent()) return
+        landingDiagLogLine("内容进程$how")
+        cancelLandingWatchdog()
+        landingLoadActive = false
+        showLandingFailure("首页加载失败：内容进程$how")
+    }
+
+    /**
+     * 桥探针：首页成功加载后，用 GeckoEval 查 window.Android 是否存在。
+     * 三种结果：BRIDGE_OK（桥在 data: 页上跑）/ BRIDGE_MISSING
+     * （页面世界里没有 window.Android）/ BRIDGE_TIMEOUT（5 秒无回音：
+     * content script 没在 data: 页运行，或 token 注不进去）。
+     * 桥不可用时也进失败页（首页按钮全死，跟白屏一样没法用）。
+     */
+    private fun runLandingBridgeProbe() {
+        landingDiagLogLine("桥探针：查 window.Android…")
+        GeckoEval.evaluate(
+            geckoSession,
+            "(typeof window.Android === 'object' || typeof window.Android === 'function') ? 'BRIDGE_OK' : 'BRIDGE_MISSING'",
+            LANDING_BRIDGE_PROBE_TIMEOUT_MS
+        ) { result ->
+            landingBridgeProbe = when {
+                result == null -> "BRIDGE_TIMEOUT（5 秒无回音：content script 未在 data: 页运行，或 token 注入失败）"
+                result.contains("BRIDGE_OK") -> "BRIDGE_OK（window.Android 存在）"
+                result.contains("BRIDGE_MISSING") -> "BRIDGE_MISSING（window.Android 不存在）"
+                else -> "未知回值：$result"
+            }
+            landingDiagLogLine("桥探针结果：$landingBridgeProbe")
+            if (landingBridgeProbe.startsWith("BRIDGE_OK")) {
+                hideLandingDiagOverlay()
+            } else {
+                val reason = if (landingBridgeProbe.startsWith("BRIDGE_TIMEOUT")) {
+                    "首页已加载，但桥没有回音：扩展 content script 可能没在 data: 页运行"
+                } else {
+                    "首页已加载，但桥不可用：window.Android 不存在，首页按钮点不了"
+                }
+                showLandingFailure(reason)
+            }
+        }
+    }
+
+    /** 失败页上的诊断快照：会话/视图/桥/各回调触发情况。 */
+    private fun landingDiagnosticState(): String {
+        val open = if (::geckoSession.isInitialized) geckoSession.isOpen else false
+        val attached = if (::geckoView.isInitialized) geckoView.isAttachedToWindow else false
+        val hasSession = if (::geckoView.isInitialized) geckoView.session != null else false
+        val w = if (::geckoView.isInitialized) geckoView.width else -1
+        val h = if (::geckoView.isInitialized) geckoView.height else -1
+        val bridgeInstalled = GeckoBridgeExtension.isInstalled
+        val javhdInstalled = JavhdGeckoExtension.isInstalled
+        fun rel(t: Long?): String =
+            if (t == null || landingLoadIssuedAt == 0L) "未触发" else "已触发（+${t - landingLoadIssuedAt}ms）"
+        return buildString {
+            appendLine("诊断快照（1.2.14-gecko）：")
+            appendLine("会话已打开=$open，视图已挂载=$attached，视图有会话=$hasSession，视图尺寸=${w}x$h")
+            appendLine("桥扩展已装=$bridgeInstalled（gecko-bridge），javhd 扩展已装=$javhdInstalled")
+            appendLine("onPageStart=${rel(landingPageStartAt)}")
+            appendLine("onPageStop=${rel(landingPageStopAt)}${if (landingPageStopSuccess != null) "，success=$landingPageStopSuccess" else ""}")
+            appendLine("onLoadError=${rel(landingLoadErrorAt)}${if (landingLoadErrorCode != null) "，code=$landingLoadErrorCode" else ""}")
+            appendLine("桥探针=$landingBridgeProbe")
+        }.trimEnd()
+    }
+
+    private fun buildLandingDiagText(reason: String): String {
+        return buildString {
+            appendLine(reason)
+            appendLine()
+            appendLine(landingDiagnosticState())
+            if (landingDiagLog.isNotEmpty()) {
+                appendLine()
+                appendLine("—— 事件日志 ——")
+                landingDiagLog.forEach { appendLine(it) }
+            }
+        }.trimEnd()
+    }
+
+    /** 首页诊断浮层（加载态 + 失败页）：盖在整个内容区上，平时隐藏。 */
+    private fun ensureLandingDiagOverlay() {
+        if (landingDiagOverlay != null) return
+        val overlay = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setBackgroundColor(Color.parseColor("#121212"))
+            setPadding(dp(24), dp(24), dp(24), dp(24))
+            visibility = View.GONE
+            layoutParams = android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        }
+        landingDiagStatus = TextView(this).apply {
+            text = "正在加载首页…"
+            setTextColor(Color.parseColor("#EEEEEE"))
+            textSize = 16f
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        overlay.addView(landingDiagStatus)
+        landingDiagProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            isIndeterminate = true
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(4)
+            ).apply { topMargin = dp(12) }
+        }
+        overlay.addView(landingDiagProgress)
+        val scroll = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0, 1f
+            ).apply { topMargin = dp(12) }
+        }
+        landingDiagMessage = TextView(this).apply {
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.parseColor("#AAAAAA"))
+            textSize = 12f
+            layoutParams = android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        scroll.addView(landingDiagMessage)
+        overlay.addView(scroll)
+        landingDiagButtonRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(16) }
+        }
+        landingDiagRetryBtn = Button(this).apply {
+            text = "重试"
+            setOnClickListener { loadLandingPage() }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(8) }
+        }
+        landingDiagSelfCheckBtn = Button(this).apply {
+            text = "自检"
+            setOnClickListener { runLandingSelfCheck() }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(8) }
+        }
+        landingDiagCopyBtn = Button(this).apply {
+            text = "复制诊断"
+            setOnClickListener { copyLandingDiagnosis() }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        landingDiagButtonRow?.addView(landingDiagRetryBtn)
+        landingDiagButtonRow?.addView(landingDiagSelfCheckBtn)
+        landingDiagButtonRow?.addView(landingDiagCopyBtn)
+        overlay.addView(landingDiagButtonRow)
+        findViewById<ViewGroup>(android.R.id.content).addView(overlay)
+        landingDiagOverlay = overlay
+    }
+
+    /** 加载态：亮起“正在加载首页…”+ 进度，按钮隐藏。 */
+    private fun showLandingLoading() {
+        ensureLandingDiagOverlay()
+        landingDiagStatus?.text = "正在加载首页…"
+        landingDiagProgress?.visibility = View.VISIBLE
+        landingDiagButtonRow?.visibility = View.GONE
+        landingDiagMessage?.text = landingDiagnosticState()
+        landingDiagOverlay?.visibility = View.VISIBLE
+    }
+
+    /** 失败页：原因 + 诊断快照 + 事件日志，三个按钮全亮。 */
+    private fun showLandingFailure(reason: String) {
+        ensureLandingDiagOverlay()
+        landingDiagStatus?.text = reason
+        landingDiagProgress?.visibility = View.GONE
+        landingDiagButtonRow?.visibility = View.VISIBLE
+        landingDiagMessage?.text = buildLandingDiagText(reason)
+        landingDiagOverlay?.visibility = View.VISIBLE
+        progressBar.visibility = View.GONE
+        android.util.Log.i("GeckoLanding", "首页诊断失败页：$reason\n${buildLandingDiagText(reason)}")
+    }
+
+    private fun hideLandingDiagOverlay() {
+        landingDiagOverlay?.visibility = View.GONE
+    }
+
+    /**
+     * 自检：用同一 runtime 新开一个探测 session 加载 about:blank
+     * （不走网络）。5 秒内 onPageStart 来了就是内核与会话正常，
+     * 问题在首页加载本身；没来就是内核或运行环境异常。
+     * （GeckoBrowserActivity.runSelfCheck 同款做法。）
+     */
+    private fun runLandingSelfCheck() {
+        if (landingProbeRunning) return
+        if (!::geckoSession.isInitialized) return
+        landingProbeRunning = true
+        landingProbeStarted = false
+        landingDiagSelfCheckBtn?.isEnabled = false
+        landingDiagSelfCheckBtn?.text = "自检中…"
+        landingDiagLogLine("自检：新会话加载 about:blank…")
+        landingDiagMessage?.text = buildLandingDiagText(landingDiagStatus?.text?.toString().orEmpty())
+        val runtime = GeckoRuntimeProvider.get(this)
+        val probe = GeckoSession()
+        probe.progressDelegate = object : GeckoSession.ProgressDelegate {
+            override fun onPageStart(session: GeckoSession, url: String) {
+                if (!landingProbeStarted) {
+                    landingProbeStarted = true
+                    geckoMainHandler.removeCallbacks(landingProbeTimeoutRunnable)
+                    finishLandingSelfCheck(true, "about:blank 已开始加载")
+                }
+            }
+
+            override fun onPageStop(session: GeckoSession, success: Boolean) {
+                if (!landingProbeStarted) {
+                    landingProbeStarted = true
+                    geckoMainHandler.removeCallbacks(landingProbeTimeoutRunnable)
+                    finishLandingSelfCheck(true, "about:blank 已加载完成")
+                }
+            }
+        }
+        landingProbeSession = probe
+        runCatching {
+            probe.open(runtime)
+            geckoView.setSession(probe)
+            probe.setActive(true)
+            probe.setFocused(true)
+            probe.loadUri("about:blank")
+        }.onFailure {
+            android.util.Log.w("GeckoLanding", "自检启动失败", it)
+            finishLandingSelfCheck(false, "探测会话启动失败：${it.message}")
+            return
+        }
+        geckoMainHandler.postDelayed(landingProbeTimeoutRunnable, LANDING_PROBE_TIMEOUT_MS)
+    }
+
+    private fun finishLandingSelfCheck(ok: Boolean, detail: String) {
+        geckoMainHandler.removeCallbacks(landingProbeTimeoutRunnable)
+        // 先把主会话挂回视图并激活，再关探测会话。
+        if (::geckoSession.isInitialized) {
+            runCatching {
+                geckoView.setSession(geckoSession)
+                activateSession()
+            }
+        }
+        landingProbeSession?.let { probe ->
+            runCatching { probe.close() }
+        }
+        landingProbeSession = null
+        landingProbeRunning = false
+        landingDiagSelfCheckBtn?.isEnabled = true
+        landingDiagSelfCheckBtn?.text = "自检"
+        val verdict = if (ok) {
+            "自检：内核与新会话正常（$detail），问题在首页加载本身，点“重试”再载一次"
+        } else {
+            "自检：新会话也无法加载（$detail）——内核或运行环境异常，请把这段话发给开发者"
+        }
+        landingDiagLogLine(verdict)
+        landingDiagMessage?.text = buildLandingDiagText(landingDiagStatus?.text?.toString().orEmpty())
+    }
+
+    /** “复制诊断”：把失败页全部内容 + 应用版本复制到剪贴板。 */
+    private fun copyLandingDiagnosis() {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("javbrowser 首页诊断", buildLandingCopyText()))
+        Toast.makeText(this, "已复制", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun buildLandingCopyText(): String {
+        val appVersion = try {
+            val pi = packageManager.getPackageInfo(packageName, 0)
+            val vc = if (android.os.Build.VERSION.SDK_INT >= 28) pi.longVersionCode else pi.versionCode.toLong()
+            "${pi.versionName} ($vc)"
+        } catch (e: Exception) {
+            "?"
+        }
+        return buildString {
+            appendLine("javbrowser 首页诊断")
+            appendLine("应用版本：$appVersion")
+            appendLine("页面：首页（Loader().data()）")
+            appendLine(landingDiagnosticState())
+            if (landingDiagLog.isNotEmpty()) {
+                appendLine("—— 事件日志 ——")
+                landingDiagLog.forEach { appendLine(it) }
+            }
+        }.trimEnd()
+    }
+
     private fun downloadAndInstallApk(url: String) {
         // 只接 http(s) 下载链接；无应用可接时不抛错（1.2.11 教训：data: URL
         // 误触发时 ACTION_VIEW 无接收方直接闪退）。
@@ -7649,6 +8068,13 @@ class MainActivity : LocalizedActivity() {
             .unregisterReceiver(favUrlReceiver)
         runCatching { unregisterReceiver(stripchatRecordingReceiver) }
         cancelLoadTimeout()
+        // 1.2.14 首页诊断：撤看门狗与自检超时，关探测会话。
+        geckoMainHandler.removeCallbacks(landingWatchdogRunnable)
+        geckoMainHandler.removeCallbacks(landingProbeTimeoutRunnable)
+        landingProbeSession?.let { probe ->
+            runCatching { probe.close() }
+        }
+        landingProbeSession = null
         videoProxyServer?.stop()
         videoProxyServer = null
         dismissStripchatPrivacyShield()

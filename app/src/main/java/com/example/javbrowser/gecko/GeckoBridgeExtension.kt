@@ -60,6 +60,9 @@ internal object GeckoBridgeExtension {
     @Volatile
     private var extension: WebExtension? = null
     private var installing = false
+
+    /** 桥扩展是否已装好（1.2.14 首页诊断快照用；与 JavhdGeckoExtension.isInstalled 同款）。 */
+    val isInstalled: Boolean get() = extension != null
     private val pendingReady = mutableListOf<(WebExtension) -> Unit>()
     private val pendingError = mutableListOf<() -> Unit>()
 

@@ -519,3 +519,40 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
 - 没动的：搜索、播放、嗅探、/api/play/ 桌面 UA、VAST 放行、11 广告域、
   迁移成果本身。`down_ra`/`.apk` 检查只在 MainActivity 这一处，
   Fullscreen 与 UnifiedSearch 没有同样模式。
+
+### 1.2.14-gecko（vc162）：首页白屏诊断版——只加可见性，不修加载
+
+- 背景：1.2.13 不闪退了，但首页直接白屏。用户 21:35 立规矩：
+  先别急着改，先做全面诊断、好好规划，不许见一个问题改一下。
+  本版是四步规划的第一步：诊断版，不修加载机制。
+- 全面诊断（已亲查代码）：首页 data: 加载在 session.open() 后
+  同步发出，内核未就绪就被静默丢弃（1.2.5/1.2.6 在
+  GeckoBrowserActivity 上踩过的同款坑），且 MainActivity 首页加载
+  没有任何进度/超时/报错反馈，丢了就是纯白屏。1.2.13 的放行改动
+  本身没错，只是把白屏露出来了。另有未知数：content script 在
+  data: 页上跑不跑（迁移文档头号风险）。
+- 本版加的（只动 MainActivity + 桥扩展 1 行）：
+  ① 首页加载亮起可见状态（“正在加载首页…”+ 不定进度条，盖在
+  内容区上的诊断浮层）；② 5 秒看门狗：loadLandingPage() 发出后
+  onPageStart 还没来就显示失败页（“首页没有开始加载”+ 原因，
+  带重试按钮；不自动重试）；③ 失败页带自检按钮：同一 runtime
+  新开探测 session 加载 about:blank，5 秒内 onPageStart 来了就是
+  内核与会话正常、问题在首页加载本身，没来就是内核或运行环境异常
+  （GeckoBrowserActivity.runSelfCheck 同款）；④ 失败页显示诊断
+  快照：会话是否打开 / 视图是否挂载 / 视图有会话 / 视图尺寸 /
+  桥扩展是否已装 / onPageStart、onPageStop、onLoadError 各自触发
+  了没、触发时间；⑤ 桥探针：首页成功加载后用 GeckoEval 查
+  window.Android 是否存在（BRIDGE_OK / BRIDGE_MISSING /
+  BRIDGE_TIMEOUT），写进诊断快照；桥不可用时也进失败页（首页按钮
+  全死，跟白屏一样没法用）；⑥ “复制诊断”按钮（一键复制应用版本
+  + 诊断快照 + 事件日志，1.2.12 嗅探页同款做法）。
+- 钩子位置：progressDelegate.onPageStart/onPageStop、
+  navigationDelegate.onLoadError、contentDelegate.onCrash/onKill
+  （只记事件、只在本次首页加载时触发：geckoCurrentUrl ==
+  LANDING_URL 才认）；GeckoBridgeExtension 补 isInstalled
+  （与 JavhdGeckoExtension.isInstalled 同款）。
+- 没动的：加载机制（首页仍走 Loader().data()）、搜索、播放、嗅探、
+  /api/play/ 桌面 UA、VAST 放行、11 广告域。
+- 待用户真机验：打开后看到什么（“正在加载首页…”还是失败页）、
+  失败页上的诊断快照截图或点“复制诊断”发回；若首页加载出来了，
+  首页按钮能不能点（桥探针的结果也在快照里）。
