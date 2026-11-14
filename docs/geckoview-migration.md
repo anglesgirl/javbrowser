@@ -186,3 +186,26 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
   兜底（失败页未显示时才显示通用原因，不覆盖 onLoadError 的具体
   原因）。追踪防护保持开（浏览器广告拦截靠它），不装 javhd 扩展，
   不改 UA；搜索、播放、嗅探、/api/play/ 桌面 UA、VAST 放行均未动。
+
+## 白屏根治 1.2.5-gecko（2026-11-14）
+- 用户真机：1.2.4 仍是白屏，而且“啥都没有”——没有进度条、没有
+  “正在加载…”、没有失败页、没有错误码。进度条只在 onPageStart 里
+  出现，30 秒超时也只在 showLoading() 里才计时，说明 onPageStart
+  根本没触发：loadUri 在 session 还没真正打开时就发出去了，加载
+  被静默丢弃，什么回调都不走。
+- 关键 API 纠正（已核对 mozilla-central 源码）：GeckoView 151 里
+  GeckoSession.open() 返回 void，没有 GeckoResult 可链（老版本才
+  返回 GeckoResult）。open() 文档说“Most GeckoSession methods only
+  take effect on an open session, and are queued until the session is
+  opened here”，但实测 loadUri 还是丢了。等价做法：open 后立刻把
+  加载 UI 亮出来（用户从第 0 秒就看到进度条，不再是白屏），再延
+  时 500ms 发 loadUri，给原生 session 打开留时间；另加 5 秒“未开
+  始加载”看门狗：onPageStart 5 秒不来就自动重调一次 loadUri（只
+  一次），再 5 秒还没动静就直接进失败页写明原因（“页面没有开始加
+  载：浏览器会话未就绪，加载请求被丢弃”+ 地址 + 重试按钮）。
+- 追踪防护也跟嵌頁播放器/嗅探统一关掉（useTrackingProtection =
+  false）：Disconnect 清单可能误拦站点关键资源，页面能打开优先于
+  浏览器挡广告；三个 Gecko 活动配置一致，少一个变量。
+- 三种结局都有可见反馈：真加载出来 / 加载失败有错误码 / 加载压
+  根没开始也有原因，不再无限白屏。搜索、播放、嗅探、/api/play/
+  桌面 UA、VAST 放行均未动。

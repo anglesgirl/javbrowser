@@ -32,8 +32,7 @@ import org.mozilla.geckoview.WebRequestError
  * DoH + ECH，SNI 不明文，不会被 RST。
  *
  * 只做浏览，不装 javhd 扩展（那是嵌頁播放器专用的广告拦截/VAST
- * 跳过）；广告拦截靠 Gecko 内建追踪防护（GeckoRuntimeProvider 默认
- * 开着）。搜索与播放主流程不动。
+ * 跳过）。搜索与播放主流程不动。
  *
  * 白屏修（2026-11-14 1.2.4-gecko）：1.2.3 用户真机点 JavDB 只见白
  * 屏。核对过，搭建与能播的嵌頁播放器等价（同一 Runtime、同一
@@ -45,6 +44,22 @@ import org.mozilla.geckoview.WebRequestError
  * 的是反馈与重试：可见进度条 +“正在加载…”、30 秒加载超时、失败
  * 时用 onLoadError 拿真实错误原因显示在失败页上 + 重试按钮，不
  * 再白屏静默。
+ *
+ * 白屏根治（2026-11-14 1.2.5-gecko）：1.2.4 用户真机仍是白屏，
+ * 而且“啥都没有”——没有进度条、没有“正在加载…”、没有失败页、
+ * 没有错误码。进度条只在 onPageStart 里出现，30 秒超时也只在
+ * showLoading() 里才计时，说明 onPageStart 根本没触发：loadUri
+ * 在 session 还没真正打开时就发出去了，加载被静默丢弃，什么回
+ * 调都不走。注意 GeckoView 151 里 GeckoSession.open() 返回 void，
+ * 没有 GeckoResult 可链（老版本才返回 GeckoResult），所以不能链
+ * 式等打开——等价做法是：open 后先把加载 UI 立刻亮出来（用户从
+ * 第 0 秒就看到进度条，不再是白屏），再延时 500ms 发 loadUri，
+ * 给原生 session 打开留时间；另加 5 秒“未开始加载”看门狗：
+ * onPageStart 5 秒不来就自动重调一次 loadUri（只一次），再 5 秒
+ * 还没动静就直接进失败页写明原因。三种结局（真加载出来 / 加载
+ * 失败有错误码 / 加载压根没开始也有原因）都有可见反馈，不再无
+ * 限白屏。追踪防护也跟嵌頁播放器/嗅探统一关掉（Disconnect 清单
+ * 可能误拦站点关键资源，页面能打开优先于浏览器挡广告）。
  */
 class GeckoBrowserActivity : LocalizedActivity() {
 
@@ -54,12 +69,11 @@ class GeckoBrowserActivity : LocalizedActivity() {
 
         /** 一次页面加载超过这么久没出结果，就当超时，显示失败页（可重试）。 */
         private const val LOAD_TIMEOUT_MS = 30_000L
-
-        fun intent(context: Context, url: String, title: String = ""): Intent =
-            Intent(context, GeckoBrowserActivity::class.java).apply {
-                putExtra(EXTRA_URL, url)
-                putExtra(EXTRA_TITLE, title)
-            }
+        /** 发 loadUri 后 onPageStart 久久不来，就当加载被丢弃，自动重试。 */
+        private const val LOAD_START_TIMEOUT_MS = 5_000L
+        /** open() 之后等这么久再发首个 loadUri，给原生 session 打开留时间。 */
+        private const val LOAD_START_DELAY_MS = 500L
+        private const val TAG = "GeckoBrowser"
     }
 
     private lateinit var geckoView: GeckoView
@@ -74,11 +88,37 @@ class GeckoBrowserActivity : LocalizedActivity() {
     /** 当前正在载入的地址（重试用；跳转后由 onLocationChange 更新）。 */
     private var currentUrl = ""
     private var loading = false
+    /** onPageStart 是否来过（加载是否真的开始了）。 */
+    private var pageStarted = false
+    /** 5 秒看门狗是否已经自动重试过一次。 */
+    private var loadRetried = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private val loadTimeoutRunnable = Runnable {
         if (loading) {
-            Log.i("GeckoBrowser", "加载超时：$currentUrl")
+            Log.i(TAG, "加载超时：$currentUrl")
             showError("加载超时：30 秒没有响应，当前网络很慢或连接被阻断")
+        }
+    }
+    /** 首次加载延时发出（等原生 session 打开），页面没开始加载时的兜底重试。 */
+    private val initialLoadRunnable = Runnable {
+        if (::geckoSession.isInitialized) {
+            startLoad(currentUrl)
+        }
+    }
+    private val startWatchdogRunnable = Runnable {
+        if (pageStarted || !::geckoSession.isInitialized) return@Runnable
+        if (!loadRetried) {
+            loadRetried = true
+            Log.w(TAG, "5 秒未触发 onPageStart，自动重载一次：$currentUrl")
+            if (geckoSession.isOpen) {
+                geckoSession.loadUri(currentUrl)
+                armStartWatchdog()
+            } else {
+                showError("页面没有开始加载：浏览器会话未打开\n$currentUrl")
+            }
+        } else {
+            Log.w(TAG, "重试后仍未触发 onPageStart：$currentUrl")
+            showError("页面没有开始加载：浏览器会话未就绪，加载请求被丢弃\n$currentUrl")
         }
     }
 
@@ -220,13 +260,17 @@ class GeckoBrowserActivity : LocalizedActivity() {
         geckoSession = GeckoSession()
         geckoSession.settings.apply {
             allowJavascript = true
-            // 不关追踪防护：通用浏览器靠它挡广告/追踪器（嵌頁播放器
-            // 才关，怕误拦 VAST/视频 CDN）。
+            // 跟嵌頁播放器/嗅探统一：关掉 Gecko 内建追踪防护。它用
+            // Disconnect 清单，可能误拦站点关键资源；页面能打开优先
+            // 于浏览器挡广告（广告拦截以后再说）。
+            useTrackingProtection = false
         }
         geckoSession.progressDelegate = object : GeckoSession.ProgressDelegate {
             override fun onPageStart(session: GeckoSession, url: String) {
                 urlText.text = url
                 currentUrl = url
+                pageStarted = true
+                mainHandler.removeCallbacks(startWatchdogRunnable)
                 showLoading()
             }
 
@@ -237,6 +281,7 @@ class GeckoBrowserActivity : LocalizedActivity() {
             override fun onPageStop(session: GeckoSession, success: Boolean) {
                 loading = false
                 mainHandler.removeCallbacks(loadTimeoutRunnable)
+                mainHandler.removeCallbacks(startWatchdogRunnable)
                 if (success) {
                     hideOverlays()
                 } else if (errorView.visibility != View.VISIBLE) {
@@ -270,17 +315,39 @@ class GeckoBrowserActivity : LocalizedActivity() {
             ): GeckoResult<String>? {
                 loading = false
                 mainHandler.removeCallbacks(loadTimeoutRunnable)
+                mainHandler.removeCallbacks(startWatchdogRunnable)
                 val failedUrl = uri ?: currentUrl
-                Log.i("GeckoBrowser", "载入失败：$failedUrl code=${error.code} category=${error.category}")
+                Log.i(TAG, "载入失败：$failedUrl code=${error.code} category=${error.category}")
                 showError("${describeError(error)}\n$failedUrl")
                 // 返回 null：不显示 Gecko 默认错误页，用我们自己的失败页。
                 return null
             }
         }
+        // 加载 UI 立刻亮出来：用户从第 0 秒就看到进度条，不再是白屏。
+        showLoading()
         geckoSession.open(runtime)
         geckoView.setSession(geckoSession)
-        // Gecko 原生 ECH/DoH，直接载入，不再明文 SNI。
+        // Gecko 原生 ECH/DoH，直接载入，不再明文 SNI。open() 是异步的，
+        // 立刻发 loadUri 可能在 session 还没打开时被静默丢弃，所以延
+        // 时 500ms 再发；5 秒看门狗会兜底（没开始就自动重调一次）。
+        mainHandler.postDelayed(initialLoadRunnable, LOAD_START_DELAY_MS)
+    }
+
+    /** 发起一次加载：重置“是否开始”状态，发 loadUri，启动 5 秒看门狗。 */
+    private fun startLoad(url: String) {
+        if (!::geckoSession.isInitialized) return
+        currentUrl = url
+        pageStarted = false
+        loadRetried = false
+        Log.i(TAG, "开始加载：$url (session open=${geckoSession.isOpen})")
+        showLoading()
         geckoSession.loadUri(url)
+        armStartWatchdog()
+    }
+
+    private fun armStartWatchdog() {
+        mainHandler.removeCallbacks(startWatchdogRunnable)
+        mainHandler.postDelayed(startWatchdogRunnable, LOAD_START_TIMEOUT_MS)
     }
 
     private fun showLoading() {
@@ -301,6 +368,9 @@ class GeckoBrowserActivity : LocalizedActivity() {
     }
 
     private fun showError(reason: String) {
+        loading = false
+        mainHandler.removeCallbacks(loadTimeoutRunnable)
+        mainHandler.removeCallbacks(startWatchdogRunnable)
         progressBar.visibility = View.GONE
         statusText.visibility = View.GONE
         errorMessage.text = reason
@@ -310,7 +380,7 @@ class GeckoBrowserActivity : LocalizedActivity() {
     private fun retryLoad() {
         if (!::geckoSession.isInitialized) return
         errorView.visibility = View.GONE
-        geckoSession.loadUri(currentUrl)
+        startLoad(currentUrl)
     }
 
     /** 把 WebRequestError 的错误码翻译成人话（附错误码，方便报障）。 */
@@ -354,6 +424,8 @@ class GeckoBrowserActivity : LocalizedActivity() {
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(loadTimeoutRunnable)
+        mainHandler.removeCallbacks(startWatchdogRunnable)
+        mainHandler.removeCallbacks(initialLoadRunnable)
         if (::geckoSession.isInitialized) {
             geckoSession.close()
         }
