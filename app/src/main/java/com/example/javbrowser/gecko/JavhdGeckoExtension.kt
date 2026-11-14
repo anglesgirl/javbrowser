@@ -78,7 +78,7 @@ object JavhdGeckoExtension {
     private val mediaCandidateSourceHandlers = mutableMapOf<GeckoSession, (String, String) -> Unit>()
 
     /** 该 session 的页面探针上报回调（GeckoSniffActivity，1.2.12 诊断用）。 */
-    private val probeReportHandlers = mutableMapOf<GeckoSession, (JSONObject) -> Unit/>
+    private val probeReportHandlers = mutableMapOf<GeckoSession, (JSONObject) -> Unit>()
 
     /** 该 session 的“正片已开始播放”回调（GeckoSniffActivity）。 */
     private val videoPlayingHandlers = mutableMapOf<GeckoSession, (JSONObject) -> Unit>()
