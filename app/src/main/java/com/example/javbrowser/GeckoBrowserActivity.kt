@@ -34,32 +34,43 @@ import org.mozilla.geckoview.WebRequestError
  * 只做浏览，不装 javhd 扩展（那是嵌頁播放器专用的广告拦截/VAST
  * 跳过）。搜索与播放主流程不动。
  *
- * 白屏修（2026-11-14 1.2.4-gecko）：1.2.3 用户真机点 JavDB 只见白
- * 屏。核对过，搭建与能播的嵌頁播放器等价（同一 Runtime、同一
- * open → setSession → loadUri 顺序；布局是标准顶栏 + weight=1 的
- * GeckoView；追踪防护只拦第三方追踪器，不拦主文档），不是渲染
- * 搭错。真正的问题是加载慢/失败时零反馈：页面在用户当时 0.75KB/s
- * 的网络下极慢或失败（RST/超时），而旧版没有任何加载进度，失败
- * 只有一个 2 秒就消失的 Toast——慢和失败看起来都是白屏。所以修
- * 的是反馈与重试：可见进度条 +“正在加载…”、30 秒加载超时、失败
- * 时用 onLoadError 拿真实错误原因显示在失败页上 + 重试按钮，不
- * 再白屏静默。
+ * 白屏根治 1.2.6-gecko：1.2.5 用户真机失败页终于出来了，写的是
+ * “页面没有开始加载：浏览器会话未就绪，加载请求被丢弃”——延时
+ * 500ms + 5 秒看门狗重调一次都没让 onPageStart 触发，而且看门狗
+ * 第一跳时 session.isOpen 已是 true（否则会先报“会话未打开”）。
+ * 所以 session 是打开的，但加载就是不开始。已核对 GeckoView 151
+ * 的 mozilla-central 源码，两个静默丢弃的关卡：
  *
- * 白屏根治（2026-11-14 1.2.5-gecko）：1.2.4 用户真机仍是白屏，
- * 而且“啥都没有”——没有进度条、没有“正在加载…”、没有失败页、
- * 没有错误码。进度条只在 onPageStart 里出现，30 秒超时也只在
- * showLoading() 里才计时，说明 onPageStart 根本没触发：loadUri
- * 在 session 还没真正打开时就发出去了，加载被静默丢弃，什么回
- * 调都不走。注意 GeckoView 151 里 GeckoSession.open() 返回 void，
- * 没有 GeckoResult 可链（老版本才返回 GeckoResult），所以不能链
- * 式等打开——等价做法是：open 后先把加载 UI 立刻亮出来（用户从
- * 第 0 秒就看到进度条，不再是白屏），再延时 500ms 发 loadUri，
- * 给原生 session 打开留时间；另加 5 秒“未开始加载”看门狗：
- * onPageStart 5 秒不来就自动重调一次 loadUri（只一次），再 5 秒
- * 还没动静就直接进失败页写明原因。三种结局（真加载出来 / 加载
- * 失败有错误码 / 加载压根没开始也有原因）都有可见反馈，不再无
- * 限白屏。追踪防护也跟嵌頁播放器/嗅探统一关掉（Disconnect 清单
- * 可能误拦站点关键资源，页面能打开优先于浏览器挡广告）。
+ * ① open() 是异步的：isOpen() 只表示 Java 层 mWindow 已建好，
+ * 原生 Window.open 要等 GeckoThread.PROFILE_READY 才执行；
+ * loadUri() 发出的 GeckoView:LoadUri 事件进 NativeQueue 排队，
+ * 内核没就绪就一直排着，不回调、不报错。runtime 若迟迟不到
+ * PROFILE_READY，加载就永远不开始。
+ * ② setActive(true) 只由 Surface 触发：GeckoView.setSession()
+ * 只在 view 已挂载时才 acquire display；onAttachedToWindow() 也
+ * 只 acquire；真正调 session.setActive(true) 的是底层 Surface
+ * 的 onSurfaceChanged/acquire（SurfaceListener 里 mValid 置真后
+ * 才调）。javbrowser 从没显式调过 setActive，全靠 Surface 路径
+ * 激活——而 hyper-browser 是显式调的（GeckoSessionController
+ * .setVisible/focusForUserInteraction：setActive(true) +
+ * setFocused(true) + PRIORITY_HIGH）。会话没激活，加载不开始，
+ * 同样静默。
+ *
+ * 修法（只改本文件 + MainActivity 预热一行，不动其他流程）：
+ * ① setSession 后立刻显式 setActive(true) + setFocused(true) +
+ * setPriorityHint(PRIORITY_HIGH)，onResume() 再断言一次，
+ * onPause() 置 inactive——不依赖 Surface 路径；
+ * ② 首个 loadUri 改走 geckoView.post（挂载 + 布局完成后再发，
+ * 保证视图已有真实尺寸/Surface），另加 1 秒兜底延时（只发一次）；
+ * ③ MainActivity.onCreate 里 decorView.post 预热 GeckoRuntime，
+ * 让内核在首页停留期间就开始初始化，到点网站时已 PROFILE_READY；
+ * ④ ContentDelegate.onCrash/onKill 进失败页（内容进程死了也不再
+ * 静默）；⑤失败页加“自检”按钮：用同一 runtime 新开一个探测
+ * session 加载 about:blank（不走网络），5 秒内 onPageStart 来了
+ * 就是内核/会话正常、问题在目标网址或网络，没来就是内核或运行
+ * 环境异常——定位写进失败页；失败页同时显示诊断快照
+ * （会话是否打开 / 视图是否挂载 / 视图尺寸）。
+ * 搜索、播放、嗅探、/api/play/ 桌面 UA、VAST 放行均未动。
  */
 class GeckoBrowserActivity : LocalizedActivity() {
 
@@ -71,8 +82,10 @@ class GeckoBrowserActivity : LocalizedActivity() {
         private const val LOAD_TIMEOUT_MS = 30_000L
         /** 发 loadUri 后 onPageStart 久久不来，就当加载被丢弃，自动重试。 */
         private const val LOAD_START_TIMEOUT_MS = 5_000L
-        /** open() 之后等这么久再发首个 loadUri，给原生 session 打开留时间。 */
-        private const val LOAD_START_DELAY_MS = 500L
+        /** geckoView.post 没跑起来时的兜底：最多等这么久就发首个 loadUri。 */
+        private const val LOAD_START_FALLBACK_DELAY_MS = 1_000L
+        /** 自检（about:blank）等 onPageStart 的上限。 */
+        private const val PROBE_TIMEOUT_MS = 5_000L
         private const val TAG = "GeckoBrowser"
 
         fun intent(context: Context, url: String, title: String = ""): Intent =
@@ -89,6 +102,8 @@ class GeckoBrowserActivity : LocalizedActivity() {
     private lateinit var statusText: TextView
     private lateinit var errorView: LinearLayout
     private lateinit var errorMessage: TextView
+    private lateinit var retryButton: Button
+    private lateinit var selfCheckButton: Button
     /** 由 NavigationDelegate.onCanGoBack 维护（GeckoSession 没有 canGoBack() 方法）。 */
     private var canGoBack = false
     /** 当前正在载入的地址（重试用；跳转后由 onLocationChange 更新）。 */
@@ -98,6 +113,8 @@ class GeckoBrowserActivity : LocalizedActivity() {
     private var pageStarted = false
     /** 5 秒看门狗是否已经自动重试过一次。 */
     private var loadRetried = false
+    /** 首个 loadUri 是否已发出（post 与兜底延时只发一次）。 */
+    private var initialLoadStarted = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private val loadTimeoutRunnable = Runnable {
         if (loading) {
@@ -105,18 +122,15 @@ class GeckoBrowserActivity : LocalizedActivity() {
             showError("加载超时：30 秒没有响应，当前网络很慢或连接被阻断")
         }
     }
-    /** 首次加载延时发出（等原生 session 打开），页面没开始加载时的兜底重试。 */
-    private val initialLoadRunnable = Runnable {
-        if (::geckoSession.isInitialized) {
-            startLoad(currentUrl)
-        }
-    }
+    /** 首次加载兜底发出（geckoView.post 没跑起来时用）。 */
+    private val initialLoadFallbackRunnable = Runnable { startInitialLoad() }
     private val startWatchdogRunnable = Runnable {
         if (pageStarted || !::geckoSession.isInitialized) return@Runnable
         if (!loadRetried) {
             loadRetried = true
             Log.w(TAG, "5 秒未触发 onPageStart，自动重载一次：$currentUrl")
             if (geckoSession.isOpen) {
+                activateSession()
                 geckoSession.loadUri(currentUrl)
                 armStartWatchdog()
             } else {
@@ -126,6 +140,13 @@ class GeckoBrowserActivity : LocalizedActivity() {
             Log.w(TAG, "重试后仍未触发 onPageStart：$currentUrl")
             showError("页面没有开始加载：浏览器会话未就绪，加载请求被丢弃\n$currentUrl")
         }
+    }
+    /** 自检探测用的 session（用完即关，不影响主会话）。 */
+    private var probeSession: GeckoSession? = null
+    private var probeRunning = false
+    private var probeStarted = false
+    private val probeTimeoutRunnable = Runnable {
+        if (probeRunning && !probeStarted) finishSelfCheck(false, "about:blank 5 秒内没有开始加载")
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -247,7 +268,7 @@ class GeckoBrowserActivity : LocalizedActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             )
         }
-        val retryButton = Button(this).apply {
+        retryButton = Button(this).apply {
             text = "重试"
             setOnClickListener { retryLoad() }
             layoutParams = LinearLayout.LayoutParams(
@@ -255,9 +276,21 @@ class GeckoBrowserActivity : LocalizedActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { gravity = Gravity.CENTER_HORIZONTAL }
         }
+        selfCheckButton = Button(this).apply {
+            text = "自检"
+            setOnClickListener { runSelfCheck() }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                topMargin = dp(12)
+            }
+        }
         errorView.addView(errorTitle)
         errorView.addView(errorMessage)
         errorView.addView(retryButton)
+        errorView.addView(selfCheckButton)
         contentFrame.addView(errorView)
         root.addView(contentFrame)
         setContentView(root)
@@ -270,6 +303,17 @@ class GeckoBrowserActivity : LocalizedActivity() {
             // Disconnect 清单，可能误拦站点关键资源；页面能打开优先
             // 于浏览器挡广告（广告拦截以后再说）。
             useTrackingProtection = false
+        }
+        geckoSession.contentDelegate = object : GeckoSession.ContentDelegate {
+            override fun onCrash(session: GeckoSession) {
+                Log.w(TAG, "内容进程崩溃：$currentUrl")
+                showError("页面进程崩溃：浏览器内核的内容进程已崩溃，点“重试”重新加载")
+            }
+
+            override fun onKill(session: GeckoSession) {
+                Log.w(TAG, "内容进程被系统结束：$currentUrl")
+                showError("页面进程被系统结束：内存不足或被系统回收，点“重试”重新加载")
+            }
         }
         geckoSession.progressDelegate = object : GeckoSession.ProgressDelegate {
             override fun onPageStart(session: GeckoSession, url: String) {
@@ -333,10 +377,49 @@ class GeckoBrowserActivity : LocalizedActivity() {
         showLoading()
         geckoSession.open(runtime)
         geckoView.setSession(geckoSession)
-        // Gecko 原生 ECH/DoH，直接载入，不再明文 SNI。open() 是异步的，
-        // 立刻发 loadUri 可能在 session 还没打开时被静默丢弃，所以延
-        // 时 500ms 再发；5 秒看门狗会兜底（没开始就自动重调一次）。
-        mainHandler.postDelayed(initialLoadRunnable, LOAD_START_DELAY_MS)
+        // 显式激活会话：不依赖 Surface 路径（GeckoView 只在底层
+        // Surface 就绪后才调 setActive(true)，而首个 loadUri 必须
+        // 在激活的会话上发）。hyper-browser 同款做法。
+        activateSession()
+        // 首个 loadUri 等视图挂载 + 布局完成后再发（geckoView.post
+        // 在挂载与测量后执行，保证视图已有真实尺寸/Surface）；1 秒
+        // 兜底延时防 post 没跑起来。只发一次。
+        geckoView.post { startInitialLoad() }
+        mainHandler.postDelayed(initialLoadFallbackRunnable, LOAD_START_FALLBACK_DELAY_MS)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 视图 detach/reattach 后再断言一次激活（Surface 重建时
+        // GeckoView 也会自己调，但显式断言不依赖它）。
+        if (::geckoSession.isInitialized && geckoSession.isOpen) {
+            activateSession()
+        }
+    }
+
+    override fun onPause() {
+        if (::geckoSession.isInitialized && geckoSession.isOpen) {
+            runCatching { geckoSession.setActive(false) }
+        }
+        super.onPause()
+    }
+
+    /** 显式激活 + 聚焦会话（hyper-browser 的 setVisible 做法）。 */
+    private fun activateSession() {
+        if (!::geckoSession.isInitialized) return
+        runCatching {
+            geckoSession.setActive(true)
+            geckoSession.setFocused(true)
+            geckoSession.setPriorityHint(GeckoSession.PRIORITY_HIGH)
+        }
+    }
+
+    /** 首个 loadUri（只发一次；post 与兜底延时都走这里）。 */
+    private fun startInitialLoad() {
+        if (initialLoadStarted) return
+        initialLoadStarted = true
+        mainHandler.removeCallbacks(initialLoadFallbackRunnable)
+        startLoad(currentUrl)
     }
 
     /** 发起一次加载：重置“是否开始”状态，发 loadUri，启动 5 秒看门狗。 */
@@ -345,6 +428,7 @@ class GeckoBrowserActivity : LocalizedActivity() {
         currentUrl = url
         pageStarted = false
         loadRetried = false
+        activateSession()
         Log.i(TAG, "开始加载：$url (session open=${geckoSession.isOpen})")
         showLoading()
         geckoSession.loadUri(url)
@@ -379,14 +463,97 @@ class GeckoBrowserActivity : LocalizedActivity() {
         mainHandler.removeCallbacks(startWatchdogRunnable)
         progressBar.visibility = View.GONE
         statusText.visibility = View.GONE
-        errorMessage.text = reason
+        errorMessage.text = "$reason\n\n${diagnosticState()}"
         errorView.visibility = View.VISIBLE
+    }
+
+    /** 失败页上的诊断快照：直接验证“会话/视图/Surface”三关。 */
+    private fun diagnosticState(): String {
+        val open = if (::geckoSession.isInitialized) geckoSession.isOpen else false
+        val attached = if (::geckoView.isInitialized) geckoView.isAttachedToWindow else false
+        val w = if (::geckoView.isInitialized) geckoView.width else -1
+        val h = if (::geckoView.isInitialized) geckoView.height else -1
+        val hasSession = if (::geckoView.isInitialized) geckoView.session != null else false
+        return "诊断：会话已打开=$open，视图已挂载=$attached，视图有会话=$hasSession，视图尺寸=${w}x$h"
     }
 
     private fun retryLoad() {
         if (!::geckoSession.isInitialized) return
         errorView.visibility = View.GONE
         startLoad(currentUrl)
+    }
+
+    /**
+     * 自检：用同一 runtime 新开一个探测 session 加载 about:blank
+     * （不走网络）。5 秒内 onPageStart 来了就是内核与会话正常，
+     * 问题在目标网址或网络；没来就是内核或运行环境异常。
+     * 探测完把主会话挂回视图，不影响主会话（它一直开着）。
+     */
+    private fun runSelfCheck() {
+        if (probeRunning) return
+        if (!::geckoSession.isInitialized) return
+        probeRunning = true
+        probeStarted = false
+        selfCheckButton.isEnabled = false
+        selfCheckButton.text = "自检中…"
+        errorMessage.text = "${errorMessage.text}\n\n自检中：新会话加载 about:blank…"
+        val runtime = GeckoRuntimeProvider.get(this)
+        val probe = GeckoSession()
+        probe.progressDelegate = object : GeckoSession.ProgressDelegate {
+            override fun onPageStart(session: GeckoSession, url: String) {
+                if (!probeStarted) {
+                    probeStarted = true
+                    mainHandler.removeCallbacks(probeTimeoutRunnable)
+                    finishSelfCheck(true, "about:blank 已开始加载")
+                }
+            }
+
+            override fun onPageStop(session: GeckoSession, success: Boolean) {
+                if (!probeStarted) {
+                    probeStarted = true
+                    mainHandler.removeCallbacks(probeTimeoutRunnable)
+                    finishSelfCheck(true, "about:blank 已加载完成")
+                }
+            }
+        }
+        probeSession = probe
+        runCatching {
+            probe.open(runtime)
+            geckoView.setSession(probe)
+            probe.setActive(true)
+            probe.setFocused(true)
+            probe.loadUri("about:blank")
+        }.onFailure {
+            Log.w(TAG, "自检启动失败", it)
+            finishSelfCheck(false, "探测会话启动失败：${it.message}")
+            return
+        }
+        mainHandler.postDelayed(probeTimeoutRunnable, PROBE_TIMEOUT_MS)
+    }
+
+    private fun finishSelfCheck(ok: Boolean, detail: String) {
+        mainHandler.removeCallbacks(probeTimeoutRunnable)
+        // 先把主会话挂回视图并激活，再关探测会话。
+        if (::geckoSession.isInitialized) {
+            runCatching {
+                geckoView.setSession(geckoSession)
+                activateSession()
+            }
+        }
+        probeSession?.let { probe ->
+            runCatching { probe.close() }
+        }
+        probeSession = null
+        probeRunning = false
+        selfCheckButton.isEnabled = true
+        selfCheckButton.text = "自检"
+        val verdict = if (ok) {
+            "自检：内核与新会话正常（$detail），问题在目标网址或网络，点“重试”再载一次"
+        } else {
+            "自检：新会话也无法加载（$detail）——内核或运行环境异常，请把这段话发给开发者"
+        }
+        Log.i(TAG, verdict)
+        errorMessage.text = "${errorMessage.text}\n\n$verdict"
     }
 
     /** 把 WebRequestError 的错误码翻译成人话（附错误码，方便报障）。 */
@@ -431,7 +598,12 @@ class GeckoBrowserActivity : LocalizedActivity() {
     override fun onDestroy() {
         mainHandler.removeCallbacks(loadTimeoutRunnable)
         mainHandler.removeCallbacks(startWatchdogRunnable)
-        mainHandler.removeCallbacks(initialLoadRunnable)
+        mainHandler.removeCallbacks(initialLoadFallbackRunnable)
+        mainHandler.removeCallbacks(probeTimeoutRunnable)
+        probeSession?.let { probe ->
+            runCatching { probe.close() }
+        }
+        probeSession = null
         if (::geckoSession.isInitialized) {
             geckoSession.close()
         }

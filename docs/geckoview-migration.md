@@ -209,3 +209,38 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
 - 三种结局都有可见反馈：真加载出来 / 加载失败有错误码 / 加载压
   根没开始也有原因，不再无限白屏。搜索、播放、嗅探、/api/play/
   桌面 UA、VAST 放行均未动。
+
+## 白屏根治 1.2.6-gecko（2026-11-14）
+- 用户真机：1.2.5 失败页终于出来了，写的是“页面没有开始加载：
+  浏览器会话未就绪，加载请求被丢弃”——延时 500ms + 5 秒看门狗
+  重调一次都没让 onPageStart 触发。而且看门狗第一跳时
+  session.isOpen 已是 true（否则会先报“会话未打开”）：session
+  是打开的，但加载就是不开始。不是单纯时序不够。
+- 根因（已核对 GeckoView 151 的 mozilla-central 源码，
+  GeckoSession.java / GeckoView.java）：两个静默丢弃的关卡。
+  ① open() 是异步的：isOpen() 只表示 Java 层 mWindow 已建好，
+  原生 Window.open 要等 GeckoThread.PROFILE_READY 才执行；
+  loadUri() 发出的 GeckoView:LoadUri 事件进 NativeQueue 排队，
+  内核没就绪就一直排着，不回调、不报错。② setActive(true) 只
+  由 Surface 触发：GeckoView.setSession() 只在 view 已挂载时才
+  acquire display；onAttachedToWindow() 也只 acquire；真正调
+  session.setActive(true) 的是底层 Surface 的 onSurfaceChanged /
+  acquire（mValid 置真后才调）。javbrowser 从没显式调过
+  setActive，全靠 Surface 路径激活——而 hyper-browser 是显式调
+  的（GeckoSessionController.setVisible/focusForUserInteraction：
+  setActive(true) + setFocused(true) + PRIORITY_HIGH）。
+- 修法（只改 GeckoBrowserActivity + MainActivity 预热一行）：
+  ① setSession 后立刻显式 setActive(true) + setFocused(true) +
+  setPriorityHint(PRIORITY_HIGH)，onResume() 再断言一次，
+  onPause() 置 inactive——不依赖 Surface 路径；②首个 loadUri
+  改走 geckoView.post（挂载 + 布局完成后再发，保证视图已有真实
+  尺寸/Surface），另加 1 秒兜底延时（只发一次）；③
+  MainActivity.onCreate 里 decorView.post 预热 GeckoRuntime，让
+  内核在首页停留期间就开始初始化，到点网站时已 PROFILE_READY；
+  ④ ContentDelegate.onCrash/onKill 进失败页（内容进程死了也不再
+  静默）；⑤失败页加“自检”按钮：用同一 runtime 新开探测 session
+  加载 about:blank（不走网络），5 秒内 onPageStart 来了就是内核
+  与会话正常、问题在目标网址或网络，没来就是内核或运行环境异常，
+  定位写进失败页；失败页同时显示诊断快照（会话是否打开 / 视图
+  是否挂载 / 视图有会话 / 视图尺寸）。搜索、播放、嗅探、
+  /api/play/ 桌面 UA、VAST 放行均未动。

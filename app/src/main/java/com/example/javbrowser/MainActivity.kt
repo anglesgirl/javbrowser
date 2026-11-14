@@ -280,6 +280,14 @@ class MainActivity : LocalizedActivity() {
         }
         setContentView(R.layout.activity_main)
 
+        // 预热 Gecko 内核：让 GeckoRuntime 在首页停留期间就开始初始化，
+        // 首页点网站进 GeckoBrowserActivity 时 runtime 已就绪
+        // （PROFILE_READY），避免首个 session 的加载卡在等内核就绪。
+        // 第一帧后再跑，不拖首页启动；失败也不影响首页。
+        window.decorView.post {
+            runCatching { com.example.javbrowser.gecko.GeckoRuntimeProvider.get(this) }
+        }
+
         favoritesManager = FavoritesManager(this)
 
         // Start local proxy for CDN-protected video (e.g. avjoy.me)
