@@ -556,3 +556,42 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
 - 待用户真机验：打开后看到什么（“正在加载首页…”还是失败页）、
   失败页上的诊断快照截图或点“复制诊断”发回；若首页加载出来了，
   首页按钮能不能点（桥探针的结果也在快照里）。
+
+### 1.2.15-gecko（vc163）：按 1.2.14 诊断结果一次性修首页
+
+- 诊断结论（用户真机 1.2.14，2026-11-14 23:58）：会话已打开=true，
+  视图已挂载=true，视图有会话=true，视图尺寸=1280x2437，桥扩展与
+  javhd 扩展均已装；onPageStart / onPageStop / onLoadError 全部未触发；
+  桥探针未测；HTML 约 20389 字符。自检：新会话加载 about:blank 正常
+  触发 onPageStart——内核与会话正常，问题在首页加载本身。结论：
+  会话/视图/扩展/内核全正常，首页 data: 加载（Loader().data()）在启动
+  时被静默丢弃、无任何回调。时序（加载发得太早、内核未就绪）与 data:
+  本身两种可能都存在；本次修复同时覆盖两者，不再分两次试。
+- 修法（只动 MainActivity + 新增 assets/landing.html）：
+  1. 首页改走 assets 本地文件：loadLandingPage() 里拼的那段 HTML
+     移到 app/src/main/assets/landing.html（加 `<meta charset="utf-8">`，
+     data: 加载时编码由 loadDataWithBaseURL 参数定，文件加载靠它），
+     用 session.loadUri("resource://android/assets/landing.html")
+     加载。照 hyper-browser 的现成做法（HOME_ASSET_URL =
+     "resource://android/assets/home.html"，loadUri 直接加载，桥在上面
+     正常工作）。动态内容（语言、文案、域名）照 hyper-browser 的
+     assetUrlWithData 模式经 URL hash 传 JSON（`#data=<URLEncoder JSON>`，
+     `+` 换 `%20`），页面里一小段启动 JS 读 location.hash 填文案、
+     给 7 个动态域名站点链接接线（data-site + click 监听；固定地址的
+     6 个站点链接仍是 javascript: href，不动）。死代码清理：
+     search*Label / search*Prefix 只定义从未使用过，不进启动 JSON。
+  2. 延时加载：首个首页加载改走 geckoView.post + 1 秒兜底延时
+     （GeckoBrowserActivity 1.2.6 同款，只发一次），不再在
+     setupGeckoSession() 后同步立即加载；loadLandingPage() 本身发
+     loadUri 前先 activateSession()。
+  3. 1.2.14 的诊断能力全保留：诊断浮层、5 秒看门狗、失败页、自检、
+     诊断快照、桥探针、“复制诊断”一字未动；文案里的 data: 改成
+     resource://，复制诊断里的页面地址同步更新。
+  4. isOnLandingPage() / mapGeckoUrl()：文档地址从 data: 改成
+     resource://android/assets/landing.html（landingDataShown 改名
+     landingAssetShown）；对外仍映射回 https://javbrowser.app/，
+     剪贴板链接、分享预填等处不受影响。
+- 没动的：搜索、播放、嗅探、/api/play/ 桌面 UA、VAST 放行、11 广告域、
+  嗅探诊断面板。
+- 待用户真机验：①首页能不能出来；②首页按钮能不能点（桥探针）；
+  ③搜番號、嵌頁播放。

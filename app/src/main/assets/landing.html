@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { box-sizing: border-box; }
+        html { -webkit-text-size-adjust: 100%; }
+        body { 
+            background-color: #121212; 
+            color: white; 
+            font-family: system-ui, -apple-system, sans-serif;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px 14px 18px;
+        }
+        .page {
+            width: 100%;
+            max-width: 760px;
+            margin: 0 auto;
+        }
+        .title-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin: 0 2px 14px;
+        }
+        h1 {
+            margin: 0;
+            font-size: 24px;
+            letter-spacing: .2px;
+        }
+        .search-container {
+            width: 100%;
+            margin-bottom: 12px;
+        }
+        .search-box {
+            width: 100%;
+            height: 48px;
+            padding: 0 14px;
+            font-size: 16px;
+            border: 2px solid #BB86FC;
+            border-radius: 12px;
+            background-color: #1E1E1E;
+            color: white;
+        }
+        .search-box:focus {
+            outline: none;
+            border-color: #CF6FFF;
+        }
+        .search-results {
+            width: 100%;
+            display: none;
+            box-sizing: border-box;
+            margin-top: 12px;
+            padding: 12px;
+            border-radius: 12px;
+            background: #1b1b1b;
+            border: 1px solid #38313f;
+        }
+        .search-results.show {
+            display: block;
+        }
+        .search-results > summary {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            min-height: 40px;
+            width: 100%;
+            cursor: pointer;
+            list-style: none;
+            font-size: 14px;
+            line-height: 1.5;
+            color: #ddd;
+        }
+        .search-results > summary::-webkit-details-marker { display: none; }
+        .search-results > summary::after { content: '+'; color: #BB86FC; font-size: 22px; flex-shrink: 0; }
+        .search-results[open] > summary::after { content: '−'; }
+        .search-query-hint {
+            margin: 4px 0 12px;
+            font-size: 12px;
+            color: #a9a2b1;
+            overflow-wrap: anywhere;
+            line-height: 1.5;
+        }
+        .search-site-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+        }
+        .search-results:not([open]) > .search-site-grid,
+        .search-results:not([open]) > .search-query-hint { display: none; }
+        a {
+            text-decoration: none;
+        }
+        .search-results a,
+        .site-grid a {
+            display: flex;
+            min-height: 44px;
+            padding: 8px 9px;
+            align-items: center;
+            justify-content: center;
+            background-color: #BB86FC; 
+            color: black; 
+            border-radius: 10px;
+            font-size: 14px;
+            font-weight: 700;
+            text-align: center;
+            line-height: 1.2;
+        }
+        .search-results a:active,
+        .site-grid a:active {
+            background-color: #CF6FFF;
+        }
+        .search-site-grid a {
+            box-sizing: border-box;
+            min-width: 0;
+            min-height: 48px;
+            padding: 10px 8px;
+            color: #24152B;
+            overflow-wrap: anywhere;
+        }
+        .search-site-grid a:focus-visible { outline: 2px solid white; outline-offset: 2px; }
+        .quick-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 8px;
+            margin: 0 0 14px;
+        }
+        .quick-grid a {
+            display: flex;
+            min-height: 54px;
+            padding: 9px;
+            align-items: center;
+            justify-content: center;
+            border-radius: 12px;
+            color: #fff;
+            font-size: 14px;
+            font-weight: 800;
+            line-height: 1.25;
+            text-align: center;
+        }
+        .divider {
+            width: 100%;
+            margin: 6px 2px 8px;
+            color: #aaa;
+            font-size: 13px;
+            font-weight: 700;
+        }
+        .site-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 8px;
+        }
+        #playback-history-link {
+            display: block; width: 100%; box-sizing: border-box; margin-top: 14px;
+            padding: 16px; min-height: 54px; border-radius: 12px; background: #776014;
+            color: #FFF4C4; font-size: 16px; font-weight: 800; text-align: center;
+        }
+        #playback-history-link:active { background: #967B22; }
+        .help-button {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background-color: #333;
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 14px;
+            cursor: pointer;
+            border: 1px solid #666;
+        }
+        #jav-hint { margin-top: 8px !important; }
+        #clipboard-link { margin: 0 0 14px; padding: 14px; border: 1px solid #BB86FC; border-radius: 12px; background: #251b32; }
+        #clipboard-link[hidden] { display: none; }
+        #clipboard-link p { margin: 6px 0 12px; }
+        #clipboard-link-url { display: block; color: #ccc; font-size: 13px; overflow-wrap: anywhere; margin-bottom: 12px; }
+        .clipboard-actions { display: flex; gap: 8px; }
+        .clipboard-actions button { min-height: 44px; padding: 10px 16px; border: 0; border-radius: 8px; font-weight: bold; }
+        #clipboard-link-open { background: #BB86FC; color: #24152B; }
+        #clipboard-link-dismiss { background: #3b3345; color: #fff; }
+        #btn-save-jav {
+            min-height: 44px;
+            padding: 8px 12px !important;
+            border-radius: 10px !important;
+            font-size: 14px !important;
+        }
+        .ad-wrap {
+            position: relative;
+            margin-top: 14px;
+        }
+        .ad-card {
+            display: flex;
+            min-height: 58px;
+            padding: 10px 46px 10px 12px;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            background: linear-gradient(135deg, #586bd8 0%, #7447a8 100%);
+            border-radius: 12px;
+            color: white;
+            box-shadow: 0 3px 10px rgba(0,0,0,.25);
+        }
+        .ad-main { font-size: 13px; font-weight: 800; line-height: 1.25; }
+        .ad-action { flex: 0 0 auto; font-size: 12px; opacity: .9; }
+        .ad-toggle {
+            position: absolute;
+            top: 9px;
+            right: 8px;
+            width: 32px;
+            height: 32px;
+            padding: 0;
+            border: 0;
+            border-radius: 8px;
+            background: rgba(0,0,0,.25);
+            color: #fff;
+            font-size: 18px;
+        }
+        .ad-wrap.collapsed .ad-card { min-height: 42px; padding-top: 7px; padding-bottom: 7px; }
+        .ad-wrap.collapsed .ad-action { display: none; }
+        @media (min-width: 620px) {
+            .site-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+            .search-site-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        }
+    </style>
+</head>
+<body>
+  <main class="page">
+    <div class="title-row">
+        <h1>JAV Browser</h1>
+        <div class="help-button" onclick="showHelp()">?</div>
+    </div>
+
+    <section id="clipboard-link" hidden aria-live="polite">
+        <strong><span id="clipboard-from"></span><span id="clipboard-link-site"></span></strong>
+        <p id="clipboard-ask"></p>
+        <span id="clipboard-link-url"></span>
+        <div class="clipboard-actions">
+            <button id="clipboard-link-open" onclick="Android.openClipboardLink()"></button>
+            <button id="clipboard-link-dismiss" onclick="document.getElementById('clipboard-link').hidden=true;Android.dismissClipboardLink()"></button>
+        </div>
+    </section>
+
+    <div class="search-container">
+        <input type="text" id="searchInput" class="search-box" />
+        <button id="unifiedSearchButton" onclick="Android.openUnifiedSearch(document.getElementById('searchInput').value)" style="display:block;width:100%;margin-top:10px;padding:14px;background:#BB86FC;color:#24152B;border:0;border-radius:8px;font-size:16px;font-weight:bold;"></button>
+        <div id="jav-hint" style="display:none; margin-top:10px;">
+            <button id="btn-save-jav" onclick="handleSaveJav()" style="display:block; width:100%; padding:15px 30px; background:#BB86FC; color:black; border:none; border-radius:8px; cursor:pointer; font-size:16px; font-weight:bold; text-align:center; box-sizing:border-box; transition:background 0.3s ease;">📚 <span id="jav-detected-label"></span></button>
+        </div>
+        <details id="searchResults" class="search-results">
+            <summary id="search-fallback-summary"></summary>
+            <p id="searchQueryHint" class="search-query-hint"></p>
+            <div class="search-site-grid">
+                <a href="#" id="searchMissAV">MissAV</a>
+                <a href="#" id="searchJable">Jable.TV</a>
+                <a href="#" id="searchAvJoy">AvJoy</a>
+                <a href="#" id="searchPigAV">PigAV</a>
+                <a href="#" id="searchAVToday">AVToday</a>
+                <a href="#" id="searchJavHD">JavHDPorn</a>
+                <a href="#" id="search7MMTV">7MMTV</a>
+                <a href="#" id="searchAvple">Avple</a>
+                <a href="#" id="searchWhos">Whos.tv</a>
+                <a href="#" id="searchJavday">JAVDAY</a>
+                <a href="#" id="searchRouVideos"></a>
+                <a href="#" id="searchRouSeries"></a>
+            </div>
+        </details>
+    </div>
+
+    <div class="quick-grid">
+        <a id="quick-todaynew" href="javascript:Android.openTodayNew()" style="background:#1565C0;"></a>
+        <a id="quick-sales" href="javascript:Android.openSalesRankings()" style="background:#00897B;"></a>
+    </div>
+
+    <div class="divider" id="direct-links-divider"></div>
+    <div class="site-grid">
+
+        <a href="#" data-site="missav">MissAV</a>
+        <a href="#" data-site="jable">Jable</a>
+        <a href="#" data-site="rou_video">Rou.Video</a>
+        <a href="#" data-site="avjoy">AvJoy</a>
+        <a href="javascript:Android.openSiteBrowse('pigav', 'https://pigav.ws/')">PigAV</a>
+        <a href="javascript:Android.openSiteBrowse('avtoday', 'https://avtoday.io/cht/index.html')">AVToday</a>
+        <a href="javascript:Android.openSiteBrowse('javhd', 'https://www.javhdporn.net/')">JavHDPorn</a>
+        <a href="#" data-site="7mmtv">7MMTV</a>
+        <a href="#" data-site="avple">Avple</a>
+        <a href="#" data-site="whos">Whos.tv</a>
+        <a href="javascript:Android.openSiteBrowse('javday', 'https://javday.app/')">JAVDAY</a>
+        <a href="javascript:Android.openSiteBrowse('supjav', 'https://supjav.com/')">SUPJAV</a>
+        <a href="javascript:Android.openSiteBrowse('javrate', 'https://www.javrate.com/')">JavRate</a>
+        <a href="javascript:Android.navigateToUrl('https://javdb.com/')">JavDB</a>
+        <a href="javascript:Android.navigateToUrl('https://javtrailers.com/ja/videos')">JavTrailers</a>
+        <a href="javascript:Android.navigateToUrl('https://zt.stripchat.com/')">Stripchat</a>
+        <a href="javascript:Android.navigateToUrl('https://cn.pornhub.com/')">Pornhub CN</a>
+        <a href="javascript:Android.navigateToUrl('https://www.xvideos.com/')">XVideos</a>
+    </div>
+    <a id="playback-history-link" href="javascript:Android.openPlaybackHistory()"></a>
+
+    <script>
+        // ── 启动数据：Kotlin 经 URL hash 传入 JSON（hyper-browser 的
+        // assetUrlWithData 同款做法）。页面 JS 读 location.hash 填文案
+        // 与站点地址；桥（window.Android）由 gecko-bridge 扩展注入。
+        var __landingData = (function() {
+            try {
+                var m = /(?:^|&)data=([^&]*)/.exec(location.hash.substring(1));
+                if (!m) return null;
+                return JSON.parse(decodeURIComponent(m[1]));
+            } catch (e) { return null; }
+        })();
+        var __D = __landingData || {};
+        var __domains = __D.domains || {};
+        function __fillText(id, text) {
+            var el = document.getElementById(id);
+            if (el && text != null) el.textContent = text;
+        }
+        document.addEventListener('DOMContentLoaded', function() {
+            __fillText('clipboard-from', __D.clipboardFrom);
+            __fillText('clipboard-ask', __D.clipboardAsk);
+            __fillText('clipboard-link-open', __D.clipboardOpen);
+            __fillText('clipboard-link-dismiss', __D.clipboardDismiss);
+            var si = document.getElementById('searchInput');
+            if (si && __D.searchPlaceholder) si.placeholder = __D.searchPlaceholder;
+            __fillText('unifiedSearchButton', __D.unifiedSearch);
+            __fillText('jav-detected-label', __D.addBookmark);
+            __fillText('search-fallback-summary', __D.fallbackSummary);
+            __fillText('searchRouVideos', __D.rouVideos);
+            __fillText('searchRouSeries', __D.rouSeries);
+            __fillText('quick-todaynew', __D.recentReleases);
+            __fillText('quick-sales', __D.salesRankings);
+            __fillText('direct-links-divider', __D.directLinks);
+            __fillText('playback-history-link', __D.playbackHistory);
+            __fillText('ad-headline', __D.adHeadline);
+            __fillText('ad-action', __D.adAction);
+            // 站点链接：按 data-site 用启动域名接线（href="#"，点按不跳转）。
+            var siteActions = {
+                'missav': function() { Android.openSiteBrowse('missav', __domains.missAvBase); },
+                'jable': function() { Android.openSiteBrowse('jable', 'https://' + __domains.jableDomain + '/'); },
+                'rou_video': function() { Android.openSiteBrowse('rou_video', 'https://' + __domains.rouVideoDomain + '/home'); },
+                'avjoy': function() { Android.openSiteBrowse('avjoy', 'https://' + __domains.avJoyDomain + '/'); },
+                'pigav': function() { Android.openSiteBrowse('pigav', 'https://pigav.ws/'); },
+                'avtoday': function() { Android.openSiteBrowse('avtoday', 'https://avtoday.io/cht/index.html'); },
+                'javhd': function() { Android.openSiteBrowse('javhd', 'https://www.javhdporn.net/'); },
+                '7mmtv': function() { Android.openSiteBrowse('7mmtv', __domains.sevenMmTvBase); },
+                'avple': function() { Android.openSiteBrowse('avple', __domains.avpleBase); },
+                'whos': function() { Android.openSiteBrowse('whos', __domains.whosBase); },
+                'javday': function() { Android.openSiteBrowse('javday', 'https://javday.app/'); },
+                'supjav': function() { Android.openSiteBrowse('supjav', 'https://supjav.com/'); },
+                'javrate': function() { Android.openSiteBrowse('javrate', 'https://www.javrate.com/'); }
+            };
+            document.querySelectorAll('.site-grid a[data-site]').forEach(function(a) {
+                a.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    var fn = siteActions[a.getAttribute('data-site')];
+                    if (fn && typeof Android !== 'undefined') fn();
+                });
+            });
+        });
+        const searchInput = document.getElementById('searchInput');
+        const searchResults = document.getElementById('searchResults');
+        const searchMissAV = document.getElementById('searchMissAV');
+        const searchJable = document.getElementById('searchJable');
+        const searchAvJoy = document.getElementById('searchAvJoy');
+        const searchPigAV = document.getElementById('searchPigAV');
+        const searchAVToday = document.getElementById('searchAVToday');
+        const searchJavHD = document.getElementById('searchJavHD');
+        const search7MMTV = document.getElementById('search7MMTV');
+        const searchAvple = document.getElementById('searchAvple');
+        const searchWhos = document.getElementById('searchWhos');
+        const searchJavday = document.getElementById('searchJavday');
+        const searchRouVideos = document.getElementById('searchRouVideos');
+        const searchRouSeries = document.getElementById('searchRouSeries');
+
+        // ── JAV code detection ──────────────────────────────────────
+        var _javCodes = [];
+        var _JAV_RE = /\b(FC2(?:[-_\s]?PPV)?[-_\s]?\d{5,10}|[A-Za-z]{2,8}-\d{1,5}(?:-\d{2,5})?)\b/gi;
+        function detectJavCodes(text) {
+            var m, codes = [];
+            _JAV_RE.lastIndex = 0;
+            while ((m = _JAV_RE.exec(text)) !== null) {
+                var c = m[1].toUpperCase();
+                if (codes.indexOf(c) === -1) codes.push(c);
+            }
+            return codes;
+        }
+        function updateJavHint(codes) {
+            var hint = document.getElementById('jav-hint');
+            var label = document.getElementById('jav-detected-label');
+            if (codes.length > 0) {
+                hint.style.display = 'block';
+                if (codes.length === 1) {
+                    label.textContent = (__D.bookmarkSinglePrefix || '') + codes[0];
+                } else {
+                    label.textContent = (__D.bookmarkBatchPrefix || '') + codes.length + (__D.bookmarkCountSuffix || '') +
+                        codes.slice(0, 3).join(', ') + (codes.length > 3 ? '…' : '');
+                }
+            } else {
+                hint.style.display = 'none';
+            }
+        }
+        function handleSaveJav() {
+            if (_javCodes.length === 0) return;
+            var btn = document.getElementById('btn-save-jav');
+            btn.disabled = true;
+            btn.style.cursor = 'not-allowed';
+            btn.style.background = 'linear-gradient(to right, #7B1FA2 0%, #BB86FC 0%)';
+            document.getElementById('jav-detected-label').textContent = (__D.savingLabel || '') + '0 / ' + _javCodes.length;
+            Android.saveJavCodes(JSON.stringify(_javCodes));
+        }
+        function updateBatchProgress(done, total) {
+            var btn = document.getElementById('btn-save-jav');
+            var pct = Math.round(done / total * 100);
+            btn.style.background = 'linear-gradient(to right, #7B1FA2 ' + pct + '%, #BB86FC ' + pct + '%)';
+            document.getElementById('jav-detected-label').textContent = (__D.savingLabel || '') + done + ' / ' + total;
+            if (done >= total) {
+                btn.style.background = '#7B1FA2';
+                document.getElementById('jav-detected-label').textContent = (__D.savedPrefix || '') + total + (__D.savedSuffix || '');
+                setTimeout(function() {
+                    btn.disabled = false;
+                    btn.style.cursor = 'pointer';
+                    btn.style.background = '#BB86FC';
+                    updateJavHint(_javCodes);
+                }, 1800);
+            }
+        }
+        // 剪貼簿回呼：直接填入搜尋框，顯示紫色存入書籤按鈕
+        function onClipboardResult(text, link) {
+            var card = document.getElementById('clipboard-link');
+            card.hidden = !link;
+            document.getElementById('clipboard-link-site').textContent = link ? link.site : '';
+            document.getElementById('clipboard-link-url').textContent = link ? link.url : '';
+            if (link) return;
+            var codes = detectJavCodes(text);
+            if (codes.length > 0) {
+                searchInput.value = codes.join(' ');
+                searchInput.dispatchEvent(new Event('input'));
+            }
+        }
+        function prefillJavCodes(codesJson) {
+            var codes = JSON.parse(codesJson);
+            if (codes.length > 0) {
+                searchInput.value = codes.join(' ');
+                searchInput.dispatchEvent(new Event('input'));
+            }
+        }
+        window.addEventListener('load', function() {
+            if (typeof Android !== 'undefined') Android.checkClipboard();
+        });
+        // ── Search input listener ────────────────────────────────────
+        searchInput.addEventListener('input', function() {
+            const keyword = this.value.trim();
+            _javCodes = detectJavCodes(keyword);
+            updateJavHint(_javCodes);
+            if (keyword.length > 0) {
+                searchResults.classList.add('show');
+                document.getElementById('searchQueryHint').textContent =
+                    (__D.searchHintPrefix || '') + keyword;
+                document.querySelectorAll('.search-site-grid a').forEach(function(link) {
+                    link.setAttribute('aria-label', link.textContent + ': ' + keyword);
+                });
+
+                // Update URLs
+                searchMissAV.href = 'https://' + __domains.missAvDomain + '/search/' + encodeURIComponent(keyword);
+                searchJable.href = 'https://jable.tv/search/' + encodeURIComponent(keyword) + '/';
+                searchAvJoy.href = 'https://' + __domains.avJoyDomain + '/search/videos/' + encodeURIComponent(keyword);
+                searchPigAV.href = 'https://pigav.ws/search?search=' + encodeURIComponent(keyword) + '&searchTarget=local';
+                searchAVToday.href = 'https://avtoday.io/search?s=' + encodeURIComponent(keyword);
+                searchJavHD.href = 'https://www.javhdporn.net/?s=' + encodeURIComponent(keyword);
+                search7MMTV.href = 'https://' + __domains.sevenMmTvDomain + '/zh/searchall_search/all/' + encodeURIComponent(keyword) + '/1.html';
+                searchAvple.href = 'https://' + __domains.avpleDomain + '/search?key=' + encodeURIComponent(keyword);
+                searchWhos.href = 'https://' + __domains.whosDomain + '/result?search=' + encodeURIComponent(keyword);
+                searchJavday.href = 'https://javday.app/search/?wd=' + encodeURIComponent(keyword);
+                searchRouVideos.href = 'https://' + __domains.rouVideoDomain + '/search?q=' + encodeURIComponent(keyword);
+                searchRouSeries.href = searchRouVideos.href + '&tab=series';
+            } else {
+                searchResults.classList.remove('show');
+            }
+        });
+
+        searchInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter' && this.value.trim().length > 0) {
+                e.preventDefault();
+                Android.openUnifiedSearch(this.value.trim());
+            }
+        });
+
+        function showHelp() {
+            Android.showHelpDialog();
+        }
+        function toggleLandingAd(event) {
+            event.preventDefault();
+            event.stopPropagation();
+            var ad = document.getElementById('lingmaoAd');
+            var collapsed = ad.classList.toggle('collapsed');
+            event.currentTarget.textContent = collapsed ? '+' : '−';
+            try { localStorage.setItem('landingAdCollapsed', collapsed ? '1' : '0'); } catch (e) {}
+        }
+        window.addEventListener('DOMContentLoaded', function() {
+            try {
+                if (localStorage.getItem('landingAdCollapsed') === '1') {
+                    var ad = document.getElementById('lingmaoAd');
+                    ad.classList.add('collapsed');
+                    ad.querySelector('.ad-toggle').textContent = '+';
+                }
+            } catch (e) {}
+        });
+    </script>
+
+    <div class="ad-wrap" id="lingmaoAd">
+        <a class="ad-card" href="https://www.277sy.com/index.php/Rmiddle/down_ra/?appid=401&tgid=da0003500&type=1">
+            <span class="ad-main" id="ad-headline"></span>
+            <span class="ad-action" id="ad-action"></span>
+        </a>
+        <button class="ad-toggle" onclick="toggleLandingAd(event)" aria-label="收合廣告">−</button>
+    </div>
+  </main>
+</body>
+</html>

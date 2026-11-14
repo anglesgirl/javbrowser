@@ -46,7 +46,7 @@ class MainActivity : LocalizedActivity() {
     private var geckoCurrentUrl: String? = null
     private var geckoPageTitle: String = ""
     private var geckoCanGoBack: Boolean = false
-    private var landingDataShown: Boolean = false
+    private var landingAssetShown: Boolean = false
     private val geckoMainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
     // GeckoView 151 没有 onShowCustomView 容器：改用一个布林追踪全屏状态。
@@ -134,6 +134,10 @@ class MainActivity : LocalizedActivity() {
     private var landingProbeRunning = false
     private var landingProbeStarted = false
     private val landingWatchdogRunnable = Runnable { onLandingWatchdog() }
+    /** 首个首页加载是否已发出（post 与兜底延时只发一次）。 */
+    private var landingInitialLoadStarted = false
+    /** 首个首页加载兜底发出（geckoView.post 没跑起来时用）。 */
+    private val landingLoadFallbackRunnable = Runnable { startInitialLandingLoad() }
     private val landingProbeTimeoutRunnable = Runnable {
         if (landingProbeRunning && !landingProbeStarted) finishLandingSelfCheck(false, "about:blank 5 秒内没有开始加载")
     }
@@ -256,6 +260,7 @@ class MainActivity : LocalizedActivity() {
         const val MAIN_UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         const val HIDDEN_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         const val LANDING_URL = "https://javbrowser.app/"
+        const val LANDING_ASSET_URL = "resource://android/assets/landing.html"
     }
 
     // 接收書籤頁傳來的 URL
@@ -332,6 +337,8 @@ class MainActivity : LocalizedActivity() {
     private val TIMEOUT_DURATION = 30000L // 30 seconds
     // 首页加载诊断（1.2.14-gecko 诊断版，只加可见性，不改加载机制）。
     private val LANDING_WATCHDOG_MS = 5_000L
+    /** 首个首页加载兜底：geckoView.post 没跑起来时最多等这么久就发（1.2.6 同款）。 */
+    private val LANDING_LOAD_FALLBACK_DELAY_MS = 1_000L
     private val LANDING_PROBE_TIMEOUT_MS = 5_000L
     private val LANDING_BRIDGE_PROBE_TIMEOUT_MS = 5_000L
     private var backPressedTime: Long = 0
@@ -451,7 +458,11 @@ class MainActivity : LocalizedActivity() {
         }
 
         android.util.Log.d("NAV_DEBUG", "initializeApp fallback -> loadLandingPage")
-        loadLandingPage()
+        // 首个首页加载等视图挂载 + 布局完成后再发（1.2.6 同款；
+        // 1.2.14 诊断：同步立即加载在内核未就绪时被静默丢弃）。
+        // 只发一次，1 秒兜底。
+        geckoView.post { startInitialLandingLoad() }
+        geckoMainHandler.postDelayed(landingLoadFallbackRunnable, LANDING_LOAD_FALLBACK_DELAY_MS)
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -2195,8 +2206,8 @@ class MainActivity : LocalizedActivity() {
      *  data:，但剪贴板链接、分享预填等处比的是完整落地页地址）。 */
     private fun mapGeckoUrl(url: String?): String? {
         if (url == null) return null
-        if (url.startsWith("data:") && landingDataShown) return LANDING_URL
-        if (!url.startsWith("data:")) landingDataShown = false
+        if (url.startsWith(LANDING_ASSET_URL) && landingAssetShown) return LANDING_URL
+        if (!url.startsWith(LANDING_ASSET_URL)) landingAssetShown = false
         return url
     }
 
@@ -2206,7 +2217,7 @@ class MainActivity : LocalizedActivity() {
     /** 主会话导航（替代 webView.loadUrl）：显式激活后发 loadUri。 */
     private fun loadGeckoUrl(url: String) {
         if (!::geckoSession.isInitialized) return
-        landingDataShown = false
+        landingAssetShown = false
         activateSession()
         geckoSession.loadUri(url)
     }
@@ -2544,9 +2555,10 @@ class MainActivity : LocalizedActivity() {
      * GeckoView 版主浏览器设置（2026-11-14 全量迁移，主页簇）。
      *
      * 映射关系（旧 WebView → 新 Gecko）：
-     * ① 首页本地 HTML：loadDataWithBaseURL → Loader().data()（data: 载入，
-     *    无 base URI 选项；HTML 里没有相对引用，已核对；对外地址由
-     *    mapGeckoUrl 映射回 https://javbrowser.app/）；
+     * ① 首页本地 HTML：loadDataWithBaseURL → resource://android/assets/
+     *    landing.html（1.2.15：1.2.14 诊断证实 data: 加载在启动时被静默
+     *    丢弃；改走 assets 本地文件，hyper-browser 同款，动态内容经 URL
+     *    hash 传 JSON；对外地址由 mapGeckoUrl 映射回 https://javbrowser.app/）；
      * ② addJavascriptInterface 桥 → GeckoBridge.attachBridge（方法名不变，
      *    参数变 JSONArray；无返回值的方法见 stripchatBridgeShimJs）；
      * ③ shouldOverrideUrlLoading → NavigationDelegate.onLoadRequest /
@@ -6751,7 +6763,7 @@ class MainActivity : LocalizedActivity() {
     
     private fun isOnLandingPage(): Boolean {
         val url = geckoCurrentUrl
-        return url == null || url == "about:blank" || url.startsWith("data:") || url == "https://javbrowser.app/"
+        return url == null || url == "about:blank" || url == LANDING_URL || url.startsWith(LANDING_ASSET_URL)
     }
     
     // ── JAV code bookmark helpers ─────────────────────────────────────────────
@@ -6886,514 +6898,69 @@ class MainActivity : LocalizedActivity() {
         }
     }
 
+    /** 首个首页加载（只发一次；post 与兜底延时都走这里）。 */
+    private fun startInitialLandingLoad() {
+        if (landingInitialLoadStarted) return
+        landingInitialLoadStarted = true
+        geckoMainHandler.removeCallbacks(landingLoadFallbackRunnable)
+        loadLandingPage()
+    }
+
     private fun loadLandingPage() {
-        // Reload the landing page
+        // 首页改走 assets 本地文件（1.2.15-gecko）：1.2.14 诊断证实，
+        // 会话/视图/扩展/内核全正常，但首页 data: 加载（Loader().data()）
+        // 在启动时被静默丢弃、无任何回调。改走
+        // resource://android/assets/landing.html（hyper-browser 同款做法，
+        // 桥在上面正常工作），同时覆盖“时序”与“data: 本身”两种可能。
+        // 动态内容（语言、文案、域名）经 URL hash 传 JSON，页面 JS 读
+        // location.hash 填进去（hyper-browser 的 assetUrlWithData 同款）。
+        // HTML 本体在 app/src/main/assets/landing.html。
         val english = LanguageManager.isEnglish(this)
-        val searchPlaceholder = if (english) "Search keywords or video code..." else "輸入搜尋關鍵字 / 番號..."
-        val addBookmark = if (english) "Add Bookmark" else "存入書籤"
-        val directLinks = if (english) "Go directly to" else "或直接前往"
-        val recentReleases = if (english) "📅 Releases from the last 3 days" else "📅 近3日新着リスト"
-        val salesRankings = if (english) "📊 Sales rankings" else "📊 銷售排行"
-        val searchMissAvLabel = if (english) "Search MissAV" else "在 MissAV 搜尋"
-        val searchJableLabel = if (english) "Search Jable.TV" else "在 Jable.TV 搜尋"
-        val searchAvJoyLabel = if (english) "Search AvJoy" else "在 AvJoy 搜尋"
-        val searchPigAvLabel = if (english) "Search PigAV" else "在 PigAV 搜尋"
-        val searchAvTodayLabel = if (english) "Search AVToday" else "在 AVToday 搜尋"
-        val searchJavHdLabel = if (english) "Search JavHDPorn" else "在 JavHDPorn 搜尋"
-        val search7MmTvLabel = if (english) "Search 7MMTV" else "在 7MMTV 搜尋"
-        val searchAvpleLabel = if (english) "Search Avple" else "在 Avple 搜尋"
-        val searchWhosLabel = if (english) "Search Whos.tv" else "在 Whos.tv 搜尋"
-        val bookmarkSinglePrefix = org.json.JSONObject.quote(if (english) "Add bookmark: " else "存入書籤：")
-        val bookmarkBatchPrefix = org.json.JSONObject.quote(if (english) "Add bookmarks (" else "批量存入書籤 (")
-        val bookmarkCountSuffix = org.json.JSONObject.quote(if (english) "): " else "個)：")
-        val savingLabel = org.json.JSONObject.quote(if (english) "Saving... " else "存入中... ")
-        val savedPrefix = org.json.JSONObject.quote(if (english) "✅ Saved " else "✅ 已存入 ")
-        val savedSuffix = org.json.JSONObject.quote(if (english) " items" else " 個")
-        val searchMissAvPrefix = org.json.JSONObject.quote("$searchMissAvLabel: ")
-        val searchJablePrefix = org.json.JSONObject.quote("$searchJableLabel: ")
-        val searchAvJoyPrefix = org.json.JSONObject.quote("$searchAvJoyLabel: ")
-        val searchPigAvPrefix = org.json.JSONObject.quote("$searchPigAvLabel: ")
-        val searchAvTodayPrefix = org.json.JSONObject.quote("$searchAvTodayLabel: ")
-        val searchJavHdPrefix = org.json.JSONObject.quote("$searchJavHdLabel: ")
-        val search7MmTvPrefix = org.json.JSONObject.quote("$search7MmTvLabel: ")
-        val searchAvplePrefix = org.json.JSONObject.quote("$searchAvpleLabel: ")
-        val searchWhosPrefix = org.json.JSONObject.quote("$searchWhosLabel: ")
-        val adHeadline = if (english) "🐱 Lingmao Games — discounts, bonuses and member perks" else "🐱 靈貓遊戲 - 超低折扣 | 海量福利 | 專屬特權"
-        val adAction = if (english) "Tap to download the app" else "點擊下載 APP"
-        val landingHtml = """
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <style>
-                    * { box-sizing: border-box; }
-                    html { -webkit-text-size-adjust: 100%; }
-                    body { 
-                        background-color: #121212; 
-                        color: white; 
-                        font-family: system-ui, -apple-system, sans-serif;
-                        min-height: 100vh;
-                        margin: 0;
-                        padding: 20px 14px 18px;
-                    }
-                    .page {
-                        width: 100%;
-                        max-width: 760px;
-                        margin: 0 auto;
-                    }
-                    .title-row {
-                        display: flex;
-                        align-items: center;
-                        justify-content: space-between;
-                        margin: 0 2px 14px;
-                    }
-                    h1 {
-                        margin: 0;
-                        font-size: 24px;
-                        letter-spacing: .2px;
-                    }
-                    .search-container {
-                        width: 100%;
-                        margin-bottom: 12px;
-                    }
-                    .search-box {
-                        width: 100%;
-                        height: 48px;
-                        padding: 0 14px;
-                        font-size: 16px;
-                        border: 2px solid #BB86FC;
-                        border-radius: 12px;
-                        background-color: #1E1E1E;
-                        color: white;
-                    }
-                    .search-box:focus {
-                        outline: none;
-                        border-color: #CF6FFF;
-                    }
-                    .search-results {
-                        width: 100%;
-                        display: none;
-                        box-sizing: border-box;
-                        margin-top: 12px;
-                        padding: 12px;
-                        border-radius: 12px;
-                        background: #1b1b1b;
-                        border: 1px solid #38313f;
-                    }
-                    .search-results.show {
-                        display: block;
-                    }
-                    .search-results > summary {
-                        display: flex;
-                        align-items: center;
-                        justify-content: space-between;
-                        gap: 12px;
-                        min-height: 40px;
-                        width: 100%;
-                        cursor: pointer;
-                        list-style: none;
-                        font-size: 14px;
-                        line-height: 1.5;
-                        color: #ddd;
-                    }
-                    .search-results > summary::-webkit-details-marker { display: none; }
-                    .search-results > summary::after { content: '+'; color: #BB86FC; font-size: 22px; flex-shrink: 0; }
-                    .search-results[open] > summary::after { content: '−'; }
-                    .search-query-hint {
-                        margin: 4px 0 12px;
-                        font-size: 12px;
-                        color: #a9a2b1;
-                        overflow-wrap: anywhere;
-                        line-height: 1.5;
-                    }
-                    .search-site-grid {
-                        display: grid;
-                        grid-template-columns: repeat(2, minmax(0, 1fr));
-                        gap: 10px;
-                    }
-                    .search-results:not([open]) > .search-site-grid,
-                    .search-results:not([open]) > .search-query-hint { display: none; }
-                    a {
-                        text-decoration: none;
-                    }
-                    .search-results a,
-                    .site-grid a {
-                        display: flex;
-                        min-height: 44px;
-                        padding: 8px 9px;
-                        align-items: center;
-                        justify-content: center;
-                        background-color: #BB86FC; 
-                        color: black; 
-                        border-radius: 10px;
-                        font-size: 14px;
-                        font-weight: 700;
-                        text-align: center;
-                        line-height: 1.2;
-                    }
-                    .search-results a:active,
-                    .site-grid a:active {
-                        background-color: #CF6FFF;
-                    }
-                    .search-site-grid a {
-                        box-sizing: border-box;
-                        min-width: 0;
-                        min-height: 48px;
-                        padding: 10px 8px;
-                        color: #24152B;
-                        overflow-wrap: anywhere;
-                    }
-                    .search-site-grid a:focus-visible { outline: 2px solid white; outline-offset: 2px; }
-                    .quick-grid {
-                        display: grid;
-                        grid-template-columns: repeat(2, minmax(0, 1fr));
-                        gap: 8px;
-                        margin: 0 0 14px;
-                    }
-                    .quick-grid a {
-                        display: flex;
-                        min-height: 54px;
-                        padding: 9px;
-                        align-items: center;
-                        justify-content: center;
-                        border-radius: 12px;
-                        color: #fff;
-                        font-size: 14px;
-                        font-weight: 800;
-                        line-height: 1.25;
-                        text-align: center;
-                    }
-                    .divider {
-                        width: 100%;
-                        margin: 6px 2px 8px;
-                        color: #aaa;
-                        font-size: 13px;
-                        font-weight: 700;
-                    }
-                    .site-grid {
-                        display: grid;
-                        grid-template-columns: repeat(2, minmax(0, 1fr));
-                        gap: 8px;
-                    }
-                    #playback-history-link {
-                        display: block; width: 100%; box-sizing: border-box; margin-top: 14px;
-                        padding: 16px; min-height: 54px; border-radius: 12px; background: #776014;
-                        color: #FFF4C4; font-size: 16px; font-weight: 800; text-align: center;
-                    }
-                    #playback-history-link:active { background: #967B22; }
-                    .help-button {
-                        width: 32px;
-                        height: 32px;
-                        border-radius: 50%;
-                        background-color: #333;
-                        color: white;
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                        font-weight: bold;
-                        font-size: 14px;
-                        cursor: pointer;
-                        border: 1px solid #666;
-                    }
-                    #jav-hint { margin-top: 8px !important; }
-                    #clipboard-link { margin: 0 0 14px; padding: 14px; border: 1px solid #BB86FC; border-radius: 12px; background: #251b32; }
-                    #clipboard-link[hidden] { display: none; }
-                    #clipboard-link p { margin: 6px 0 12px; }
-                    #clipboard-link-url { display: block; color: #ccc; font-size: 13px; overflow-wrap: anywhere; margin-bottom: 12px; }
-                    .clipboard-actions { display: flex; gap: 8px; }
-                    .clipboard-actions button { min-height: 44px; padding: 10px 16px; border: 0; border-radius: 8px; font-weight: bold; }
-                    #clipboard-link-open { background: #BB86FC; color: #24152B; }
-                    #clipboard-link-dismiss { background: #3b3345; color: #fff; }
-                    #btn-save-jav {
-                        min-height: 44px;
-                        padding: 8px 12px !important;
-                        border-radius: 10px !important;
-                        font-size: 14px !important;
-                    }
-                    .ad-wrap {
-                        position: relative;
-                        margin-top: 14px;
-                    }
-                    .ad-card {
-                        display: flex;
-                        min-height: 58px;
-                        padding: 10px 46px 10px 12px;
-                        align-items: center;
-                        justify-content: space-between;
-                        gap: 8px;
-                        background: linear-gradient(135deg, #586bd8 0%, #7447a8 100%);
-                        border-radius: 12px;
-                        color: white;
-                        box-shadow: 0 3px 10px rgba(0,0,0,.25);
-                    }
-                    .ad-main { font-size: 13px; font-weight: 800; line-height: 1.25; }
-                    .ad-action { flex: 0 0 auto; font-size: 12px; opacity: .9; }
-                    .ad-toggle {
-                        position: absolute;
-                        top: 9px;
-                        right: 8px;
-                        width: 32px;
-                        height: 32px;
-                        padding: 0;
-                        border: 0;
-                        border-radius: 8px;
-                        background: rgba(0,0,0,.25);
-                        color: #fff;
-                        font-size: 18px;
-                    }
-                    .ad-wrap.collapsed .ad-card { min-height: 42px; padding-top: 7px; padding-bottom: 7px; }
-                    .ad-wrap.collapsed .ad-action { display: none; }
-                    @media (min-width: 620px) {
-                        .site-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-                        .search-site-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-                    }
-                </style>
-            </head>
-            <body>
-              <main class="page">
-                <div class="title-row">
-                    <h1>JAV Browser</h1>
-                    <div class="help-button" onclick="showHelp()">?</div>
-                </div>
-
-                <section id="clipboard-link" hidden aria-live="polite">
-                    <strong>${if (english) "Copied link from " else "剪貼簿網址："}<span id="clipboard-link-site"></span></strong>
-                    <p>${if (english) "Open this page?" else "要前往這個頁面嗎？"}</p>
-                    <span id="clipboard-link-url"></span>
-                    <div class="clipboard-actions">
-                        <button id="clipboard-link-open" onclick="Android.openClipboardLink()">${if (english) "Open page" else "前往此頁面"}</button>
-                        <button id="clipboard-link-dismiss" onclick="document.getElementById('clipboard-link').hidden=true;Android.dismissClipboardLink()">${if (english) "Not now" else "暫時不要"}</button>
-                    </div>
-                </section>
-                
-                <div class="search-container">
-                    <input type="text" id="searchInput" class="search-box" placeholder="$searchPlaceholder" />
-                    <button id="unifiedSearchButton" onclick="Android.openUnifiedSearch(document.getElementById('searchInput').value)" style="display:block;width:100%;margin-top:10px;padding:14px;background:#BB86FC;color:#24152B;border:0;border-radius:8px;font-size:16px;font-weight:bold;">${if (english) "Search all sites · Unified results" else "統一跨站搜尋 · 彙整結果"}</button>
-                    <div id="jav-hint" style="display:none; margin-top:10px;">
-                        <button id="btn-save-jav" onclick="handleSaveJav()" style="display:block; width:100%; padding:15px 30px; background:#BB86FC; color:black; border:none; border-radius:8px; cursor:pointer; font-size:16px; font-weight:bold; text-align:center; box-sizing:border-box; transition:background 0.3s ease;">📚 <span id="jav-detected-label">$addBookmark</span></button>
-                    </div>
-                    <details id="searchResults" class="search-results">
-                        <summary>${if (english) "Fallback: search on an original site" else "備用：到個別原站搜尋"}</summary>
-                        <p id="searchQueryHint" class="search-query-hint"></p>
-                        <div class="search-site-grid">
-                            <a href="#" id="searchMissAV">MissAV</a>
-                            <a href="#" id="searchJable">Jable.TV</a>
-                            <a href="#" id="searchAvJoy">AvJoy</a>
-                            <a href="#" id="searchPigAV">PigAV</a>
-                            <a href="#" id="searchAVToday">AVToday</a>
-                            <a href="#" id="searchJavHD">JavHDPorn</a>
-                            <a href="#" id="search7MMTV">7MMTV</a>
-                            <a href="#" id="searchAvple">Avple</a>
-                            <a href="#" id="searchWhos">Whos.tv</a>
-                            <a href="#" id="searchJavday">JAVDAY</a>
-                            <a href="#" id="searchRouVideos">${if (english) "ROU · Videos" else "ROU · 影片"}</a>
-                            <a href="#" id="searchRouSeries">${if (english) "ROU · Series" else "ROU · 影集"}</a>
-                        </div>
-                    </details>
-                </div>
-
-                <div class="quick-grid">
-                    <a href="javascript:Android.openTodayNew()" style="background:#1565C0;">$recentReleases</a>
-                    <a href="javascript:Android.openSalesRankings()" style="background:#00897B;">$salesRankings</a>
-                </div>
-
-                <div class="divider">$directLinks</div>
-                <div class="site-grid">
-                
-                    <a href="javascript:Android.openSiteBrowse('missav', '${domainConfig.getMissAvBaseUrl()}')">MissAV</a>
-                    <a href="javascript:Android.openSiteBrowse('jable', 'https://${domainConfig.getJableDomain()}/')">Jable</a>
-                    <a href="javascript:Android.openSiteBrowse('rou_video', 'https://${domainConfig.getRouVideoDomain()}/home')">Rou.Video</a>
-                    <a href="javascript:Android.openSiteBrowse('avjoy', 'https://${domainConfig.getAvJoyDomain()}/')">AvJoy</a>
-                    <a href="javascript:Android.openSiteBrowse('pigav', 'https://pigav.ws/')">PigAV</a>
-                    <a href="javascript:Android.openSiteBrowse('avtoday', 'https://avtoday.io/cht/index.html')">AVToday</a>
-                    <a href="javascript:Android.openSiteBrowse('javhd', 'https://www.javhdporn.net/')">JavHDPorn</a>
-                    <a href="javascript:Android.openSiteBrowse('7mmtv', '${domainConfig.get7MmTvBaseUrl()}')">7MMTV</a>
-                    <a href="javascript:Android.openSiteBrowse('avple', '${domainConfig.getAvpleBaseUrl()}')">Avple</a>
-                    <a href="javascript:Android.openSiteBrowse('whos', '${domainConfig.getWhosBaseUrl()}')">Whos.tv</a>
-                    <a href="javascript:Android.openSiteBrowse('javday', 'https://javday.app/')">JAVDAY</a>
-                    <a href="javascript:Android.openSiteBrowse('supjav', 'https://supjav.com/')">SUPJAV</a>
-                    <a href="javascript:Android.openSiteBrowse('javrate', 'https://www.javrate.com/')">JavRate</a>
-                    <a href="javascript:Android.navigateToUrl('https://javdb.com/')">JavDB</a>
-                    <a href="javascript:Android.navigateToUrl('https://javtrailers.com/ja/videos')">JavTrailers</a>
-                    <a href="javascript:Android.navigateToUrl('https://zt.stripchat.com/')">Stripchat</a>
-                    <a href="javascript:Android.navigateToUrl('https://cn.pornhub.com/')">Pornhub CN</a>
-                    <a href="javascript:Android.navigateToUrl('https://www.xvideos.com/')">XVideos</a>
-                </div>
-                <a id="playback-history-link" href="javascript:Android.openPlaybackHistory()">${if (english) "📜 Playback history" else "📜 播放紀錄"}</a>
-
-                <script>
-                    const searchInput = document.getElementById('searchInput');
-                    const searchResults = document.getElementById('searchResults');
-                    const searchMissAV = document.getElementById('searchMissAV');
-                    const searchJable = document.getElementById('searchJable');
-                    const searchAvJoy = document.getElementById('searchAvJoy');
-                    const searchPigAV = document.getElementById('searchPigAV');
-                    const searchAVToday = document.getElementById('searchAVToday');
-                    const searchJavHD = document.getElementById('searchJavHD');
-                    const search7MMTV = document.getElementById('search7MMTV');
-                    const searchAvple = document.getElementById('searchAvple');
-                    const searchWhos = document.getElementById('searchWhos');
-                    const searchJavday = document.getElementById('searchJavday');
-                    const searchRouVideos = document.getElementById('searchRouVideos');
-                    const searchRouSeries = document.getElementById('searchRouSeries');
-
-                    // ── JAV code detection ──────────────────────────────────────
-                    var _javCodes = [];
-                    var _JAV_RE = /\b(FC2(?:[-_\s]?PPV)?[-_\s]?\d{5,10}|[A-Za-z]{2,8}-\d{1,5}(?:-\d{2,5})?)\b/gi;
-                    function detectJavCodes(text) {
-                        var m, codes = [];
-                        _JAV_RE.lastIndex = 0;
-                        while ((m = _JAV_RE.exec(text)) !== null) {
-                            var c = m[1].toUpperCase();
-                            if (codes.indexOf(c) === -1) codes.push(c);
-                        }
-                        return codes;
-                    }
-                    function updateJavHint(codes) {
-                        var hint = document.getElementById('jav-hint');
-                        var label = document.getElementById('jav-detected-label');
-                        if (codes.length > 0) {
-                            hint.style.display = 'block';
-                            if (codes.length === 1) {
-                                label.textContent = $bookmarkSinglePrefix + codes[0];
-                            } else {
-                                label.textContent = $bookmarkBatchPrefix + codes.length + $bookmarkCountSuffix +
-                                    codes.slice(0, 3).join(', ') + (codes.length > 3 ? '…' : '');
-                            }
-                        } else {
-                            hint.style.display = 'none';
-                        }
-                    }
-                    function handleSaveJav() {
-                        if (_javCodes.length === 0) return;
-                        var btn = document.getElementById('btn-save-jav');
-                        btn.disabled = true;
-                        btn.style.cursor = 'not-allowed';
-                        btn.style.background = 'linear-gradient(to right, #7B1FA2 0%, #BB86FC 0%)';
-                        document.getElementById('jav-detected-label').textContent = $savingLabel + '0 / ' + _javCodes.length;
-                        Android.saveJavCodes(JSON.stringify(_javCodes));
-                    }
-                    function updateBatchProgress(done, total) {
-                        var btn = document.getElementById('btn-save-jav');
-                        var pct = Math.round(done / total * 100);
-                        btn.style.background = 'linear-gradient(to right, #7B1FA2 ' + pct + '%, #BB86FC ' + pct + '%)';
-                        document.getElementById('jav-detected-label').textContent = $savingLabel + done + ' / ' + total;
-                        if (done >= total) {
-                            btn.style.background = '#7B1FA2';
-                            document.getElementById('jav-detected-label').textContent = $savedPrefix + total + $savedSuffix;
-                            setTimeout(function() {
-                                btn.disabled = false;
-                                btn.style.cursor = 'pointer';
-                                btn.style.background = '#BB86FC';
-                                updateJavHint(_javCodes);
-                            }, 1800);
-                        }
-                    }
-                    // 剪貼簿回呼：直接填入搜尋框，顯示紫色存入書籤按鈕
-                    function onClipboardResult(text, link) {
-                        var card = document.getElementById('clipboard-link');
-                        card.hidden = !link;
-                        document.getElementById('clipboard-link-site').textContent = link ? link.site : '';
-                        document.getElementById('clipboard-link-url').textContent = link ? link.url : '';
-                        if (link) return;
-                        var codes = detectJavCodes(text);
-                        if (codes.length > 0) {
-                            searchInput.value = codes.join(' ');
-                            searchInput.dispatchEvent(new Event('input'));
-                        }
-                    }
-                    function prefillJavCodes(codesJson) {
-                        var codes = JSON.parse(codesJson);
-                        if (codes.length > 0) {
-                            searchInput.value = codes.join(' ');
-                            searchInput.dispatchEvent(new Event('input'));
-                        }
-                    }
-                    window.addEventListener('load', function() {
-                        if (typeof Android !== 'undefined') Android.checkClipboard();
-                    });
-                    // ── Search input listener ────────────────────────────────────
-                    searchInput.addEventListener('input', function() {
-                        const keyword = this.value.trim();
-                        _javCodes = detectJavCodes(keyword);
-                        updateJavHint(_javCodes);
-                        if (keyword.length > 0) {
-                            searchResults.classList.add('show');
-                            document.getElementById('searchQueryHint').textContent =
-                                ${org.json.JSONObject.quote(if (english) "Search: " else "搜尋內容：")} + keyword;
-                            document.querySelectorAll('.search-site-grid a').forEach(function(link) {
-                                link.setAttribute('aria-label', link.textContent + ': ' + keyword);
-                            });
-
-                            // Update URLs
-                            searchMissAV.href = 'https://${domainConfig.getMissAvDomain()}/search/' + encodeURIComponent(keyword);
-                            searchJable.href = 'https://jable.tv/search/' + encodeURIComponent(keyword) + '/';
-                            searchAvJoy.href = 'https://${domainConfig.getAvJoyDomain()}/search/videos/' + encodeURIComponent(keyword);
-                            searchPigAV.href = 'https://pigav.ws/search?search=' + encodeURIComponent(keyword) + '&searchTarget=local';
-                            searchAVToday.href = 'https://avtoday.io/search?s=' + encodeURIComponent(keyword);
-                            searchJavHD.href = 'https://www.javhdporn.net/?s=' + encodeURIComponent(keyword);
-                            search7MMTV.href = 'https://${domainConfig.get7MmTvDomain()}/zh/searchall_search/all/' + encodeURIComponent(keyword) + '/1.html';
-                            searchAvple.href = 'https://${domainConfig.getAvpleDomain()}/search?key=' + encodeURIComponent(keyword);
-                            searchWhos.href = 'https://${domainConfig.getWhosDomain()}/result?search=' + encodeURIComponent(keyword);
-                            searchJavday.href = 'https://javday.app/search/?wd=' + encodeURIComponent(keyword);
-                            searchRouVideos.href = 'https://${domainConfig.getRouVideoDomain()}/search?q=' + encodeURIComponent(keyword);
-                            searchRouSeries.href = searchRouVideos.href + '&tab=series';
-                        } else {
-                            searchResults.classList.remove('show');
-                        }
-                    });
-
-                    searchInput.addEventListener('keypress', function(e) {
-                        if (e.key === 'Enter' && this.value.trim().length > 0) {
-                            e.preventDefault();
-                            Android.openUnifiedSearch(this.value.trim());
-                        }
-                    });
-
-                    function showHelp() {
-                        Android.showHelpDialog();
-                    }
-                    function toggleLandingAd(event) {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        var ad = document.getElementById('lingmaoAd');
-                        var collapsed = ad.classList.toggle('collapsed');
-                        event.currentTarget.textContent = collapsed ? '+' : '−';
-                        try { localStorage.setItem('landingAdCollapsed', collapsed ? '1' : '0'); } catch (e) {}
-                    }
-                    window.addEventListener('DOMContentLoaded', function() {
-                        try {
-                            if (localStorage.getItem('landingAdCollapsed') === '1') {
-                                var ad = document.getElementById('lingmaoAd');
-                                ad.classList.add('collapsed');
-                                ad.querySelector('.ad-toggle').textContent = '+';
-                            }
-                        } catch (e) {}
-                    });
-                </script>
-                
-                <div class="ad-wrap" id="lingmaoAd">
-                    <a class="ad-card" href="https://www.277sy.com/index.php/Rmiddle/down_ra/?appid=401&tgid=da0003500&type=1">
-                        <span class="ad-main">$adHeadline</span>
-                        <span class="ad-action">$adAction</span>
-                    </a>
-                    <button class="ad-toggle" onclick="toggleLandingAd(event)" aria-label="收合廣告">−</button>
-                </div>
-              </main>
-            </body>
-            </html>
-        """.trimIndent()
-        // A null history URL makes WebView.getUrl() report about:blank on some devices.
-        // Keep the native home check consistent with the document's base URL.
-        // Gecko 的 Loader().data() 没有 base URL 参数；首页 HTML 里没有
-        // 相对引用（无 href="/、src="/、fetch()），直接用 data: 加载是安全的。
-        // mapGeckoUrl() 会把 data: 地址映射回 LANDING_URL，
-        // isOnLandingPage() 与 refreshHomeClipboard() 的判断不受影响。
+        val data = org.json.JSONObject().apply {
+            put("searchPlaceholder", if (english) "Search keywords or video code..." else "輸入搜尋關鍵字 / 番號...")
+            put("addBookmark", if (english) "Add Bookmark" else "存入書籤")
+            put("unifiedSearch", if (english) "Search all sites · Unified results" else "統一跨站搜尋 · 彙整結果")
+            put("fallbackSummary", if (english) "Fallback: search on an original site" else "備用：到個別原站搜尋")
+            put("searchHintPrefix", if (english) "Search: " else "搜尋內容：")
+            put("directLinks", if (english) "Go directly to" else "或直接前往")
+            put("recentReleases", if (english) "📅 Releases from the last 3 days" else "📅 近3日新着リスト")
+            put("salesRankings", if (english) "📊 Sales rankings" else "📊 銷售排行")
+            put("playbackHistory", if (english) "📜 Playback history" else "📜 播放紀錄")
+            put("clipboardFrom", if (english) "Copied link from " else "剪貼簿網址：")
+            put("clipboardAsk", if (english) "Open this page?" else "要前往這個頁面嗎？")
+            put("clipboardOpen", if (english) "Open page" else "前往此頁面")
+            put("clipboardDismiss", if (english) "Not now" else "暫時不要")
+            put("rouVideos", if (english) "ROU · Videos" else "ROU · 影片")
+            put("rouSeries", if (english) "ROU · Series" else "ROU · 影集")
+            put("bookmarkSinglePrefix", if (english) "Add bookmark: " else "存入書籤：")
+            put("bookmarkBatchPrefix", if (english) "Add bookmarks (" else "批量存入書籤 (")
+            put("bookmarkCountSuffix", if (english) "): " else "個)：")
+            put("savingLabel", if (english) "Saving... " else "存入中... ")
+            put("savedPrefix", if (english) "✅ Saved " else "✅ 已存入 ")
+            put("savedSuffix", if (english) " items" else " 個")
+            put("adHeadline", if (english) "🐱 Lingmao Games — discounts, bonuses and member perks" else "🐱 靈貓遊戲 - 超低折扣 | 海量福利 | 專屬特權")
+            put("adAction", if (english) "Tap to download the app" else "點擊下載 APP")
+            put("domains", org.json.JSONObject().apply {
+                put("missAvBase", domainConfig.getMissAvBaseUrl())
+                put("missAvDomain", domainConfig.getMissAvDomain())
+                put("jableDomain", domainConfig.getJableDomain())
+                put("rouVideoDomain", domainConfig.getRouVideoDomain())
+                put("avJoyDomain", domainConfig.getAvJoyDomain())
+                put("sevenMmTvBase", domainConfig.get7MmTvBaseUrl())
+                put("sevenMmTvDomain", domainConfig.get7MmTvDomain())
+                put("avpleBase", domainConfig.getAvpleBaseUrl())
+                put("avpleDomain", domainConfig.getAvpleDomain())
+                put("whosBase", domainConfig.getWhosBaseUrl())
+                put("whosDomain", domainConfig.getWhosDomain())
+            })
+        }
+        val encoded = java.net.URLEncoder.encode(data.toString(), "UTF-8").replace("+", "%20")
+        val url = "$LANDING_ASSET_URL#data=$encoded"
         geckoCurrentUrl = LANDING_URL
-        landingDataShown = true
-        geckoSession.load(GeckoSession.Loader().data(landingHtml, "text/html"))
+        landingAssetShown = true
+        activateSession()
+        geckoSession.loadUri(url)
         // 1.2.14 诊断：记录加载发出时间，亮起加载状态，启动 5 秒看门狗。
-        // 只加可见性，不改加载机制（仍走 Loader().data()）。
         landingLoadIssuedAt = SystemClock.elapsedRealtime()
         landingPageStartAt = null
         landingPageStopAt = null
@@ -7403,18 +6970,19 @@ class MainActivity : LocalizedActivity() {
         landingBridgeProbe = "未测"
         landingLoadActive = true
         landingDiagLog.clear()
-        landingDiagLogLine("发出首页加载（Loader().data()，HTML 约 ${landingHtml.length} 字符）")
+        landingDiagLogLine("发出首页加载（$LANDING_ASSET_URL，启动数据约 ${data.toString().length} 字符）")
         showLandingLoading()
         armLandingWatchdog()
     }
     
-    // ── 首页加载诊断（1.2.14-gecko 诊断版）──────────────────────────────
-    // 只加可见性，不改加载机制。回答两个问题：
-    // ① 首页 data: 加载到底有没有开始（onPageStart 来没来）；
-    // ② 桥（window.Android）在 data: 页上跑不跑。
-    // 诊断版不修加载：白屏修法是第二步，按这版的诊断结果再定。
+    // ── 首页加载诊断（1.2.14-gecko 诊断版，1.2.15 保留）──────────────────
+    // 回答两个问题：
+    // ① 首页 resource:// 加载到底有没有开始（onPageStart 来没来）；
+    // ② 桥（window.Android）在 resource:// 页上跑不跑。
+    // 1.2.14 诊断结论：会话/视图/扩展/内核全正常，data: 加载在启动时被
+    // 静默丢弃；1.2.15 按此改走 assets 本地文件 + 延时加载。
 
-    /** 当前回调是否属于本次首页加载（data: 载入映射后的地址正是 LANDING_URL）。 */
+    /** 当前回调是否属于本次首页加载（resource:// 载入映射后的地址正是 LANDING_URL）。 */
     private fun isLandingLoadEvent(): Boolean = landingLoadActive && geckoCurrentUrl == LANDING_URL
 
     /** 诊断事件记一行（带相对时间），进日志与“复制诊断”。 */
@@ -7489,9 +7057,9 @@ class MainActivity : LocalizedActivity() {
 
     /**
      * 桥探针：首页成功加载后，用 GeckoEval 查 window.Android 是否存在。
-     * 三种结果：BRIDGE_OK（桥在 data: 页上跑）/ BRIDGE_MISSING
+     * 三种结果：BRIDGE_OK（桥在 resource:// 页上跑）/ BRIDGE_MISSING
      * （页面世界里没有 window.Android）/ BRIDGE_TIMEOUT（5 秒无回音：
-     * content script 没在 data: 页运行，或 token 注不进去）。
+     * content script 没在 resource:// 页运行，或 token 注不进去）。
      * 桥不可用时也进失败页（首页按钮全死，跟白屏一样没法用）。
      */
     private fun runLandingBridgeProbe() {
@@ -7502,7 +7070,7 @@ class MainActivity : LocalizedActivity() {
             LANDING_BRIDGE_PROBE_TIMEOUT_MS
         ) { result ->
             landingBridgeProbe = when {
-                result == null -> "BRIDGE_TIMEOUT（5 秒无回音：content script 未在 data: 页运行，或 token 注入失败）"
+                result == null -> "BRIDGE_TIMEOUT（5 秒无回音：content script 未在 resource:// 页运行，或 token 注入失败）"
                 result.contains("BRIDGE_OK") -> "BRIDGE_OK（window.Android 存在）"
                 result.contains("BRIDGE_MISSING") -> "BRIDGE_MISSING（window.Android 不存在）"
                 else -> "未知回值：$result"
@@ -7512,7 +7080,7 @@ class MainActivity : LocalizedActivity() {
                 hideLandingDiagOverlay()
             } else {
                 val reason = if (landingBridgeProbe.startsWith("BRIDGE_TIMEOUT")) {
-                    "首页已加载，但桥没有回音：扩展 content script 可能没在 data: 页运行"
+                    "首页已加载，但桥没有回音：扩展 content script 可能没在 resource:// 页运行"
                 } else {
                     "首页已加载，但桥不可用：window.Android 不存在，首页按钮点不了"
                 }
@@ -7765,7 +7333,7 @@ class MainActivity : LocalizedActivity() {
         return buildString {
             appendLine("javbrowser 首页诊断")
             appendLine("应用版本：$appVersion")
-            appendLine("页面：首页（Loader().data()）")
+            appendLine("页面：首页（resource://android/assets/landing.html）")
             appendLine(landingDiagnosticState())
             if (landingDiagLog.isNotEmpty()) {
                 appendLine("—— 事件日志 ——")
