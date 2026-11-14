@@ -74,6 +74,12 @@ class GeckoBrowserActivity : LocalizedActivity() {
         /** open() 之后等这么久再发首个 loadUri，给原生 session 打开留时间。 */
         private const val LOAD_START_DELAY_MS = 500L
         private const val TAG = "GeckoBrowser"
+
+        fun intent(context: Context, url: String, title: String = ""): Intent =
+            Intent(context, GeckoBrowserActivity::class.java).apply {
+                putExtra(EXTRA_URL, url)
+                putExtra(EXTRA_TITLE, title)
+            }
     }
 
     private lateinit var geckoView: GeckoView
