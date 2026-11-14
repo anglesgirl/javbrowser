@@ -165,7 +165,6 @@ class MainActivity : LocalizedActivity() {
     private var lastStripchatModelUrl: String? = null
     private var videoFoundToastShown = false
     // 全螢幕播放支援
-    private var isGeckoFullscreen: Boolean = false
     private lateinit var fullscreenContainer: android.widget.FrameLayout
     private var isStripchatOverlayActive = false
     private var videoProxyServer: VideoProxyServer? = null
@@ -2372,16 +2371,6 @@ class MainActivity : LocalizedActivity() {
         return result
     }
 
-    private fun cancelPendingFilePrompt() {
-        val prompt = pendingFilePrompt
-        val pending = pendingFileResult
-        pendingFilePrompt = null
-        pendingFileResult = null
-        if (prompt != null && pending != null) {
-            runCatching { pending.complete(prompt.dismiss()) }
-        }
-    }
-
     // ── Stripchat 桥返回值 shim ──────────────────────────────────────────
     //
     // GeckoBridge 的 handler 是 (JSONArray) -> Unit，没有返回值；页面 JS
@@ -2723,7 +2712,7 @@ class MainActivity : LocalizedActivity() {
                 androidx.appcompat.app.AlertDialog.Builder(this@MainActivity)
                     .setMessage(prompt.message)
                     .setPositiveButton(android.R.string.ok) { _, _ ->
-                        result.complete(prompt.confirm())
+                        result.complete(prompt.confirm(GeckoSession.PromptDelegate.ButtonPrompt.Type.POSITIVE))
                     }
                     .setNegativeButton(android.R.string.cancel) { _, _ ->
                         result.complete(prompt.dismiss())
@@ -3692,7 +3681,7 @@ class MainActivity : LocalizedActivity() {
         GeckoEval.evaluate(geckoSession, "(function() { return document.documentElement.outerHTML; })();") { html ->
             // html is a JSON string, e.g. "\u003Chtml>..."
             // We need to unescape it.
-            val rawHtml = unescapeJsString(html)
+            val rawHtml = unescapeJsString(html.orEmpty())
 
             var extractedUrl: String? = null
 
@@ -3867,7 +3856,6 @@ class MainActivity : LocalizedActivity() {
      * 不到——点播放按钮后改由 DOM 轮询 video.currentSrc/src 补；
      * ③ 旧版返回空响应阻断加载以省流量的行为没了。
      */
-    @android.annotation.SuppressLint("SetJavaScriptEnabled")
     private fun extractStreamtapeUrl(embedUrl: String, callback: (String?) -> Unit) {
         // 用 Handler 确保所有会话操作在 main thread
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -3995,7 +3983,6 @@ class MainActivity : LocalizedActivity() {
      * doodcdn 上无副档名的地址它看不到——那部分只剩 onPageStop 后的
      * DOM 扫描（video/source/data-src），与旧版拦截互补。
      */
-    @android.annotation.SuppressLint("SetJavaScriptEnabled")
     private fun resolvePlaymogoVideo(embedUrl: String, callback: (String?) -> Unit) {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
         var hiddenSession: GeckoSession? = null
@@ -6636,7 +6623,7 @@ class MainActivity : LocalizedActivity() {
             exitGeckoFullscreen()
             return
         }
-        if (geckoCanGoBack()) {
+        if (geckoCanGoBack) {
             // 返回上一頁前，把當前的 Y 軸位置直接寫進該網頁的 sessionStorage
             GeckoEval.evaluate(geckoSession, 
                 """

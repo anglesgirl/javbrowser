@@ -173,8 +173,8 @@ internal object GeckoBridgeExtension {
                     val callbacks = synchronized(this) {
                         extension = installed
                         installing = false
-                        pendingReady.toList().also { pendingReady.clear() }
                         pendingError.clear()
+                        pendingReady.toList().also { pendingReady.clear() }
                     }
                     callbacks.forEach { it(installed) }
                 }

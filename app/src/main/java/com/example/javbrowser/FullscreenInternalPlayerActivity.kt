@@ -686,7 +686,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     args.optInt(3, 0), args.optInt(4, 0) == 1)
             },
             "resolveAdditionalEpisode" to { args ->
-                resolveAdditionalEpisode(args.optString(0), args.optInt(1), args.optInt(2, -1),
+                resolveAdditionalEpisode(args.optString(0), args.optString(1), args.optInt(2, -1),
                     args.optInt(3, 0), args.optInt(4, 0) == 1)
             },
             "toggleOrientationLock" to { toggleOrientationLock() },

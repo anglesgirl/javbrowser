@@ -1161,7 +1161,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
          * Never throws. `timeoutMs` is 10s by default; the bundled
          * script injections pass 30s (a cold Gecko eval of ~90KB of
          * jQuery must not be cut off). */
-        fun evalJs(js: String, cb: (String?) -> Unit, timeoutMs: Long = 10_000L) {
+        fun evalJs(js: String, timeoutMs: Long = 10_000L, cb: (String?) -> Unit) {
             if (done) return
             val gen = evalGen
             val session = hiddenSession
