@@ -491,3 +491,31 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
   一字未动。
 - 用法：进嗅探页看面板（扩展装好没、domScan 到没到、探针找到播放器没），
   出结果或超时后点“复制诊断”发回。
+
+### 1.2.13-gecko（vc161）：修 1.2.11 启动闪退
+
+- 现象：1.2.11（build-20261114-a3ebff0）用户真机“一打开就崩溃”，1.2.10
+  能打开。Gmail 里没有 Crashlytics 新报警邮件（只对热门问题发邮件，
+  单台首崩不会发），堆栈是按代码 + GeckoView 151 源码核实的，不是猜的。
+- 根因（已核实）：首页 HTML 里嵌的广告链接含 `down_ra`
+ （`https://www.277sy.com/index.php/Rmiddle/down_ra/?appid=401…`）。
+  旧 WebView 的 `loadDataWithBaseURL` 不会把初始加载送进
+  `shouldOverrideUrlLoading`，但 GeckoView 的 `load()` 会把初始 data:
+  加载也送进 `NavigationDelegate.onLoadRequest`（151 源码
+  `GeckoSession.load()` → `shouldLoadUri()` → `onLoadRequest`，
+  `isDirectNavigation=true`）。`onGeckoLoadRequest` 对整条 data: URL
+  （含全部 HTML）做子串匹配，`url.contains("down_ra")` 命中，调
+  `downloadAndInstallApk(dataUrl)` 发 `ACTION_VIEW`；没有任何应用能接
+  `data:text/html` 的 VIEW 意图，`startActivity` 抛
+  `ActivityNotFoundException`，主线程直接闪退。每次启动都走
+  `loadLandingPage()`，故 100% 复现。
+- 修法（两处，只动 MainActivity）：
+  1. `onGeckoLoadRequest` 开头：非 http(s) 地址（data:/about:/blob:/
+     javascript: 等）直接放行，不走拦截规则（广告拦截、APK 下载、DMM
+     跳转、Shopee 拦截只对真实网页导航有意义）。主路与子框共用此函数，
+     一并覆盖。
+  2. `downloadAndInstallApk` 加防线：只接 http(s) 链接，无接收方时
+     runCatching 记日志不抛错——同样的误触发再也不会闪退。
+- 没动的：搜索、播放、嗅探、/api/play/ 桌面 UA、VAST 放行、11 广告域、
+  迁移成果本身。`down_ra`/`.apk` 检查只在 MainActivity 这一处，
+  Fullscreen 与 UnifiedSearch 没有同样模式。

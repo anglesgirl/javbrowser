@@ -2029,6 +2029,16 @@ class MainActivity : LocalizedActivity() {
 
         val lowerUrl = url.lowercase()
 
+        // 非 http(s) 地址（data:/about:/blob:/javascript: 等）不走拦截规则。
+        // Gecko 的 load() 会把初始 data: 加载也送进 onLoadRequest（旧
+        // WebView 的 loadDataWithBaseURL 不会）；首页 HTML 里嵌的广告链接
+        // 含 down_ra，子串匹配会误判成 APK 下载、调 downloadAndInstallApk
+        // 发 ACTION_VIEW，没有应用能接 data:text/html，直接闪退
+        // （1.2.11 启动闪退根因，2026-11-14）。
+        if (!lowerUrl.startsWith("http://") && !lowerUrl.startsWith("https://")) {
+            return false
+        }
+
         if (SupjavNavigation.blocks(currentPageUrl, url, isMainFrame)) {
             android.util.Log.d("AdBlock", "SUPJAV main-frame advertisement blocked")
             return true
@@ -7346,9 +7356,18 @@ class MainActivity : LocalizedActivity() {
     }
     
     private fun downloadAndInstallApk(url: String) {
+        // 只接 http(s) 下载链接；无应用可接时不抛错（1.2.11 教训：data: URL
+        // 误触发时 ACTION_VIEW 无接收方直接闪退）。
+        if (!url.startsWith("http://", ignoreCase = true) &&
+            !url.startsWith("https://", ignoreCase = true)
+        ) {
+            android.util.Log.w("MainActivity", "拒绝非 http(s) 下载链接：${url.take(120)}")
+            return
+        }
         val intent = Intent(Intent.ACTION_VIEW)
         intent.setData(android.net.Uri.parse(url))
-        startActivity(intent)
+        runCatching { startActivity(intent) }
+            .onFailure { android.util.Log.w("MainActivity", "无法打开下载链接：$url", it) }
     }
 
     private fun setupCrossSiteSearchButton() {
