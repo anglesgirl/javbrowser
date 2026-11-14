@@ -93,15 +93,17 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
 
 ## 未迁 / 已知取舍（待后续，不悄悄降级）
 
-- MainActivity（7238 行，主浏览器）、UnifiedSearchActivity（3152 行）、
-  FullscreenInternalPlayerActivity（3418 行）仍用 WebView；它们的
-  shouldInterceptRequest 里 EchH3Router.fetchWebViewResource 调用改为
-  直接放行（返回 null，走 WebView 默认加载）。这意味着这几个 WebView
-  不再走 ECH 拦截，明文 SNI 加载在用户网络上可能被 RST/403。
-  后续：把这几个主 WebView 也迁到 GeckoView。
-  （2026-11-14 1.2.3-gecko：MainActivity 的 navigateToUrl 已改走
-  GeckoBrowserActivity，首页点外站不再经 WebView；MainActivity 本体
-  的首页本地 HTML 仍用 WebView。）
+- **全量迁移已做（1.2.11-gecko，见文末）**：MainActivity、UnifiedSearchActivity、
+  FullscreenInternalPlayerActivity、SearchSourceActivity、TodayContentActivity、
+  TodayNewActivity、FavoritesActivity（隐藏 WebView 部分）与全部无界面抓取器
+  （JavDbWebViewScraper、JavTrailersScraper、MissavScraper、CrossSiteChecker、
+  SearchWebViewFetcher、SupjavMediaResolver、JavratePlaybackSession）已改走
+  GeckoView + 通用桥扩展（gecko-bridge）。仅剩一处 WebView：
+  FullscreenInternalPlayerActivity 里的 bootstrapSurritCookie 隐藏 WebView
+  （唯一用途是往 android.webkit.CookieManager 写 surrit cookie 供下载服务用，
+  Gecko 没有写该仓的公开 API，硬迁等于废掉它）。另有两处 layout 仍是
+  `<WebView>` 占位（MainActivity、TodayContentActivity），启动时原位换成
+  GeckoView，未加载过即销毁。
 - SearchHttpFetcher 改明文 OkHttp 后，搜索 HTML 抓取不再隐藏 SNI；
   若用户网络上明文 SNI 被 RST，搜索会受影响，后续应把搜索抓取也
   走 GeckoView（原生 ECH/DoH）。
@@ -370,3 +372,96 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
     FullscreenInternalPlayerActivity 未动（另一个全量迁移任务在做）。
 - 待用户真机验：进嗅探页等视频播起来，看正片地址是否被抓到、不
   再报页面失败。
+
+## 1.2.11-gecko（vc159，2026-11-14 晚）——全量迁移：所有页面转火狐内核
+
+- 用户 18:57 真机确认 1.2.8 最小测试能打开，随即要求“把那些所有的页面都
+  转成火狐内核”。本次把 App 里全部 WebView 页面与无界面抓取器一次迁完。
+- 做法：6 组并行、成果先 staged 到 `~/workspace/javbrowser-migration/` 再统一
+  集成（infra / 纯浏览器 / 搜索 / 播放 / 抓取器 / 主页），集成基底 4dabf70
+  （1.2.10-gecko）；被迁文件在 7ab56f4→4dabf70 间零改动，staged 文件直接合入。
+
+### 新基建：通用桥扩展 gecko-bridge（GeckoView 151 没有的三个能力一次补齐）
+
+- GeckoView 151 没有 evaluateJavascript、没有 addJavascriptInterface、没有直接
+  读 Cookie 的 API；唯一官方通道是内置 WebExtension + native messaging。
+- 新增 `app/src/main/assets/gecko-bridge/`（manifest.json、background.js、
+  content.js，扩展 id `gecko-bridge@javbrowser`，nativeApp `geckoBridge`）
+  与 `gecko/` 下 5 个 Kotlin 文件：
+  `GeckoEval`（evaluate / runJavascript，语义对齐 WebView.evaluateJavascript：
+  字符串结果包 JSON 引号、undefined→"null"、超时回调 null、主线程回调）、
+  `GeckoBridge`（attachBridge / detachBridge，页面 JS 调 window.Android.<method>）、
+  `GeckoCookies`（getCookie / setCookie，getCookie 返回 "name=value; ..."）、
+  `GeckoHeadless`（loadSession：无界面 session 加载，成功回调 session、超时回调 null）、
+  `GeckoBridgeExtension`（内部宿主：装扩展、native port、分发、token 管理）。
+- 机制：background 经 connectNative 连 native port；eval 由 background 向全部 tab
+  广播，content script 中继到页面世界注入的 hook 里执行（content script 是隔离
+  世界，直接 eval 拿不到页面变量）；每会话一个 UUID token，经 javascript: URL
+  注入页面（window.__jbToken），结果带 token 回来才认领。
+- **退化模式（已写进实现，不是假设）**：1.2.10 已记“loadUri("javascript:...")
+  经用户报告在 GeckoView 里跑不起来”——若 token 注不进去，content script 照
+  样执行并回 token=null，Kotlin 认第一个回来的结果；bridge 调用无 token 时广播
+  给全部已挂会话、按方法名分发。单会话流程下结果正确；多会话并发 eval 时结果
+  可能串话、有副作用的 JS 会在各已加载页面各执行一次。token 串话是本次最大的
+  已知风险，真机验证第 1 条就是它。
+- 与 javhd-gecko 共存（扩展 id、nativeApp、content-script 匹配范围都不同，
+  互不干扰）；javhd 扩展与 JavhdGeckoExtension 本次未动。首次使用前调用方必须
+  先给一次 Context（`GeckoBridgeExtension.ensureInstalled(context)` 或
+  `GeckoHeadless.loadSession`，幂等），否则 evaluate 直接回 null、getCookie 回 ""。
+
+### 每页迁移状态
+
+- MainActivity（7240→7661 行）：首页本地 HTML 改 Loader().data()（data: 载入，
+  无 baseUri）；42 个桥方法自动生成进 GeckoBridge.attachBridge；导航改
+  onGeckoLoadRequest；媒体嗅改 attachMediaSniffer（谓词逐字保留）；文件选择改
+  PromptDelegate.onFilePrompt；全屏视频改 FullscreenDelegate；长按改
+  onContextMenu；两个隐藏 WebView 改无界面 GeckoSession；DMM cookie 改
+  GeckoCookies.setCookie。layout 里的 `<WebView>` 仍作占位，启动时原位换成
+  GeckoView。**头号风险：首页是 data: 加载，GeckoView 151 是否在 data: 页跑
+  content script 未知——若不跑，首页全部按钮（window.Android.*）全死，备选是
+  本地 HTTP 服务器。真机验证第 1 条。**
+- UnifiedSearchActivity（3177→3146 行）：4 个隐藏 WebView 全迁——嗅探改
+  loadSession + attachMediaSniffer；直取沙盒改 data:text/html;base64 + stripScripts
+  中和（iframe 去 src/srcdoc、video/audio/source 去 src、去 refresh meta）；
+  点击回退改 DOM 探针；HentaiMama 改 GeckoEval 轮询。原来为绕 WebView 明文 RST
+  做的 OkHttp 预载 + loadDataWithBaseURL 注入整个删掉。loadSession 无 UA 参数，
+  隐藏会话用 Firefox 默认 UA（原 Pixel 7 Chrome 124），是已知降级。
+- FullscreenInternalPlayerActivity（3407→3578 行）：13 个桥方法原样映射到
+  GeckoBridge（页面 17 处调用全改 window.Android.*）；5 个同步回值方法改异步
+  回调（画质清单、录影事件、分集解析×2、方向锁，结果经 GeckoEval 送回页面
+  window.__on*；分集加 index + token 防连点串集）；播放器 HTML 改 Loader.data()。
+  **唯一剩下的 WebView：bootstrapSurritCookie 隐藏 WebView**（往 webkit
+  CookieManager 写 surrit cookie 供下载服务用，Gecko 无写该仓的公开 API）。
+- SearchSourceActivity、TodayContentActivity：纯浏览器页，按 GeckoBrowserActivity
+  模式直迁；layout 的 `<WebView>` 占位启动时换掉。SearchSource 丢了 HTTP 状态码
+  与 cf-mitigated 响应头细分（NavigationDelegate 不暴露，无对等 API）。
+- TodayNewActivity：隐藏 WebView 改无界面 session + GeckoEval，提取 JS 一字未动。
+- 抓取器（JavDbWebViewScraper、JavTrailersScraper、MissavScraper、
+  CrossSiteChecker、SearchWebViewFetcher、SupjavMediaResolver、
+  JavratePlaybackSession）：全部改 loadSession + GeckoEval + GeckoCookies；
+  提取 JS 逐字保留；挑战等待改轮询（覆盖页内解开、无导航的情况）；
+  JavTrailers 的 shouldInterceptRequest 拦 m3u8/mp4 改 attachMediaSniffer；
+  FavoritesActivity 只改 showJavDbManualWebViewDialog 一处（其余 106 个成员未动）。
+- Supjav 已知降级：WebMessageListener、子框内 streamtape 点击、请求级侦测无等
+  价物；直连 bypass 站（supjav/missav/jable/avjoy/avtoday）可能因丢 Referer/
+  cookie 而 403（后备方案是改走 localhost 代理；走代理的站不受影响）。
+- Javrate：document-start 注入无等价 API（改载入后注入；站方若先调 createPlayer，
+  授权拿不到，25 秒超时）；loadSession 不带 Referer。
+- 未动的：/api/play/ 桌面 UA（Windows Chrome 131，仅那一处）、tsyndicate.com
+  VAST 永不拦、11 广告域、全部搜索解析器/扇出/结果解析/播放地址提取、OkHttp 侧
+  的 webkit CookieManager（两边仓不互通是已知现状，未试图打通）。
+
+### 真机验证（按顺序，任何一项失败先报现象 + 截图，不要只说“不行”）
+
+1. 首页：打开 App，首页按钮能不能点（验证 data: 页 content script + 桥）。
+   若全死：data: 页不跑扩展，改本地 HTTP 服务器方案。
+2. 统一跨站搜寻：搜一个番號，看结果、详情、播放地址是否正常出（验证隐藏会话
+   eval + 嗅探）。
+3. JavDB / MissAV / JavTrailers 搜索与详情（验证抓取器 eval + 挑战等待）。
+4. 播一个片：嵌頁播放器播不播、画质切不切、分集切不切、自动连播还在不在
+   （验证播放器桥 + 异步回调）。
+5. Supjav 解析、Javrate 授权刷新 + 字幕、下一次下载（验证 Referer/cookie 降级
+   有没有真的 403）。
+6. 收藏夹里 JavDB 手动框、今日新片、SearchSource 打开一个站（验证可见浏览器页）。
+7. 若多站同时搜寻时结果串了（A 站的结果出现在 B 站），就是 token 退化串话，
+   报给我，修 token 通道（改走 background 按 tab 路由，不再靠 javascript: URL）。

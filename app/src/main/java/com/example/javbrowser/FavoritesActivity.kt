@@ -35,6 +35,12 @@ import com.bumptech.glide.load.engine.GlideException
 import com.bumptech.glide.request.RequestListener
 import com.bumptech.glide.request.target.Target
 import org.json.JSONObject
+import com.example.javbrowser.gecko.GeckoEval
+import com.example.javbrowser.gecko.GeckoRuntimeProvider
+import org.mozilla.geckoview.GeckoResult
+import org.mozilla.geckoview.GeckoSession
+import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.WebRequestError
 import java.util.concurrent.TimeUnit
 
 class FavoritesActivity : LocalizedActivity() {
@@ -3092,27 +3098,33 @@ class FavoritesActivity : LocalizedActivity() {
         val dialog  = android.app.Dialog(this)
         dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
 
-        // ── WebView（儘量擬真 Chrome，提高 CF 通過率）──
-        val webView = android.webkit.WebView(this)
-        webView.settings.apply {
-            javaScriptEnabled        = true
-            domStorageEnabled        = true
-            databaseEnabled          = true
-            setSupportMultipleWindows(false)
-            mediaPlaybackRequiresUserGesture = false
-            // 行動版 Chrome UA（比桌面版更符合 Android WebView 的預期）
-            userAgentString =
+        // ── GeckoView（儘量擬真 Chrome，提高 CF 通過率；Gecko 原生 DoH +
+        // ECH，用户在对话框里手动过 CF 挑战）──
+        // 原 WebView 的 WebChromeClient（给 CF JS 挑战提供完整执行环境）
+        // 在 Gecko 里不需要：挑战 JS 直接在 Gecko 内核里跑。
+        val runtime = GeckoRuntimeProvider.get(this)
+        val geckoView = GeckoView(this)
+        val geckoSession = GeckoSession()
+        geckoSession.settings.apply {
+            allowJavascript = true
+            useTrackingProtection = false
+            // 行動版 Chrome UA（比桌面版更符合站方预期；原 WebView 同款）。
+            // 注意：Gecko 的 UA 设置项叫 userAgentOverride。
+            userAgentOverride =
                 "Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/UQ1A.240105.004) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/122.0.6261.119 Mobile Safari/537.36"
         }
-        // WebChromeClient 讓 CF JS challenge 有完整執行環境
-        webView.webChromeClient = android.webkit.WebChromeClient()
-        android.webkit.CookieManager.getInstance().apply {
-            setAcceptCookie(true)
-            setAcceptThirdPartyCookies(webView, true)
-            setCookie("https://javdb.com", "over18=1; path=/; domain=.javdb.com")
-            flush()
+        // over18 cookie：任务简报给定的共享 API 里没有写 cookie 的接口，
+        // 首载后用 JS 在 javdb.com 域内种 cookie 再重载一次（只一次）。
+        // 注：infra 实际还公开了 GeckoCookies.setCookie，后续可简化。
+        var cookieSeeded = false
+        var sessionClosed = false
+        fun closeSession() {
+            if (sessionClosed) return
+            sessionClosed = true
+            runCatching { geckoSession.stop() }
+            runCatching { geckoSession.close() }
         }
 
         val dp = resources.displayMetrics.density
@@ -3121,6 +3133,12 @@ class FavoritesActivity : LocalizedActivity() {
         var step        = "search"
         var detailHref  = ""
         val searchUrl   = "https://javdb.com/search?q=${java.net.URLEncoder.encode(javCode, "UTF-8")}&locale=zh"
+        var initialLoadStarted = false
+        fun startInitialLoad() {
+            if (initialLoadStarted || sessionClosed) return
+            initialLoadStarted = true
+            geckoSession.loadUri(searchUrl)
+        }
 
         // ── 底部狀態列 ──
         val tvStatus = TextView(this).apply {
@@ -3140,7 +3158,7 @@ class FavoritesActivity : LocalizedActivity() {
                 visibility = View.GONE
                 step = "search"
                 tvStatus.text = "🔍 重新搜尋..."
-                webView.loadUrl(searchUrl)
+                if (!sessionClosed) geckoSession.loadUri(searchUrl)
             }
         }
         val btnClose = android.widget.Button(this).apply {
@@ -3148,7 +3166,7 @@ class FavoritesActivity : LocalizedActivity() {
             textSize = 12f
             setPadding((dp * 16).toInt(), 0, (dp * 16).toInt(), 0)
             setOnClickListener {
-                webView.stopLoading(); webView.destroy(); dialog.dismiss()
+                closeSession(); dialog.dismiss()
             }
         }
         val bottomBar = LinearLayout(this).apply {
@@ -3162,7 +3180,7 @@ class FavoritesActivity : LocalizedActivity() {
 
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(webView,   LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+            addView(geckoView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
             addView(bottomBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
 
@@ -3172,15 +3190,19 @@ class FavoritesActivity : LocalizedActivity() {
             setLayout((m.widthPixels * 0.93).toInt(), (m.heightPixels * 0.80).toInt())
         }
 
-        fun evalAfterDelay(view: android.webkit.WebView, delayMs: Long, block: (android.webkit.WebView) -> Unit) {
-            handler.postDelayed({ if (dialog.isShowing) block(view) }, delayMs)
+        fun evalAfterDelay(session: GeckoSession, delayMs: Long, block: (GeckoSession) -> Unit) {
+            handler.postDelayed({ if (dialog.isShowing && !sessionClosed) block(session) }, delayMs)
         }
 
-        webView.webViewClient = object : android.webkit.WebViewClient() {
+        geckoSession.progressDelegate = object : GeckoSession.ProgressDelegate {
 
-            // 在頁面 JS 執行前注入，掩蓋 WebView 特徵，提高 CF 通過率
-            override fun onPageStarted(view: android.webkit.WebView, url: String, favicon: android.graphics.Bitmap?) {
-                view.evaluateJavascript("""
+            // 在頁面 JS 執行前注入，掩蓋 WebView 特徵，提高 CF 通過率。
+            // Gecko 没有“页面 JS 执行前”的注入点，退到 onPageStart 时注入
+            // ——CF 挑战 JS 在加载后持续执行，注入仍可能赶在其指纹读取
+            // 之前；且 Gecko 本身就是真实 Firefox 指纹，不像 WebView 那样
+            // 自带可探测特征。这段注入是尽力而为，原语义不变。
+            override fun onPageStart(session: GeckoSession, url: String) {
+                GeckoEval.runJavascript(session, """
                     (function(){
                         try { Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); } catch(e){}
                         try {
@@ -3203,11 +3225,19 @@ class FavoritesActivity : LocalizedActivity() {
                             Object.defineProperty(navigator,'languages',{get:()=>['zh-TW','zh','en-US','en']});
                         } catch(e){}
                     })();
-                """.trimIndent(), null)
+                """.trimIndent())
             }
 
-            override fun onPageFinished(view: android.webkit.WebView, url: String) {
-                evalAfterDelay(view, 1800) { wv ->
+            override fun onPageStop(session: GeckoSession, success: Boolean) {
+                if (sessionClosed || !success) return
+                // 首载先种 over18 cookie 再重载一次（只一次；重试时不再种）。
+                if (step == "search" && !cookieSeeded) {
+                    cookieSeeded = true
+                    GeckoEval.runJavascript(session, "document.cookie = 'over18=1; path=/; domain=.javdb.com';")
+                    session.loadUri(searchUrl)
+                    return
+                }
+                evalAfterDelay(session, 1800) { s ->
                     // 同時抓 title + body 文字，body 用於偵測 "Verification failed" 字樣
                     val detectJs = """
                         (function(){
@@ -3216,8 +3246,8 @@ class FavoritesActivity : LocalizedActivity() {
                             return JSON.stringify({title:t, body:b.substring(0,400)});
                         })()
                     """.trimIndent()
-                    wv.evaluateJavascript(detectJs) { raw ->
-                        if (!dialog.isShowing) return@evaluateJavascript
+                    GeckoEval.evaluate(s, detectJs) { raw ->
+                        if (!dialog.isShowing) return@evaluate
                         var pageTitle = ""
                         var pageBody  = ""
                         try {
@@ -3235,7 +3265,7 @@ class FavoritesActivity : LocalizedActivity() {
                                    pageTitle.contains("security verification", ignoreCase = true)
                         if (isCF) {
                             tvStatus.text = "⚠️ 請在上方完成人機驗證，完成後自動繼續"
-                            return@evaluateJavascript
+                            return@evaluate
                         }
 
                         // 方案C：只有 body 明確出現「失敗」字樣才觸發（比 CF challenge 更嚴重）
@@ -3247,7 +3277,7 @@ class FavoritesActivity : LocalizedActivity() {
                         if (isVerifyFailed) {
                             tvStatus.text = "🚫 驗證失敗，請在上方手動瀏覽 JavDB 通過驗證，再按「重新查詢」"
                             btnRetry.visibility = View.VISIBLE
-                            return@evaluateJavascript
+                            return@evaluate
                         }
 
                         when (step) {
@@ -3269,15 +3299,15 @@ class FavoritesActivity : LocalizedActivity() {
                                         return first?first.getAttribute('href'):null;
                                     })()
                                 """.trimIndent()
-                                wv.evaluateJavascript(js) { href ->
+                                GeckoEval.evaluate(s, js) { href ->
                                     if (href == null || href == "null") {
                                         tvStatus.text = "❌ 找不到番號「$javCode」的資料"
-                                        return@evaluateJavascript
+                                        return@evaluate
                                     }
                                     detailHref = href.trim('"').replace("\\/", "/")
                                     step = "detail"
                                     tvStatus.text = "🔗 載入詳情頁..."
-                                    wv.loadUrl("https://javdb.com$detailHref?locale=zh")
+                                    s.loadUri("https://javdb.com$detailHref?locale=zh")
                                 }
                             }
                             "detail" -> {
@@ -3296,9 +3326,9 @@ class FavoritesActivity : LocalizedActivity() {
                                         return {title:te?te.textContent.trim():'',coverUrl:abs(cover),releaseDate:mv('\u65E5\u671F:','\u767C\u884C\u65E5\u671F:','Released Date:'),rating:mv('\u8A55\u5206:','Rating:').trim(),maker:mv('\u7247\u5546:','\u767C\u884C\u5546:','Maker:'),series:mv('\u7CFB\u5217:','Series:'),genres:ml('\u985E\u5225:','\u6A19\u7C64:','Tags:'),actors:ea('\u6F14\u54E1:','\u5973\u512A:','Actor(s):')};
                                     })()
                                 """.trimIndent()
-                                wv.evaluateJavascript(js) { result ->
+                                GeckoEval.evaluate(s, js) { result ->
                                     if (result == null || result == "null") {
-                                        tvStatus.text = "❌ 資料解析失敗，請重試"; return@evaluateJavascript
+                                        tvStatus.text = "❌ 資料解析失敗，請重試"; return@evaluate
                                     }
                                     try {
                                         val obj    = org.json.JSONObject(result)
@@ -3327,7 +3357,7 @@ class FavoritesActivity : LocalizedActivity() {
                                         favoritesManager.updateFavoriteDetail(item.url, detail)
                                         tvStatus.text = "✅ 查詢成功，即將關閉..."
                                         handler.postDelayed({
-                                            webView.stopLoading(); webView.destroy(); dialog.dismiss()
+                                            closeSession(); dialog.dismiss()
                                             LocalBroadcastManager.getInstance(this@FavoritesActivity)
                                                 .sendBroadcast(Intent(ACTION_FAVORITE_ENRICHED))
                                         }, 900)
@@ -3342,8 +3372,32 @@ class FavoritesActivity : LocalizedActivity() {
             }
         }
 
-        dialog.setOnDismissListener { if (step != "done") { webView.stopLoading(); webView.destroy() } }
+        geckoSession.navigationDelegate = object : GeckoSession.NavigationDelegate {
+            override fun onLoadError(
+                session: GeckoSession,
+                uri: String?,
+                error: WebRequestError
+            ): GeckoResult<String>? {
+                if (!dialog.isShowing) return null
+                tvStatus.text = "❌ 載入失敗（錯誤碼 ${error.code}），請檢查網絡後按「重新查詢」"
+                btnRetry.visibility = View.VISIBLE
+                // 返回 null：不显示 Gecko 默认错误页，用对话框自己的状态行。
+                return null
+            }
+        }
+
+        dialog.setOnDismissListener { if (step != "done") { closeSession() } }
         dialog.show()
-        webView.loadUrl(searchUrl)
+        geckoSession.open(runtime)
+        geckoView.setSession(geckoSession)
+        // 显式激活会话，不依赖 Surface 路径（GeckoBrowserActivity 同款）。
+        runCatching {
+            geckoSession.setActive(true)
+            geckoSession.setFocused(true)
+            geckoSession.setPriorityHint(GeckoSession.PRIORITY_HIGH)
+        }
+        // 首个 loadUri 等视图挂载后再发，1 秒兜底（同款）。
+        geckoView.post { startInitialLoad() }
+        handler.postDelayed({ startInitialLoad() }, 1_000L)
     }
 }

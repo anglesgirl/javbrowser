@@ -4,11 +4,13 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import com.example.javbrowser.gecko.GeckoEval
+import com.example.javbrowser.gecko.GeckoHeadless
+import com.example.javbrowser.gecko.GeckoRuntimeProvider
+import org.mozilla.geckoview.GeckoResult
+import org.mozilla.geckoview.GeckoSession
+import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.WebRequestError
 
 /**
  * 番號跨站檢測器：隱藏 WebView 確認各平台是否存在對應頁面。
@@ -210,23 +212,15 @@ object CrossSiteChecker {
         callback: (String?) -> Unit
     ) {
         val handler = Handler(Looper.getMainLooper())
-        val webView = WebView(context)
-        webView.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            mediaPlaybackRequiresUserGesture = false
-            userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-        }
-        android.webkit.CookieManager.getInstance().setAcceptCookie(true)
-        android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+        var sessionRef: GeckoSession? = null
 
         var responded = false
         fun done(result: String?) {
             if (responded) return
             responded = true
-            webView.stopLoading()
-            webView.destroy()
+            handler.removeCallbacksAndMessages(null)
+            sessionRef?.let { runCatching { it.close() } }
+            sessionRef = null
             callback(result)
         }
 
@@ -289,48 +283,55 @@ object CrossSiteChecker {
             """.trimIndent()
         }
 
-        fun evaluate(view: WebView?) {
+        fun evaluateScript(session: GeckoSession) {
             if (responded) return
-            view?.evaluateJavascript(script) { raw ->
-                if (responded) return@evaluateJavascript
+            GeckoEval.evaluate(session, script) { raw ->
+                if (responded) return@evaluate
                 val result = runCatching { org.json.JSONTokener(raw ?: "null").nextValue().toString() }
                     .getOrDefault("")
                     .replace("\\/", "/")
                 if (result.startsWith("http", ignoreCase = true)) {
-                    handler.removeCallbacks(timeout)
                     done(result)
                 }
             }
         }
 
-        webView.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                if (responded) return
-                val title = view?.title.orEmpty()
-                if (title.contains("just a moment", true) || title.contains("cloudflare", true)) return
-                evaluate(view)
-                handler.postDelayed({ evaluate(view) }, 1_200)
-            }
-
-            override fun onReceivedHttpError(
-                view: WebView?,
-                request: WebResourceRequest?,
-                errorResponse: WebResourceResponse?
-            ) {
-                if (request?.isForMainFrame == true && (errorResponse?.statusCode ?: 0) in listOf(404, 410)) {
-                    handler.removeCallbacks(timeout)
-                    done(null)
+        // 原 onPageFinished：先看标题是不是 CF 挑战页，是就直接 return、
+        // 等下一次 onPageFinished；不是就 evaluate，1200ms 后再补一次。
+        // Gecko 版：loadSession 就绪后先查标题，挑战页每 2 秒重查一次
+        // （覆盖挑战在页内解开、无导航的情况）；非挑战页立即 evaluate
+        // 一次，1200ms 后再补一次。原 onReceivedHttpError / onReceivedError
+        // 的快 fail 没有对等物：加载失败 → loadSession 回调 null；
+        // 404 页 → 提取不到链接，等 15 秒超时后 done(null)，结果相同。
+        fun evaluateCycle(session: GeckoSession) {
+            if (responded) return
+            GeckoEval.evaluate(session, "(document.title || '')", 5_000L) { rawTitle ->
+                if (responded) return@evaluate
+                val title = rawTitle?.trim()?.removeSurrounding("\"") ?: ""
+                if (title.contains("just a moment", true) || title.contains("cloudflare", true)) {
+                    handler.postDelayed({ evaluateCycle(session) }, 2000L)
+                    return@evaluate
                 }
-            }
-
-            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                if (request?.isForMainFrame == true) {
-                    handler.removeCallbacks(timeout)
-                    done(null)
-                }
+                evaluateScript(session)
+                handler.postDelayed({ evaluateScript(session) }, 1_200)
             }
         }
-        webView.loadUrl(searchUrl)
+
+        GeckoHeadless.loadSession(context, searchUrl, 15_000L) { session ->
+            handler.post {
+                if (responded) {
+                    // 15 秒总超时已先触发：直接关掉迟到的 session。
+                    runCatching { session?.close() }
+                    return@post
+                }
+                if (session == null) {
+                    done(null)
+                    return@post
+                }
+                sessionRef = session
+                evaluateCycle(session)
+            }
+        }
     }
 
     // ── Jable / MissAV 依序檢測 ──────────────────────────────────────────────
@@ -374,76 +375,76 @@ object CrossSiteChecker {
         callback: (Boolean) -> Unit
     ) {
         val handler = Handler(Looper.getMainLooper())
-        val webView = WebView(context)
-        webView.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            userAgentString =
-                "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-        }
-        android.webkit.CookieManager.getInstance().setAcceptCookie(true)
+        var sessionRef: GeckoSession? = null
 
         var responded = false
         fun done(result: Boolean) {
             if (responded) return
             responded = true
-            webView.stopLoading()
-            webView.destroy()
+            handler.removeCallbacksAndMessages(null)
+            sessionRef?.let { runCatching { it.close() } }
+            sessionRef = null
             callback(result)
         }
 
         val timeout = Runnable { done(false) }
         handler.postDelayed(timeout, 15_000)
 
-        webView.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                if (responded) return
-                view?.evaluateJavascript(
-                    "(function(){" +
-                    "  var t=document.title||'';" +
-                    "  var l=document.body?document.body.innerHTML.length:0;" +
-                    "  var u=location.href||'';" +
-                    "  return t+'|||'+l+'|||'+u;" +
-                    "})()"
-                ) { raw ->
-                    if (responded) return@evaluateJavascript
-                    val decoded = raw?.trim()?.removeSurrounding("\"")
-                        ?.replace("\\n", "")?.replace("\\\"", "\"") ?: ""
-                    val parts   = decoded.split("|||")
-                    val title   = parts.getOrElse(0) { "" }
-                    val bodyLen = parts.getOrElse(1) { "0" }.toIntOrNull() ?: 0
-                    val finalUrl = parts.getOrElse(2) { "" }.trimEnd('/')
-
-                    val isCfChallenge = title.contains("just a moment", ignoreCase = true) ||
-                                        title.contains("checking your browser", ignoreCase = true) ||
-                                        title.contains("attention required", ignoreCase = true)
-                    if (isCfChallenge) return@evaluateJavascript
-
-                    val is404 = title.contains("404") ||
-                                title.contains("not found", ignoreCase = true)
-                    val isHome = finalUrl == "https://missav.ai" ||
-                                 finalUrl == "https://missav.ai/en" ||
-                                 finalUrl.endsWith("/404")
-                    val tooShort = bodyLen < 5000
-
-                    handler.removeCallbacks(timeout)
-                    done(!is404 && !isHome && !tooShort)
+        GeckoHeadless.loadSession(context, targetUrl, 15_000L) { session ->
+            handler.post {
+                if (responded) {
+                    // 15 秒总超时已先触发：直接关掉迟到的 session。
+                    runCatching { session?.close() }
+                    return@post
                 }
-            }
+                if (session == null) {
+                    done(false)
+                    return@post
+                }
+                sessionRef = session
 
-            override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
-                if (request?.isForMainFrame != true || responded) return
-                val status = errorResponse?.statusCode ?: 0
-                if (status == 404 || status == 410) { handler.removeCallbacks(timeout); done(false) }
-            }
+                fun evaluatePage() {
+                    if (responded) return
+                    GeckoEval.evaluate(session,
+                        "(function(){" +
+                        "  var t=document.title||'';" +
+                        "  var l=document.body?document.body.innerHTML.length:0;" +
+                        "  var u=location.href||'';" +
+                        "  return t+'|||'+l+'|||'+u;" +
+                        "})()"
+                    ) { raw ->
+                        if (responded) return@evaluate
+                        val decoded = raw?.trim()?.removeSurrounding("\"")
+                            ?.replace("\\n", "")?.replace("\\\"", "\"") ?: ""
+                        val parts   = decoded.split("|||")
+                        val title   = parts.getOrElse(0) { "" }
+                        val bodyLen = parts.getOrElse(1) { "0" }.toIntOrNull() ?: 0
+                        val finalUrl = parts.getOrElse(2) { "" }.trimEnd('/')
 
-            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                if (request?.isForMainFrame != true || responded) return
-                handler.removeCallbacks(timeout); done(false)
+                        val isCfChallenge = title.contains("just a moment", ignoreCase = true) ||
+                                            title.contains("checking your browser", ignoreCase = true) ||
+                                            title.contains("attention required", ignoreCase = true)
+                        // 挑战页：原版直接 return、等下一次 onPageFinished；
+                        // Gecko 版 2 秒后重查（覆盖挑战在页内解开、无导航的情况）。
+                        if (isCfChallenge) {
+                            handler.postDelayed({ evaluatePage() }, 2000L)
+                            return@evaluate
+                        }
+
+                        val is404 = title.contains("404") ||
+                                    title.contains("not found", ignoreCase = true)
+                        val isHome = finalUrl == "https://missav.ai" ||
+                                     finalUrl == "https://missav.ai/en" ||
+                                     finalUrl.endsWith("/404")
+                        val tooShort = bodyLen < 5000
+
+                        done(!is404 && !isHome && !tooShort)
+                    }
+                }
+
+                evaluatePage()
             }
         }
-        webView.loadUrl(targetUrl)
     }
 
     // ── AvJoy：解析搜尋頁，取原版 + 中字各觀看數最高一條 ────────────────────
@@ -455,30 +456,33 @@ object CrossSiteChecker {
         callback: (Map<String, String>) -> Unit
     ) {
         val handler = Handler(Looper.getMainLooper())
-        val webView = WebView(context)
-        webView.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            userAgentString =
-                "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-        }
+        var sessionRef: GeckoSession? = null
 
         var responded = false
         fun done(result: Map<String, String>) {
             if (responded) return
             responded = true
-            webView.stopLoading()
-            webView.destroy()
+            handler.removeCallbacksAndMessages(null)
+            sessionRef?.let { runCatching { it.close() } }
+            sessionRef = null
             callback(result)
         }
 
         val timeout = Runnable { done(emptyMap()) }
         handler.postDelayed(timeout, 15_000)
 
-        webView.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                if (responded) return
+        GeckoHeadless.loadSession(context, "https://avjoy.me/search/videos/$code", 15_000L) { session ->
+            handler.post {
+                if (responded) {
+                    // 15 秒总超时已先触发：直接关掉迟到的 session。
+                    runCatching { session?.close() }
+                    return@post
+                }
+                if (session == null) {
+                    done(emptyMap())
+                    return@post
+                }
+                sessionRef = session
                 // JS：分原版 / 中字兩組，各取觀看數最高的 href
                 val targetCode = code.uppercase()
                 val js = """
@@ -514,9 +518,8 @@ object CrossSiteChecker {
                     })()
                 """.trimIndent()
 
-                view?.evaluateJavascript(js) { raw ->
-                    if (responded) return@evaluateJavascript
-                    handler.removeCallbacks(timeout)
+                GeckoEval.evaluate(session, js) { raw ->
+                    if (responded) return@evaluate
                     val found = mutableMapOf<String, String>()
                     try {
                         val clean = raw?.trim()?.removeSurrounding("\"")
@@ -537,14 +540,7 @@ object CrossSiteChecker {
                     done(found)
                 }
             }
-
-            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                if (request?.isForMainFrame != true || responded) return
-                handler.removeCallbacks(timeout); done(emptyMap())
-            }
         }
-
-        webView.loadUrl("https://avjoy.me/search/videos/$code")
     }
 
     // ── JavHD：HEAD 請求檢查原版 + 中字版（中字版 URL = 原版 code 後加 'c'）────
@@ -609,21 +605,15 @@ object CrossSiteChecker {
     @SuppressLint("SetJavaScriptEnabled")
     private fun checkJavHDWithWebView(context: Context, targetUrl: String, callback: (JavHDCheckResult) -> Unit) {
         val handler = Handler(Looper.getMainLooper())
-        val webView = WebView(context)
-        webView.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-        }
-        android.webkit.CookieManager.getInstance().setAcceptCookie(true)
+        var sessionRef: GeckoSession? = null
 
         var responded = false
         fun done(result: JavHDCheckResult) {
             if (responded) return
             responded = true
-            webView.stopLoading()
-            webView.destroy()
+            handler.removeCallbacksAndMessages(null)
+            sessionRef?.let { runCatching { it.close() } }
+            sessionRef = null
             callback(result)
         }
 
@@ -633,13 +623,23 @@ object CrossSiteChecker {
         }
         handler.postDelayed(timeout, 15_000)
 
-        webView.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                if (responded) return
-                view?.evaluateJavascript(
+        GeckoHeadless.loadSession(context, targetUrl, 15_000L) { session ->
+            handler.post {
+                if (responded) {
+                    // 15 秒总超时已先触发：直接关掉迟到的 session。
+                    runCatching { session?.close() }
+                    return@post
+                }
+                if (session == null) {
+                    // 加载失败 ≈ 原 onReceivedError → CF_BLOCKED。
+                    done(JavHDCheckResult.CF_BLOCKED)
+                    return@post
+                }
+                sessionRef = session
+                GeckoEval.evaluate(session,
                     "(function(){ return document.title + '|||' + location.href; })()"
                 ) { raw ->
-                    if (responded) return@evaluateJavascript
+                    if (responded) return@evaluate
                     val decoded = raw?.trim()?.removeSurrounding("\"") ?: ""
                     val parts = decoded.split("|||")
                     val title = parts.getOrElse(0) { "" }
@@ -650,15 +650,17 @@ object CrossSiteChecker {
                                title.contains("checking", ignoreCase = true) ||
                                title.contains("請稍候", ignoreCase = true) ||
                                title.contains("attention required", ignoreCase = true) ||
-                               title.contains("cloudflare", ignoreCase = true)
+                               title.contains("cloudflare", ignoreCase = true) ||
+                               // 原 onReceivedHttpError(403) → CF_BLOCKED 的近似：
+                               // loadSession 不暴露 HTTP 状态码，403 页标题兜底。
+                               title.contains("403", ignoreCase = true) ||
+                               title.contains("forbidden", ignoreCase = true)
                     if (isCF) {
                         android.util.Log.d("CrossSiteChecker", "JavHD CF page detected")
-                        handler.removeCallbacks(timeout)
                         done(JavHDCheckResult.CF_BLOCKED)
-                        return@evaluateJavascript
+                        return@evaluate
                     }
 
-                    handler.removeCallbacks(timeout)
                     val is404 = title.contains("404") ||
                             title.contains("not found", ignoreCase = true) ||
                             title.contains("page not found", ignoreCase = true) ||
@@ -666,23 +668,7 @@ object CrossSiteChecker {
                     done(if (is404) JavHDCheckResult.NOT_FOUND else JavHDCheckResult.FOUND)
                 }
             }
-
-            override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
-                if (request?.isForMainFrame != true || responded) return
-                val status = errorResponse?.statusCode ?: 0
-                android.util.Log.d("CrossSiteChecker", "JavHD HTTP error $status: $targetUrl")
-                when (status) {
-                    403 -> { handler.removeCallbacks(timeout); done(JavHDCheckResult.CF_BLOCKED) }
-                    404, 410 -> { handler.removeCallbacks(timeout); done(JavHDCheckResult.NOT_FOUND) }
-                }
-            }
-
-            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                if (request?.isForMainFrame != true || responded) return
-                handler.removeCallbacks(timeout); done(JavHDCheckResult.CF_BLOCKED)
-            }
         }
-        webView.loadUrl(targetUrl)
     }
 
     // ── JavHD CF 暖機對話框：顯示真實 WebView 讓用戶過 CF 驗證 ────────────────
@@ -691,39 +677,56 @@ object CrossSiteChecker {
     private fun showJavHDCFWarmup(context: Context, onComplete: () -> Unit) {
         val activity = context as? android.app.Activity ?: run { onComplete(); return }
         activity.runOnUiThread {
-            val webView = WebView(activity)
-            webView.settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
-                        "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+            // 可见 GeckoView 对话框：用户手动过 CF 验证，之后隐藏检查
+            // 靠同一 Gecko runtime 的 cookie 仓拿到 cf_clearance。
+            // 原 WebView 版的 CookieManager.flush() 没有 Gecko 对等物：
+            // 同一 runtime 的 session 共享 cookie 仓，不需要 flush。
+            val runtime = GeckoRuntimeProvider.get(activity)
+            val geckoView = GeckoView(activity)
+            val session = GeckoSession()
+            session.settings.apply {
+                allowJavascript = true
+                useTrackingProtection = false
+                // UA 设置项叫 userAgentOverride（与 GeckoBrowserActivity /
+                // GeckoSniffActivity 同款），不是 WebView 的 userAgentString。
+                userAgentOverride =
+                    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
             }
-            android.webkit.CookieManager.getInstance().setAcceptCookie(true)
+
+            var closed = false
+            fun closeSession() {
+                if (closed) return
+                closed = true
+                runCatching { session.close() }
+            }
 
             val dialog = android.app.AlertDialog.Builder(activity)
                 .setTitle("JavHD 驗證 - 通過後自動繼續")
-                .setView(webView)
+                .setView(geckoView)
                 .setNegativeButton("略過") { d, _ ->
-                    webView.destroy()
+                    closeSession()
                     d.dismiss()
                     onComplete()
                 }
                 .setCancelable(false)
                 .create()
 
-            webView.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    view?.evaluateJavascript("document.title") { raw ->
+            session.progressDelegate = object : GeckoSession.ProgressDelegate {
+                override fun onPageStop(session: GeckoSession, success: Boolean) {
+                    if (closed || !success) return
+                    GeckoEval.evaluate(session, "document.title") { raw ->
+                        if (closed) return@evaluate
                         val title = raw?.trim()?.removeSurrounding("\"") ?: ""
                         val isCF = title.contains("請稍候", ignoreCase = true) ||
                                    title.contains("just a moment", ignoreCase = true) ||
                                    title.contains("checking", ignoreCase = true)
                         if (!isCF) {
                             android.util.Log.d("CrossSiteChecker", "JavHD CF warmup passed, title='$title'")
-                            // CF 通過，儲存 cookie 後關閉對話框
-                            android.webkit.CookieManager.getInstance().flush()
+                            // CF 通過，關閉對話框（cookie 已在同一 runtime
+                            // 的仓里，后续隐藏检查直接用）。
                             activity.runOnUiThread {
-                                webView.destroy()
+                                closeSession()
                                 dialog.dismiss()
                                 onComplete()
                             }
@@ -731,13 +734,42 @@ object CrossSiteChecker {
                     }
                 }
             }
+            session.navigationDelegate = object : GeckoSession.NavigationDelegate {
+                override fun onLoadError(
+                    session: GeckoSession,
+                    uri: String?,
+                    error: WebRequestError
+                ): GeckoResult<String>? {
+                    android.util.Log.w("CrossSiteChecker", "JavHD warmup load error: $uri code=${error.code}")
+                    // 不自动关：用户可在页内重试，或按“略過”。
+                    return null
+                }
+            }
 
+            dialog.setOnDismissListener { closeSession() }
             dialog.show()
             dialog.window?.setLayout(
                 (activity.resources.displayMetrics.widthPixels * 0.9).toInt(),
                 (activity.resources.displayMetrics.heightPixels * 0.7).toInt()
             )
-            webView.loadUrl("https://www.javhdporn.net/")
+
+            var initialLoadStarted = false
+            fun startInitialLoad() {
+                if (initialLoadStarted || closed) return
+                initialLoadStarted = true
+                session.loadUri("https://www.javhdporn.net/")
+            }
+            session.open(runtime)
+            geckoView.setSession(session)
+            // 显式激活会话，不依赖 Surface 路径（GeckoBrowserActivity 同款）。
+            runCatching {
+                session.setActive(true)
+                session.setFocused(true)
+                session.setPriorityHint(GeckoSession.PRIORITY_HIGH)
+            }
+            // 首个 loadUri 等视图挂载后再发，1 秒兜底（同款）。
+            geckoView.post { startInitialLoad() }
+            Handler(Looper.getMainLooper()).postDelayed({ startInitialLoad() }, 1_000L)
         }
     }
 

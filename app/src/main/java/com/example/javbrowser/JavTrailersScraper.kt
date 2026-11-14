@@ -3,12 +3,12 @@ package com.example.javbrowser
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.webkit.CookieManager
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.os.SystemClock
+import com.example.javbrowser.gecko.GeckoEval
+import com.example.javbrowser.gecko.GeckoHeadless
+import com.example.javbrowser.gecko.JavhdGeckoExtension
 import org.json.JSONObject
+import org.mozilla.geckoview.GeckoSession
 
 /**
  * Scrapes javtrailers.com for cover image + title only.
@@ -17,6 +17,21 @@ import org.json.JSONObject
  * URL pattern:  MIDA-271  →  /ja/video/mida00271
  *               OFJE-489  →  /ja/video/ofje00489
  *               FC2-PPV-* →  null (not on JavTrailers)
+ *
+ * Gecko 迁移（原隐藏 WebView 版）：
+ * - shouldInterceptRequest 拦 media.javtrailers.com 的 .m3u8/.mp4 改为
+ *   JavhdGeckoExtension.attachMediaSniffer（扩展 background.js 的
+ *   webRequest 观察者，非阻塞）。content.js 只注入
+ *   video.javhdporn.net / video1.javhdporn.net，不会跑到本站页面；
+ *   background 的 11 广告域拦截与本站无关。注意扩展的过滤规则会丢掉
+ *   含 "sample" token 的 URL（见 NOTES.md），sample.mgstage.com 的
+ *   预告片只能走下面 JS 兜底（videojs currentSources / data-setup）。
+ * - 搜尋 → 影片頁的跳转改同一 session 内 location.href（Referer
+ *   自动带上，原 loadUrl(url, headers) 的 Referer 同款语义；Accept /
+ *   Accept-Language 自定义头随 loadSession 一起丢掉，见 NOTES.md）。
+ * - onReceivedHttpError 的快 fail 没有对等物：404 页走提取逻辑自然
+ *   落空（搜尋页无链接 / 影片页空标题+空封面 → null），只是不再
+ *   提前结束。
  */
 class JavTrailersScraper(private val context: Context) {
 
@@ -95,145 +110,150 @@ class JavTrailersScraper(private val context: Context) {
     // ── Scraping（兩階段：搜尋 → 影片頁）────────────────────────────────────────
 
     private fun doScrape(searchUrl: String, javCode: String, callback: (TrailersResult?) -> Unit) {
-        val wv = createWebView()
         var handled = false
         var phase = "search"   // "search" → "video"
         val capturedTrailer = arrayOf("")  // m3u8 or direct mp4
+        var sessionRef: GeckoSession? = null
+
+        // 终结：只关一次 session（含 detach 嗅探），再回调。
+        fun teardown() {
+            sessionRef?.let { session ->
+                JavhdGeckoExtension.detachMediaSniffer(session)
+                runCatching { session.close() }
+            }
+            sessionRef = null
+        }
 
         // Hard timeout: 30 seconds（兩次載頁需要更多時間）
         val timeoutRunnable = Runnable {
             if (!handled) {
                 handled = true
                 android.util.Log.w("JavTrailers", "timeout at phase=$phase url=$searchUrl")
-                wv.destroy()
+                teardown()
                 callback(null)
             }
         }
         mainHandler.postDelayed(timeoutRunnable, 30_000L)
 
-        wv.webViewClient = object : WebViewClient() {
-
-            // 攔截 media.javtrailers.com 的 .m3u8 / .mp4 請求
-            override fun shouldInterceptRequest(
-                view: WebView, request: WebResourceRequest
-            ): android.webkit.WebResourceResponse? {
-                val reqUrl = request.url.toString()
-                if (capturedTrailer[0].isEmpty() &&
-                    (reqUrl.contains("media.javtrailers.com") || reqUrl.contains("sample.mgstage.com")) &&
-                    (reqUrl.contains(".m3u8") || reqUrl.contains(".mp4"))) {
-                    capturedTrailer[0] = reqUrl
-                    android.util.Log.d("JavTrailers", "captured trailer: $reqUrl")
-                }
-                return super.shouldInterceptRequest(view, request)
-            }
-
-            override fun onPageFinished(view: WebView, finishedUrl: String) {
-                if (handled) return
-                when {
-                    // 階段一：搜尋結果頁 → 抽出第一個 /video/ 連結
-                    phase == "search" && finishedUrl.contains("/search/") -> {
-                        phase = "transitioning"
-                        mainHandler.postDelayed({
-                            if (handled) return@postDelayed
-                            // 正規化番號用於比對（去連字符 + 去前導零）
-                            // REBD-1022 → REBD1022；頁面上 rebd01022 也會正規化成 REBD1022
-                            val codeNorm = run {
-                                val stripped = javCode.replace(Regex("[-\\s]"), "").uppercase()
-                                val m = Regex("^([A-Z]+)(\\d+)$").find(stripped)
-                                if (m != null) m.groupValues[1] + m.groupValues[2].trimStart('0').ifEmpty { "0" }
-                                else stripped
-                            }.lowercase()
-                            val js = """
-                                (function(){
-                                    function normCode(s) {
-                                        var clean = s.replace(/[-\s]/g,'').toUpperCase();
-                                        var m = clean.match(/^([A-Z]+)(\d+)$/);
-                                        if (!m) return clean;
-                                        return m[1] + parseInt(m[2], 10).toString();
-                                    }
-                                    var target = '${codeNorm.uppercase()}';
-                                    var links = document.querySelectorAll('a[href*="/video/"]');
-                                    for (var i = 0; i < links.length; i++) {
-                                        var href = links[i].getAttribute('href') || '';
-                                        var card = links[i].closest('.card, article, li') || links[i].parentElement;
-                                        var cardText = card ? card.textContent : '';
-                                        // 正規化 href 裡的番號部分
-                                        var hrefPart = href.replace(/.*\/video\//,'');
-                                        var hrefNorm = normCode(hrefPart).toUpperCase();
-                                        // 正規化卡片文字中出現的番號
-                                        var cardNorm = normCode(cardText.replace(/[^A-Za-z0-9]/g,'')).toUpperCase();
-                                        if (hrefNorm === target || cardNorm.indexOf(target) >= 0) {
-                                            return href;
-                                        }
-                                    }
-                                    return null;
-                                })()
-                            """.trimIndent()
-                            wv.evaluateJavascript(js) { raw ->
-                                val path = raw?.trim('"')
-                                    ?.takeIf { it.isNotEmpty() && it != "null" }
-                                if (path != null) {
-                                    val videoUrl = if (path.startsWith("http")) path
-                                                   else "https://javtrailers.com$path"
-                                    android.util.Log.d("JavTrailers", "found video URL: $videoUrl")
-                                    phase = "video"
-                                    val headers = mapOf(
-                                        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                                        "Accept-Language" to "ja-JP,ja;q=0.9",
-                                        "Referer" to "https://javtrailers.com/"
-                                    )
-                                    wv.loadUrl(videoUrl, headers)
-                                } else {
-                                    android.util.Log.w("JavTrailers", "no video link found on search page")
-                                    handled = true
-                                    mainHandler.removeCallbacks(timeoutRunnable)
-                                    wv.destroy()
-                                    callback(null)
-                                }
-                            }
-                        }, 2000L)
+        // 階段一：搜尋結果頁 → 抽出第一個 /video/ 連結
+        fun runSearchExtract(session: GeckoSession) {
+            if (handled) return
+            // 正規化番號用於比對（去連字符 + 去前導零）
+            // REBD-1022 → REBD1022；頁面上 rebd01022 也會正規化成 REBD1022
+            val codeNorm = run {
+                val stripped = javCode.replace(Regex("[-\\s]"), "").uppercase()
+                val m = Regex("^([A-Z]+)(\\d+)$").find(stripped)
+                if (m != null) m.groupValues[1] + m.groupValues[2].trimStart('0').ifEmpty { "0" }
+                else stripped
+            }.lowercase()
+            val js = """
+                (function(){
+                    function normCode(s) {
+                        var clean = s.replace(/[-\s]/g,'').toUpperCase();
+                        var m = clean.match(/^([A-Z]+)(\d+)$/);
+                        if (!m) return clean;
+                        return m[1] + parseInt(m[2], 10).toString();
                     }
-
-                    // 階段二：影片頁 → 抽出 gallery + trailer
-                    phase == "video" && finishedUrl.contains("/video/") -> {
+                    var target = '${codeNorm.uppercase()}';
+                    var links = document.querySelectorAll('a[href*="/video/"]');
+                    for (var i = 0; i < links.length; i++) {
+                        var href = links[i].getAttribute('href') || '';
+                        var card = links[i].closest('.card, article, li') || links[i].parentElement;
+                        var cardText = card ? card.textContent : '';
+                        // 正規化 href 裡的番號部分
+                        var hrefPart = href.replace(/.*\/video\//,'');
+                        var hrefNorm = normCode(hrefPart).toUpperCase();
+                        // 正規化卡片文字中出現的番號
+                        var cardNorm = normCode(cardText.replace(/[^A-Za-z0-9]/g,'')).toUpperCase();
+                        if (hrefNorm === target || cardNorm.indexOf(target) >= 0) {
+                            return href;
+                        }
+                    }
+                    return null;
+                })()
+            """.trimIndent()
+            GeckoEval.evaluate(session, js) { raw ->
+                if (handled) return@evaluate
+                val path = raw?.trim('"')
+                    ?.takeIf { it.isNotEmpty() && it != "null" }
+                if (path != null) {
+                    val videoUrl = if (path.startsWith("http")) path
+                                   else "https://javtrailers.com$path"
+                    android.util.Log.d("JavTrailers", "found video URL: $videoUrl")
+                    phase = "video"
+                    // 站内跳转：同一 session 里改 location.href，Referer 自动
+                    // 为搜尋页（原 loadUrl(videoUrl, headers) 的 Referer 同款）。
+                    GeckoEval.runJavascript(session, "location.href = '${videoUrl.replace("'", "\\'")}';")
+                    waitForSessionPage(session, "/video/", 15_000L) { ok ->
+                        if (handled) return@waitForSessionPage
+                        if (!ok) {
+                            handled = true
+                            mainHandler.removeCallbacks(timeoutRunnable)
+                            android.util.Log.w("JavTrailers", "video page did not load: $videoUrl")
+                            teardown()
+                            callback(null)
+                            return@waitForSessionPage
+                        }
+                        // 階段二：影片頁 → 抽出 gallery + trailer
                         val delay = (1800L..2800L).random()
                         mainHandler.postDelayed({
                             if (!handled) {
                                 handled = true
                                 mainHandler.removeCallbacks(timeoutRunnable)
-                                extractData(wv, finishedUrl, capturedTrailer, callback)
+                                extractData(session, videoUrl, capturedTrailer, callback)
                             }
                         }, delay)
                     }
-                }
-            }
-
-            override fun onReceivedHttpError(
-                view: WebView, request: WebResourceRequest, errorResponse: WebResourceResponse
-            ) {
-                if (request.isForMainFrame && !handled) {
+                } else {
+                    android.util.Log.w("JavTrailers", "no video link found on search page")
                     handled = true
                     mainHandler.removeCallbacks(timeoutRunnable)
-                    android.util.Log.w("JavTrailers", "HTTP ${errorResponse.statusCode}: ${request.url}")
-                    wv.destroy()
+                    teardown()
                     callback(null)
                 }
             }
         }
 
-        val headers = mapOf(
-            "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language" to "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Cache-Control"   to "no-cache",
-            "Pragma"          to "no-cache",
-            "Upgrade-Insecure-Requests" to "1"
-        )
-        wv.loadUrl(searchUrl, headers)
+        // loadSession 没有自定义请求头参数：原搜尋页的 Accept /
+        // Accept-Language / Cache-Control 头随之丢掉（见 NOTES.md）。
+        GeckoHeadless.loadSession(context, searchUrl, 30_000L) { session ->
+            mainHandler.post {
+                if (handled) {
+                    // 30 秒总超时已先触发：直接关掉迟到的 session。
+                    runCatching { session?.close() }
+                    return@post
+                }
+                if (session == null) {
+                    if (!handled) {
+                        handled = true
+                        mainHandler.removeCallbacks(timeoutRunnable)
+                        callback(null)
+                    }
+                    return@post
+                }
+                sessionRef = session
+                // 挂实时嗅探：替代原 shouldInterceptRequest 对
+                // media.javtrailers.com / sample.mgstage.com 的 .m3u8/.mp4
+                // 拦截（扩展只观察、不阻塞；tsyndicate.com VAST 不在
+                // 本站出现，也不受影响）。
+                JavhdGeckoExtension.attachMediaSniffer(session) { url ->
+                    if (capturedTrailer[0].isEmpty() &&
+                        (url.contains("media.javtrailers.com") || url.contains("sample.mgstage.com")) &&
+                        (url.contains(".m3u8") || url.contains(".mp4"))) {
+                        capturedTrailer[0] = url
+                        android.util.Log.d("JavTrailers", "captured trailer: $url")
+                    }
+                }
+                JavhdGeckoExtension.ensureInstalled(context)
+                // 原 onPageFinished 后等 2000ms 再抽搜尋结果。
+                mainHandler.postDelayed({ runSearchExtract(session) }, 2000L)
+            }
+        }
     }
 
     // ── JS extraction ─────────────────────────────────────────────────────────
 
-    private fun extractData(wv: WebView, pageUrl: String,
+    private fun extractData(session: GeckoSession, pageUrl: String,
                             capturedTrailer: Array<String>,
                             callback: (TrailersResult?) -> Unit) {
         // 同時點 gallery 按鈕 + 播放鍵，讓 video.js 發出 m3u8 請求
@@ -246,16 +266,16 @@ class JavTrailersScraper(private val context: Context) {
                 return (gallery ? gallery.className : 'NO_GALLERY') + '|' + (play ? 'PLAY_CLICKED' : 'NO_PLAY');
             })()
         """.trimIndent()
-        wv.evaluateJavascript(clickJs) { btnResult ->
+        GeckoEval.evaluate(session, clickJs) { btnResult ->
             android.util.Log.d("JavTrailers", "click result: $btnResult  page=$pageUrl")
             // 等 3500ms：Vue gallery 渲染 + video.js 初始化並發出 m3u8 請求
             mainHandler.postDelayed({
-                doExtractAllData(wv, pageUrl, capturedTrailer, callback)
+                doExtractAllData(session, pageUrl, capturedTrailer, callback)
             }, 3500L)
         }
     }
 
-    private fun doExtractAllData(wv: WebView, pageUrl: String,
+    private fun doExtractAllData(session: GeckoSession, pageUrl: String,
                                  capturedTrailer: Array<String>,
                                  callback: (TrailersResult?) -> Unit) {
         val js = """
@@ -388,13 +408,14 @@ class JavTrailersScraper(private val context: Context) {
             })()
         """.trimIndent()
 
-        wv.evaluateJavascript(js) { raw ->
-            wv.destroy()
+        GeckoEval.evaluate(session, js) { raw ->
+            JavhdGeckoExtension.detachMediaSniffer(session)
+            runCatching { session.close() }
             android.util.Log.d("JavTrailers", "raw JS result: $raw")
             if (raw == null || raw == "null") {
                 android.util.Log.w("JavTrailers", "JS returned null for $pageUrl")
                 callback(null)
-                return@evaluateJavascript
+                return@evaluate
             }
             try {
                 val obj = JSONObject(raw)
@@ -407,7 +428,7 @@ class JavTrailersScraper(private val context: Context) {
                 }
                 android.util.Log.d("JavTrailers",
                     "title='$title' cover=${cover.isNotEmpty()} slides=$debugSlides gallery=${gallery.size} page=$pageUrl")
-                // 優先用 shouldInterceptRequest 攔截到的（精確），其次用 JS 解析的
+                // 優先用嗅探到的（精確），其次用 JS 解析的
                 val jsTrailerUrl = obj.optString("trailerUrl", "").trim()
                 val trailerUrl = capturedTrailer[0].ifEmpty {
                     jsTrailerUrl.takeIf { it.isNotEmpty() && !it.startsWith("blob:") } ?: ""
@@ -427,29 +448,41 @@ class JavTrailersScraper(private val context: Context) {
         }
     }
 
-    // ── WebView factory ───────────────────────────────────────────────────────
-
-    private fun createWebView(): WebView {
-        val wv = WebView(context)
-        wv.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            databaseEnabled = true
-            loadsImagesAutomatically = true
-            mediaPlaybackRequiresUserGesture = false  // 允許 JS 觸發播放，讓 m3u8 請求可被攔截
-            setSupportZoom(false)
-            builtInZoomControls = false
-            displayZoomControls = false
-            // Realistic recent Chrome on Android — Pixel 8 Pro, Chrome 128
-            userAgentString =
-                "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro Build/AD1A.240905.004) " +
-                "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                "Chrome/128.0.6613.127 Mobile Safari/537.36"
+    /**
+     * 等待同一 session 内的 JS 导航完成：轮询 location.href +
+     * document.readyState，直到地址含 [marker] 且 readyState 为 complete。
+     * 替代原 WebViewClient.onPageFinished。
+     */
+    private fun waitForSessionPage(
+        session: GeckoSession,
+        marker: String,
+        timeoutMs: Long,
+        initialDelayMs: Long = 500L,
+        onReady: (Boolean) -> Unit
+    ) {
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        var done = false
+        fun poll() {
+            if (done) return
+            if (SystemClock.uptimeMillis() >= deadline) {
+                done = true
+                onReady(false)
+                return
+            }
+            GeckoEval.evaluate(session, "(location.href + '|' + document.readyState)", 5_000L) { raw ->
+                if (done) return@evaluate
+                val text = raw?.trim()?.removeSurrounding("\"")?.replace("\\/", "/") ?: ""
+                val parts = text.split("|")
+                val href = parts.getOrElse(0) { "" }
+                val state = parts.getOrElse(1) { "" }
+                if (href.contains(marker, ignoreCase = true) && state == "complete") {
+                    done = true
+                    onReady(true)
+                } else {
+                    mainHandler.postDelayed({ poll() }, 500L)
+                }
+            }
         }
-        CookieManager.getInstance().apply {
-            setAcceptCookie(true)
-            setAcceptThirdPartyCookies(wv, true)
-        }
-        return wv
+        mainHandler.postDelayed({ poll() }, initialDelayMs)
     }
 }

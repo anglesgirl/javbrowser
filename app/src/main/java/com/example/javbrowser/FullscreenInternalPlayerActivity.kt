@@ -1,6 +1,5 @@
 package com.example.javbrowser
 
-import android.annotation.SuppressLint
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.net.Uri
@@ -8,23 +7,36 @@ import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.view.WindowManager
-import android.webkit.JavascriptInterface
-import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
-import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.example.javbrowser.gecko.GeckoBridge
+import com.example.javbrowser.gecko.GeckoEval
+import com.example.javbrowser.gecko.GeckoRuntimeProvider
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
+import org.mozilla.geckoview.GeckoSession
+import org.mozilla.geckoview.GeckoView
 import java.net.URI
 import java.util.concurrent.TimeUnit
 
+/**
+ * 全螢幕內建播放器（GeckoView 遷移，2026-11-14，見 playback/NOTES.md）。
+ *
+ * WebView → GeckoView + GeckoSession：播放器 HTML 用 Loader.data 載入，
+ * 頁面 JS 調 window.Android.*（GeckoBridge），eval 走 GeckoEval。
+ * 原 13 個 @JavascriptInterface 方法原樣映射；其中 5 個同步回傳值的
+ * 方法（畫質清單、錄影事件、分集解析 ×2、方向鎖）改為非同步回呼。
+ * 唯一留下的 WebView 是 bootstrapSurritCookie 的隱藏 WebView——它的
+ * 用途是往 android.webkit.CookieManager 寫 surrit cookie 供下載服務
+ * 用，Gecko 沒有寫該 cookie 倉的公開 API，硬遷等於廢掉它，故保留。
+ */
 class FullscreenInternalPlayerActivity : LocalizedActivity() {
 
     companion object {
@@ -55,7 +67,8 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         const val EXTRA_PC_RECORDING_DISPLAY_NAME = "pc_recording_display_name"
     }
 
-    private lateinit var webView: WebView
+    private lateinit var geckoView: GeckoView
+    private lateinit var geckoSession: GeckoSession
     private var localVideoServer: LocalVideoHttpServer? = null
     private var playbackProxyServer: VideoProxyServer? = null
     private var javrateSession: JavratePlaybackSession? = null
@@ -78,6 +91,44 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
     private var playbackEnteredAtMs: Long = 0
     private var playbackOutcomeRecorded: Boolean = false
     private var playbackOutcomeDelivered: Boolean = false
+    /** 首個 data 載入是否已發出（post 與 1 秒兜底只發一次）。 */
+    private var playerHtmlLoaded = false
+
+    /** 顯式激活會話（GeckoBrowserActivity 同款，不依賴 Surface 路徑）。 */
+    private fun activateGeckoSession() {
+        if (!::geckoSession.isInitialized) return
+        runCatching {
+            geckoSession.setActive(true)
+            geckoSession.setFocused(true)
+            geckoSession.setPriorityHint(GeckoSession.PRIORITY_HIGH)
+        }
+    }
+
+    /** 載入播放器 HTML（data 載入，見方法內的 baseUri 說明）。 */
+    private fun loadPlayerHtml(html: String) {
+        if (playerHtmlLoaded || !::geckoSession.isInitialized) return
+        playerHtmlLoaded = true
+        activateGeckoSession()
+        // GeckoView 151 的 Loader.data 沒有 baseUri 參數（WebView 的
+        // loadDataWithBaseURL 才有）：播放器 HTML 內全部用絕對 URL，base
+        // 只影響子資源的 Referer——直連 CDN 的 bypass 站見 NOTES.md。
+        geckoSession.load(
+            GeckoSession.Loader().data(html.toByteArray(Charsets.UTF_8), "text/html")
+        )
+    }
+
+    /**
+     * 橋接方法把結果回呼頁面時用：會話還在才發 eval，已關就靜默丟棄。
+     * PlayerBridge 是 inner class，直接調這個方法可避開在 inner class
+     * 裡寫 ::geckoSession.isInitialized 的解析問題。
+     */
+    private fun postToPlayer(js: String) {
+        if (!::geckoSession.isInitialized) return
+        runOnUiThread {
+            if (!::geckoSession.isInitialized) return@runOnUiThread
+            GeckoEval.runJavascript(geckoSession, js)
+        }
+    }
 
     private fun beginPlaybackTelemetry() {
         telemetryStarted.set(false)
@@ -91,7 +142,6 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         }
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         PlaybackDataStore.init(applicationContext)
@@ -141,8 +191,9 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                 loading.text = "無法取得播放授權，請返回網頁重新開啟影片"
             }, { tracks ->
                 subtitleTracks = tracks
-                if (::webView.isInitialized) webView.evaluateJavascript(
-                    "window.setSubtitleTracks && window.setSubtitleTracks(${subtitlePlaybackJson()})", null)
+                if (::geckoSession.isInitialized) GeckoEval.runJavascript(
+                    geckoSession,
+                    "window.setSubtitleTracks && window.setSubtitleTracks(${subtitlePlaybackJson()})")
             })
             return
         }
@@ -155,7 +206,6 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         showPlayer(videoUrl, referer, maxPictureMode)
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
     private fun showPlayer(videoUrl: String, referer: String, maxPictureMode: Boolean) {
         val thumbnailConfig = readThumbnailConfig()
         val previewVttUrl = intent.getStringExtra(EXTRA_PREVIEW_VTT_URL)
@@ -196,79 +246,65 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
             buildInternalPlaybackUrl(videoUrl, referer)
         }
 
-        webView = WebView(this)
-        setContentView(webView)
+        geckoView = GeckoView(this)
+        setContentView(geckoView)
 
-        webView.settings.javaScriptEnabled = true
-        webView.settings.domStorageEnabled = true
-        webView.settings.mediaPlaybackRequiresUserGesture = false
-        webView.settings.allowContentAccess = true
-        webView.settings.allowFileAccess = true
-        if (isLocalPlayback || playbackUrl.startsWith("http://127.0.0.1:", ignoreCase = true)) {
-            @Suppress("DEPRECATION")
-            webView.settings.allowFileAccessFromFileURLs = true
-            webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+        val runtime = GeckoRuntimeProvider.get(this)
+        geckoSession = GeckoSession()
+        geckoSession.settings.apply {
+            userAgentOverride = PLAYER_USER_AGENT
+            allowJavascript = true
+            // 跟嵌頁播放器 / 通用瀏覽器統一：關掉 Gecko 內建追蹤防護，
+            // 它用 Disconnect 清單，可能誤攔影片 CDN 或字幕資源。
+            useTrackingProtection = false
         }
-        webView.settings.userAgentString = PLAYER_USER_AGENT
-        // MISSAV 的影片由 surrit CDN 提供。Cloudflare 會在播放清單回應設定
-        // __cf_bm；允許第三方 Cookie 才能讓背景下載沿用 WebView 已通過的驗證。
-        android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
-        webView.webChromeClient = object : WebChromeClient() {
-            override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage?): Boolean {
-                consoleMessage?.let {
-                    android.util.Log.i(
-                        "INTERNAL_PLAYER",
-                        "console ${it.messageLevel()} ${it.sourceId()}:${it.lineNumber()} ${it.message()}"
+        // 頁面載入失敗時記一筆（與 JavhdEmbedPlayerActivity 同款）。
+        geckoSession.progressDelegate = object : GeckoSession.ProgressDelegate {
+            override fun onPageStop(session: GeckoSession, success: Boolean) {
+                if (!success) {
+                    PlaybackDataStore.addTrace(
+                        playbackSessionId,
+                        "內部播放器錯誤：頁面載入失敗"
                     )
                 }
-                return super.onConsoleMessage(consoleMessage)
             }
         }
-        // GeckoView 遷移後：不再攔截。ECH 基建（EchH3Router）已刪，
-        // 這裡的 WebView 走明文載入（見 docs/geckoview-migration.md）。
-        // localhost 代理 URL 是 http，本來就不會被攔。
-        webView.webViewClient = object : WebViewClient() {
-            override fun shouldInterceptRequest(
-                view: WebView?,
-                request: WebResourceRequest?
-            ): WebResourceResponse? {
-                return super.shouldInterceptRequest(view, request)
-            }
-        }
-        webView.addJavascriptInterface(
-            PlayerBridge(
-                playbackUrl,
-                referer,
-                pageUrl,
-                downloadName,
-                !isLocalPlayback,
-                enableQualitySelector,
-                pcRecordingEventsUri,
-                rouEpisodes.associate { it.id to it.number },
-                additionalEpisodes.associate { it.url to it.title }
-            ),
-            "AndroidPlayer"
+        // Gecko 沒有 WebView 的 onConsoleMessage 等價物；頁面內的
+        // log() 仍走 Android.log 橋接方法（見 PlayerBridge）。
+        val playerBridge = PlayerBridge(
+            playbackUrl,
+            referer,
+            pageUrl,
+            downloadName,
+            !isLocalPlayback,
+            enableQualitySelector,
+            pcRecordingEventsUri,
+            rouEpisodes.associate { it.id to it.number },
+            additionalEpisodes.associate { it.url to it.title }
         )
-
-        webView.loadDataWithBaseURL(
-            if (isLocalPlayback) playbackUrl.substringBeforeLast('/') + "/" else referer,
-            buildPlayerHtml(
-                playbackUrl,
-                thumbnailConfig,
-                previewVttUrl,
-                isLocalPlayback,
-                enableQualitySelector,
-                immersiveMode,
-                maxPictureMode,
-                rouEpisodes,
-                currentRouEpisodeId,
-                additionalEpisodes,
-                videoUrl
-            ),
-            "text/html",
-            "UTF-8",
-            null
+        GeckoBridge.attachBridge(geckoSession, playerBridge.handlers())
+        val playerHtml = buildPlayerHtml(
+            playbackUrl,
+            thumbnailConfig,
+            previewVttUrl,
+            isLocalPlayback,
+            enableQualitySelector,
+            immersiveMode,
+            maxPictureMode,
+            rouEpisodes,
+            currentRouEpisodeId,
+            additionalEpisodes,
+            videoUrl
         )
+        geckoSession.open(runtime)
+        geckoView.setSession(geckoSession)
+        activateGeckoSession()
+        // 首個載入等視圖掛載後再發（GeckoBrowserActivity 1.2.6 的教訓：
+        // 未激活會話上發的 load 會被靜默丟棄）。data 載入不走網路，
+        // 不另設看門狗；頁面自己的狀態列會顯示載入進度。
+        playerHtmlLoaded = false
+        geckoView.post { loadPlayerHtml(playerHtml) }
+        geckoView.postDelayed({ loadPlayerHtml(playerHtml) }, 1000L)
     }
 
     private fun parseRouEpisodes(json: String): List<VideoExtractor.RouVideoEpisode> {
@@ -304,6 +340,14 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         return RouVideoDomains.isHost(host)
     }
 
+    override fun onResume() {
+        super.onResume()
+        // 視圖 detach/reattach 後再斷言一次激活（GeckoBrowserActivity 同款）。
+        if (::geckoSession.isInitialized && geckoSession.isOpen) {
+            activateGeckoSession()
+        }
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) applyPlayerSystemUi()
@@ -315,21 +359,25 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
 
     override fun onPause() {
         super.onPause()
-        recordWebViewPlayback()
+        recordGeckoPlayback()
+        if (::geckoSession.isInitialized && geckoSession.isOpen) {
+            runCatching { geckoSession.setActive(false) }
+        }
     }
 
     /**
      * Reads the video element's state and reports it into the sniff
-     * session. evaluateJavascript is async; the callback still runs
-     * while the WebView is alive (it is destroyed in onDestroy).
+     * session. GeckoEval.evaluate is async; the callback still runs
+     * while the GeckoSession is alive (it is closed in onDestroy).
      * Never throws.
      */
-    private fun recordWebViewPlayback() {
+    private fun recordGeckoPlayback() {
         if (playbackSessionId < 0 || playbackOutcomeRecorded) return
-        if (!::webView.isInitialized) return
+        if (!::geckoSession.isInitialized) return
         playbackOutcomeRecorded = true
         try {
-            webView.evaluateJavascript(
+            GeckoEval.evaluate(
+                geckoSession,
                 "(function(){var v=document.querySelector('video');if(!v) return 'novideo';" +
                     "return JSON.stringify({t:v.currentTime||0,d:v.duration||0,p:v.paused?1:0,e:v.error?v.error.code:0});})();"
             ) { value ->
@@ -341,10 +389,10 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                             PlaybackOutcome("內部", false, 0.0, wallSeconds, false, "無video元素"),
                         )
                         playbackOutcomeDelivered = true
-                        return@evaluateJavascript
+                        return@evaluate
                     }
                     // The callback value is a JSON-encoded string; unwrap it, then parse the object.
-                    val inner = org.json.JSONTokener(value).nextValue() as? String ?: return@evaluateJavascript
+                    val inner = org.json.JSONTokener(value).nextValue() as? String ?: return@evaluate
                     val o = org.json.JSONObject(inner)
                     val secondsPlayed = o.optDouble("t", 0.0)
                     val errorCode = o.optInt("e", 0)
@@ -366,7 +414,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
     }
 
     override fun onDestroy() {
-        // If the onPause JS read never delivered (WebView torn down
+        // If the onPause JS read never delivered (Gecko session torn down
         // first), leave an honest "no data" outcome rather than silence.
         if (playbackSessionId >= 0 && playbackOutcomeRecorded && !playbackOutcomeDelivered) {
             try {
@@ -387,8 +435,9 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         if (javrateLease == null) playbackProxyServer?.stop()
         javrateLease = null
         playbackProxyServer = null
-        if (::webView.isInitialized) {
-            webView.destroy()
+        if (::geckoSession.isInitialized) {
+            runCatching { GeckoBridge.detachBridge(geckoSession) }
+            runCatching { geckoSession.close() }
         }
         super.onDestroy()
     }
@@ -431,46 +480,43 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         @Volatile private var activePageUrl = pageUrl
         @Volatile private var activeDownloadName = downloadName
 
-        @JavascriptInterface
         fun playbackStarted() {
             if (telemetryStarted.compareAndSet(false, true)) AppTelemetry.playerStarted(telemetryLocal)
         }
 
-        @JavascriptInterface
         fun playbackFailed(code: Int) {
             reportPlaybackFailure(if (telemetryStarted.get()) AppTelemetry.PlaybackPhase.PLAYBACK
                 else AppTelemetry.PlaybackPhase.STARTUP, code)
         }
 
-        @JavascriptInterface
         fun close() {
             runOnUiThread { finish() }
         }
 
-        @JavascriptInterface
         fun setMuted(muted: Boolean) {
             PrivacySettings(this@FullscreenInternalPlayerActivity).internalPlayerMuted = muted
         }
 
-        @JavascriptInterface
-        fun setImmersiveMode(enabled: Boolean): Boolean {
+        /**
+         * 原同步回傳 enabled；JS 不用回傳值，GeckoBridge 也無回傳值，改為 Unit。
+         */
+        fun setImmersiveMode(enabled: Boolean) {
             immersiveMode = enabled
             getSharedPreferences(PLAYER_UI_PREFERENCES, MODE_PRIVATE).edit()
                 .putBoolean(PREFERENCE_IMMERSIVE_MODE, enabled)
                 .apply()
             runOnUiThread { applyPlayerSystemUi() }
-            return enabled
         }
 
-        @JavascriptInterface
-        fun setMaxPictureMode(enabled: Boolean): Boolean {
+        /**
+         * 原同步回傳 enabled；JS 不用回傳值，GeckoBridge 也無回傳值，改為 Unit。
+         */
+        fun setMaxPictureMode(enabled: Boolean) {
             getSharedPreferences(PLAYER_UI_PREFERENCES, MODE_PRIVATE).edit()
                 .putBoolean(PREFERENCE_MAX_PICTURE_MODE, enabled)
                 .apply()
-            return enabled
         }
 
-        @JavascriptInterface
         fun download() {
             if (!canDownload) return
             runOnUiThread {
@@ -478,12 +524,26 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
             }
         }
 
-        @JavascriptInterface
-        fun resolveRouEpisode(episodeId: String, episodeNumber: Int): String {
-            if (allowedRouEpisodes[episodeId] != episodeNumber || episodeNumber <= 0) return ""
-            val pageUri = runCatching { Uri.parse(pageUrl) }.getOrNull() ?: return ""
+        /**
+         * 原同步回傳代理 URL；GeckoBridge 無回傳值，改由
+         * window.__onEpisodeResolved(index, token, url, automatic) 送回頁面。
+         * 失敗（不在允許清單 / 無代理）回空字串，頁面顯示「無法載入所選分集」。
+         */
+        fun resolveRouEpisode(episodeId: String, episodeNumber: Int, index: Int, token: Int, automatic: Boolean) {
+            if (allowedRouEpisodes[episodeId] != episodeNumber || episodeNumber <= 0) {
+                postEpisodeResolved(index, token, "", automatic)
+                return
+            }
+            val pageUri = runCatching { Uri.parse(pageUrl) }.getOrNull()
+            if (pageUri == null) {
+                postEpisodeResolved(index, token, "", automatic)
+                return
+            }
             val host = pageUri.host.orEmpty()
-            if (!isRouVideoHost(host)) return ""
+            if (!isRouVideoHost(host)) {
+                postEpisodeResolved(index, token, "", automatic)
+                return
+            }
             val scheme = pageUri.scheme?.takeIf { it == "http" || it == "https" } ?: "https"
             val authority = pageUri.encodedAuthority ?: host
             val sourceUrl = Uri.Builder()
@@ -501,7 +561,11 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                 .appendPath(episodeId)
                 .build()
                 .toString()
-            val proxy = playbackProxyServer ?: return ""
+            val proxy = playbackProxyServer
+            if (proxy == null) {
+                postEpisodeResolved(index, token, "", automatic)
+                return
+            }
             val cookieManager = android.webkit.CookieManager.getInstance()
             val cookies = cookieManager.getCookie(sourceUrl).orEmpty()
                 .ifEmpty { cookieManager.getCookie(referer).orEmpty() }
@@ -514,16 +578,26 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                 .ifBlank { "video" } + " - 第 $episodeNumber 集"
             PlaybackHistoryRepository.record(this@FullscreenInternalPlayerActivity, activePageUrl, activeDownloadName)
             beginPlaybackTelemetry()
-            return proxiedUrl
+            postEpisodeResolved(index, token, proxiedUrl, automatic)
         }
 
-        @JavascriptInterface
-        fun resolveAdditionalEpisode(episodeUrl: String, episodeTitle: String): String {
+        /**
+         * 原同步回傳代理 URL；GeckoBridge 無回傳值，改由
+         * window.__onEpisodeResolved(index, token, url, automatic) 送回頁面。
+         */
+        fun resolveAdditionalEpisode(episodeUrl: String, episodeTitle: String, index: Int, token: Int, automatic: Boolean) {
             if (allowedAdditionalEpisodes[episodeUrl] != episodeTitle ||
                 !AdditionalSiteMedia.hostMatches(pageUrl, "javday.app") ||
                 !AdditionalSiteMedia.accepts(pageUrl, episodeUrl, pageUrl)
-            ) return ""
-            val proxy = playbackProxyServer ?: return ""
+            ) {
+                postEpisodeResolved(index, token, "", automatic)
+                return
+            }
+            val proxy = playbackProxyServer
+            if (proxy == null) {
+                postEpisodeResolved(index, token, "", automatic)
+                return
+            }
             val cookies = android.webkit.CookieManager.getInstance().getCookie(episodeUrl).orEmpty()
                 .ifEmpty { android.webkit.CookieManager.getInstance().getCookie(referer).orEmpty() }
             val proxiedUrl = proxy.buildProxyUrl(episodeUrl, referer, cookies)
@@ -532,49 +606,101 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
             activeDownloadName = downloadName.trim() + " - " + episodeTitle
             PlaybackHistoryRepository.record(this@FullscreenInternalPlayerActivity, activePageUrl, activeDownloadName)
             beginPlaybackTelemetry()
-            return proxiedUrl
+            postEpisodeResolved(index, token, proxiedUrl, automatic)
         }
 
-        @JavascriptInterface
-        fun toggleOrientationLock(): String {
-            if (orientationLockMode != "auto") {
+        /**
+         * 原同步回傳 mode 字串；GeckoBridge 無回傳值，改由
+         * window.__onOrientationLock(mode) 把結果送回頁面。
+         */
+        fun toggleOrientationLock() {
+            val mode = if (orientationLockMode != "auto") {
                 orientationLockMode = "auto"
                 runOnUiThread {
                     requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
                 }
-                return "auto"
-            }
-
-            val mode = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
-                "landscape"
+                "auto"
             } else {
-                "portrait"
+                val locked = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+                    "landscape"
+                } else {
+                    "portrait"
+                }
+                orientationLockMode = locked
+                runOnUiThread {
+                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LOCKED
+                    android.util.Log.i(
+                        "INTERNAL_PLAYER",
+                        "orientation locked mode=$locked config=${resources.configuration.orientation} " +
+                            "rotation=${display?.rotation} requested=$requestedOrientation"
+                    )
+                }
+                locked
             }
-            orientationLockMode = mode
-            runOnUiThread {
-                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LOCKED
-                android.util.Log.i(
-                    "INTERNAL_PLAYER",
-                    "orientation locked mode=$mode config=${resources.configuration.orientation} " +
-                        "rotation=${display?.rotation} requested=$requestedOrientation"
-                )
-            }
-            return mode
+            postToPlayer("window.__onOrientationLock && window.__onOrientationLock(${JSONObject.quote(mode)})")
         }
 
-        @JavascriptInterface
-        fun getQualityOptions(): String {
-            if (!canSelectQuality) return "[]"
-            return fetchHlsQualityOptions(videoUrl, referer)
+        /**
+         * 原同步回傳畫質 JSON；GeckoBridge 無回傳值，且取播放清單是網路 I/O，
+         * 改在背景執行緒取，結果由 window.__onQualityOptions(json) 送回頁面。
+         */
+        fun fetchQualityOptionsAsync() {
+            Thread {
+                val options = if (canSelectQuality) fetchHlsQualityOptions(videoUrl, referer) else "[]"
+                postToPlayer("window.__onQualityOptions && window.__onQualityOptions(${JSONObject.quote(options)})")
+            }.start()
         }
 
-        @JavascriptInterface
-        fun getPcRecordingEvents(): String =
-            RecordingEventParser.playerPayload(this@FullscreenInternalPlayerActivity, pcRecordingEventsUri)
+        /**
+         * 原同步回傳事件 JSON；GeckoBridge 無回傳值，且讀事件檔是 I/O，
+         * 改在背景執行緒讀，結果由 window.__onPcRecordingEvents(json) 送回頁面。
+         */
+        fun fetchPcRecordingEventsAsync() {
+            Thread {
+                val payload = runCatching {
+                    RecordingEventParser.playerPayload(this@FullscreenInternalPlayerActivity, pcRecordingEventsUri)
+                }.getOrDefault("{\"events\":[]}")
+                postToPlayer("window.__onPcRecordingEvents && window.__onPcRecordingEvents(${JSONObject.quote(payload)})")
+            }.start()
+        }
 
-        @JavascriptInterface
         fun log(message: String) {
             android.util.Log.i("INTERNAL_PLAYER", message)
+        }
+
+        /**
+         * GeckoBridge 用的方法表：方法名與原 @JavascriptInterface 相同，
+         * 頁面 JS 調 window.Android.<method>，參數以 JSONArray 傳入。
+         * 5 個原同步回傳值的方法（見各方法註解）改為非同步回呼。
+         */
+        fun handlers(): Map<String, (JSONArray) -> Unit> = mapOf(
+            "playbackStarted" to { playbackStarted() },
+            "playbackFailed" to { args -> playbackFailed(args.optInt(0)) },
+            "close" to { close() },
+            "setMuted" to { args -> setMuted(args.optBoolean(0)) },
+            "setImmersiveMode" to { args -> setImmersiveMode(args.optBoolean(0)) },
+            "setMaxPictureMode" to { args -> setMaxPictureMode(args.optBoolean(0)) },
+            "download" to { download() },
+            "resolveRouEpisode" to { args ->
+                resolveRouEpisode(args.optString(0), args.optInt(1), args.optInt(2, -1),
+                    args.optInt(3, 0), args.optInt(4, 0) == 1)
+            },
+            "resolveAdditionalEpisode" to { args ->
+                resolveAdditionalEpisode(args.optString(0), args.optInt(1), args.optInt(2, -1),
+                    args.optInt(3, 0), args.optInt(4, 0) == 1)
+            },
+            "toggleOrientationLock" to { toggleOrientationLock() },
+            "getQualityOptions" to { fetchQualityOptionsAsync() },
+            "getPcRecordingEvents" to { fetchPcRecordingEventsAsync() },
+            "log" to { args -> log(args.optString(0)) }
+        )
+
+        /** 把選集結果送回頁面（window.__onEpisodeResolved）。 */
+        private fun postEpisodeResolved(index: Int, token: Int, url: String, automatic: Boolean) {
+            val autoFlag = if (automatic) "true" else "false"
+            postToPlayer(
+                "window.__onEpisodeResolved && window.__onEpisodeResolved($index, $token, ${JSONObject.quote(url)}, $autoFlag)"
+            )
         }
     }
 
@@ -814,11 +940,17 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         }
     }
 
+    /**
+     * 刻意留下的唯一 WebView：它的用途是把 surrit cookie 寫進
+     * android.webkit.CookieManager，供下載服務（enqueueVideoDownload）
+     * 讀用；Gecko 沒有寫該 cookie 倉的公開 API，改走 Gecko 等於廢掉
+     * 它，故保留。見 playback/NOTES.md。
+     */
     private fun bootstrapSurritCookie(videoUrl: String, referer: String, onReady: () -> Unit) {
         val bootstrap = WebView(this)
         bootstrap.visibility = View.INVISIBLE
         bootstrap.settings.javaScriptEnabled = false
-        bootstrap.settings.userAgentString = webView.settings.userAgentString
+        bootstrap.settings.userAgentString = PLAYER_USER_AGENT
         android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(bootstrap, true)
         addContentView(bootstrap, android.view.ViewGroup.LayoutParams(1, 1))
 
@@ -1952,7 +2084,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   }
 
                   function setStatus(text) {
-                    try { AndroidPlayer.log('status=' + text + ' url=' + url); } catch (e) {}
+                    try { window.Android.log('status=' + text + ' url=' + url); } catch (e) {}
                     if (uiEnglish) {
                       text = text
                         .replace('跳轉到 ', 'Seeked to ')
@@ -1992,7 +2124,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   }
 
                   function attachVideoSource(targetUrl) {
-                    try { AndroidPlayer.log('attachVideoSource target=' + targetUrl); } catch (e) {}
+                    try { window.Android.log('attachVideoSource target=' + targetUrl); } catch (e) {}
                     if (window._hlsPlayer) {
                       try {
                         window._hlsPlayer.destroy();
@@ -2009,7 +2141,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                         window._hlsPlayer = hls;
                         hls.on(Hls.Events.ERROR, function(event, data) {
                           try {
-                            AndroidPlayer.log('hlsError type=' + data.type + ' details=' + data.details + ' fatal=' + data.fatal);
+                            window.Android.log('hlsError type=' + data.type + ' details=' + data.details + ' fatal=' + data.fatal);
                           } catch (e) {}
                           if (data.fatal) {
                             if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
@@ -2025,7 +2157,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                         hls.attachMedia(video);
                         return;
                       } catch (e) {
-                        try { AndroidPlayer.log('hlsInitFailed=' + (e && e.message ? e.message : e)); } catch (ignore) {}
+                        try { window.Android.log('hlsInitFailed=' + (e && e.message ? e.message : e)); } catch (ignore) {}
                       }
                     }
 
@@ -2066,27 +2198,37 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     setStatus('畫質已切換為 ' + label);
                   }
 
+                  // GeckoBridge 沒有同步回傳值：先發請求，結果由
+                  // window.__onQualityOptions(json) 回填（見下）。
                   function loadQualityOptions() {
                     if (!quality) return;
                     setTimeout(function() {
                       try {
-                        var variants = JSON.parse(AndroidPlayer.getQualityOptions() || '[]');
-                        if (!variants.length) {
-                          quality.style.display = 'none';
-                          return;
-                        }
-                        variants.forEach(function(variant) {
-                          var option = document.createElement('option');
-                          option.value = variant.url;
-                          option.textContent = variant.label;
-                          quality.appendChild(option);
-                        });
+                        window.Android.getQualityOptions();
                       } catch (e) {
                         quality.style.display = 'none';
                         setStatus('無法取得解析度清單');
                       }
                     }, 1200);
                   }
+                  window.__onQualityOptions = function(json) {
+                    try {
+                      var variants = JSON.parse(json || '[]');
+                      if (!variants.length) {
+                        quality.style.display = 'none';
+                        return;
+                      }
+                      variants.forEach(function(variant) {
+                        var option = document.createElement('option');
+                        option.value = variant.url;
+                        option.textContent = variant.label;
+                        quality.appendChild(option);
+                      });
+                    } catch (e) {
+                      quality.style.display = 'none';
+                      setStatus('無法取得解析度清單');
+                    }
+                  };
 
                   function seekBy(seconds) {
                     try {
@@ -2253,11 +2395,23 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     showChrome();
                   }
 
+                  // GeckoBridge 沒有同步回傳值：先發請求，結果由
+                  // window.__onPcRecordingEvents(json) 回填（見下）。
                   function loadRecordingTipEvents() {
                     if (recordingTipEventsLoaded || !video.duration || !isFinite(video.duration)) return;
                     recordingTipEventsLoaded = true;
                     try {
-                      var payload = JSON.parse(AndroidPlayer.getPcRecordingEvents() || '{"events":[]}');
+                      window.Android.getPcRecordingEvents();
+                    } catch (error) {
+                      recordingTipEvents = [];
+                      tipMarkerTrack.style.display = 'none';
+                      renderRecordingTipList();
+                      setStatus(uiEnglish ? 'Event data could not be read' : '事件資料無法讀取');
+                    }
+                  }
+                  window.__onPcRecordingEvents = function(json) {
+                    try {
+                      var payload = JSON.parse(json || '{"events":[]}');
                       var source = Array.isArray(payload.events) ? payload.events : [];
                       recordingTipEvents = source.filter(function(event) {
                         var offset = Number(event.offsetSeconds);
@@ -2277,7 +2431,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                       renderRecordingTipList();
                       setStatus(uiEnglish ? 'Event data could not be read' : '事件資料無法讀取');
                     }
-                  }
+                  };
 
                   tipListToggle.onclick = function(event) {
                     event.preventDefault();
@@ -2794,7 +2948,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   video.addEventListener('canplay', function(){ setStatus('可播放'); });
                   video.addEventListener('playing', function(){
                     setStatus('播放中'); updatePlay();
-                    try { AndroidPlayer.playbackStarted(); } catch (e) {}
+                    try { window.Android.playbackStarted(); } catch (e) {}
                   });
                   video.addEventListener('ended', function(){
                     updatePlay();
@@ -2815,9 +2969,9 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   video.addEventListener('emptied', function(){ setStatus('來源清空 emptied'); });
                   video.addEventListener('error', function(){
                     var err = video.error;
-                    try { AndroidPlayer.playbackFailed(err ? err.code : 0); } catch (e) {}
+                    try { window.Android.playbackFailed(err ? err.code : 0); } catch (e) {}
                     try {
-                      AndroidPlayer.log('videoError code=' + (err ? err.code : 'unknown') +
+                      window.Android.log('videoError code=' + (err ? err.code : 'unknown') +
                         ' currentSrc=' + (video.currentSrc || '') +
                         ' networkState=' + video.networkState +
                         ' readyState=' + video.readyState);
@@ -3228,14 +3382,17 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   mute.onclick = function() {
                     video.muted = !video.muted;
                     updateMute();
-                    AndroidPlayer.setMuted(video.muted);
+                    window.Android.setMuted(video.muted);
                     setStatus(video.muted ? '已靜音' : '已開啟聲音');
                   };
                   orientation.onclick = function() {
-                    var mode = AndroidPlayer.toggleOrientationLock();
+                    try { window.Android.toggleOrientationLock(); } catch (e) {}
+                    showChrome();
+                  };
+                  // 方向鎖定的結果是非同步回來的（GeckoBridge 無回傳值）。
+                  window.__onOrientationLock = function(mode) {
                     updateOrientation(mode);
                     setStatus(mode === 'auto' ? '自動旋轉' : (mode === 'landscape' ? '已鎖定橫屏' : '已鎖定豎屏'));
-                    showChrome();
                   };
                   displaySettings.onclick = function(event) {
                     event.stopPropagation();
@@ -3245,7 +3402,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   pictureModeButton.onclick = function(event) {
                     event.stopPropagation();
                     maxPictureMode = !maxPictureMode;
-                    AndroidPlayer.setMaxPictureMode(maxPictureMode);
+                    window.Android.setMaxPictureMode(maxPictureMode);
                     updateDisplayModeUi();
                     updatePlayerLayout();
                     setStatus(maxPictureMode
@@ -3256,7 +3413,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   immersiveModeButton.onclick = function(event) {
                     event.stopPropagation();
                     immersiveMode = !immersiveMode;
-                    AndroidPlayer.setImmersiveMode(immersiveMode);
+                    window.Android.setImmersiveMode(immersiveMode);
                     updateDisplayModeUi();
                     setTimeout(updatePlayerLayout, 120);
                     setStatus(immersiveMode
@@ -3275,7 +3432,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   var downloadButton = document.getElementById('download');
                   if (downloadButton) {
                     downloadButton.onclick = function() {
-                      AndroidPlayer.download();
+                      window.Android.download();
                       setStatus('已加入背景下載');
                       showChrome();
                     };
@@ -3286,17 +3443,32 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                       showChrome();
                     };
                   }
+                  // GeckoBridge 沒有同步回傳值：先發請求，Kotlin 算出代理 URL 後
+                  // 由 window.__onEpisodeResolved(index, token, url, automatic)
+                  // 回填（見下）。token 防連點兩集時先發的回應後到、蓋掉後選的集；
+                  // automatic 原樣回傳，自動連播的狀態文案與 clean-view 邏輯不變。
+                  var episodeResolveToken = 0;
                   function startPlayerEpisode(index, automatic) {
                     var selected = playerEpisodes[index];
                     if (!selected || index === currentPlayerEpisodeIndex) return false;
-                    var nextUrl = selected.kind === 'rou'
-                      ? AndroidPlayer.resolveRouEpisode(selected.id, selected.number)
-                      : AndroidPlayer.resolveAdditionalEpisode(selected.url, selected.title);
-                    if (!nextUrl) {
+                    var token = ++episodeResolveToken;
+                    try {
+                      if (selected.kind === 'rou') {
+                        window.Android.resolveRouEpisode(selected.id, selected.number, index, token, automatic ? 1 : 0);
+                      } else {
+                        window.Android.resolveAdditionalEpisode(selected.url, selected.title, index, token, automatic ? 1 : 0);
+                      }
+                    } catch (e) {}
+                    return true;
+                  }
+                  window.__onEpisodeResolved = function(index, token, nextUrl, automatic) {
+                    if (token !== episodeResolveToken) return;
+                    var selected = playerEpisodes[index];
+                    if (!selected || !nextUrl) {
                       if (episodeSelector) episodeSelector.value = String(currentPlayerEpisodeIndex);
                       setStatus(uiEnglish ? 'Unable to load this episode' : '無法載入所選分集');
                       showChrome();
-                      return false;
+                      return;
                     }
                     currentPlayerEpisodeIndex = index;
                     if (episodeSelector) episodeSelector.value = String(index);
@@ -3319,8 +3491,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                       ? (uiEnglish ? 'Auto-playing ' + selected.title : '自動播放 ' + selected.title)
                       : (uiEnglish ? selected.title : '已切換至 ' + selected.title));
                     if (!automatic || !document.documentElement.classList.contains('clean-view')) showChrome();
-                    return true;
-                  }
+                  };
                   if (episodeSelector) {
                     episodeSelector.onchange = function() {
                       var selectedIndex = parseInt(episodeSelector.value, 10);
@@ -3378,7 +3549,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   };
                   document.getElementById('close').onclick = function() {
                     video.pause();
-                    AndroidPlayer.close();
+                    window.Android.close();
                   };
 
                   video.muted = initialMuted;

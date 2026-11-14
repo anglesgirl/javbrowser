@@ -3,16 +3,24 @@ package com.example.javbrowser
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.webkit.CookieManager
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.os.SystemClock
+import com.example.javbrowser.gecko.GeckoEval
+import com.example.javbrowser.gecko.GeckoHeadless
 import java.net.URLEncoder
 import org.json.JSONObject
+import org.mozilla.geckoview.GeckoSession
 
 /**
- * JavDB scraper using a hidden WebView (no paid API needed).
- * All WebView operations run on the main thread internally;
+ * JavDB scraper using a headless Gecko session (no paid API needed).
+ * All Gecko operations run on the main thread internally;
  * [enrichFavorite] may be called from any thread.
+ *
+ * Gecko 迁移（原隐藏 WebView 版）：加载 → 等渲染 → evaluateJavascript
+ * 取数据。任务简报给定的共享 API 里没有写 cookie 的接口，over18 cookie
+ * 改为首载后用 JS 在 javdb.com 域内种下再重载一次（见
+ * [seedOver18AndReload]）。注：核对 infra 簇落地实现后，infra 实际还公开
+ * 了 `GeckoCookies.setCookie`（见 NOTES.md），后续可简化为先 setCookie
+ * 再加载；本簇按简报 API 写，未用它。
  */
 class JavDbWebViewScraper(private val context: Context) {
 
@@ -25,39 +33,61 @@ class JavDbWebViewScraper(private val context: Context) {
     /** 直接用指定 JavDB 頁面 URL 補全（跳過搜尋，避免誤選第一筆） */
     fun enrichFromUrl(javCode: String, detailUrl: String, callback: (JavVideoDetail?) -> Unit) {
         mainHandler.post {
-            val webView = createWebView()
-            doDetail(webView, javCode, detailUrl, callback)
+            val urlWithLocale = withLocale(detailUrl)
+            GeckoHeadless.loadSession(context, urlWithLocale, LOAD_TIMEOUT_MS) { session ->
+                mainHandler.post {
+                    if (session == null) {
+                        callback(null)
+                        return@post
+                    }
+                    seedOver18AndReload(session, detailUrl) { ok ->
+                        if (!ok) {
+                            close(session)
+                            callback(null)
+                            return@seedOver18AndReload
+                        }
+                        mainHandler.postDelayed({
+                            extractDetailData(session, javCode, detailUrl, callback)
+                        }, SETTLE_DELAY_MS)
+                    }
+                }
+            }
         }
     }
 
     // ── Step 1: search page ───────────────────────────────────────────────────
 
     private fun doSearch(javCode: String, callback: (JavVideoDetail?) -> Unit) {
-        val webView = createWebView()
         val searchUrl = "https://javdb.com/search?q=${URLEncoder.encode(javCode, "UTF-8")}&locale=zh"
-        var handled = false
-
-        webView.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView, url: String) {
-                if (handled) return
-                handled = true
-                mainHandler.postDelayed({
-                    extractHref(webView, javCode) { href ->
-                        if (href.isNullOrEmpty()) {
-                            android.util.Log.w("JavDbWebView", "No search result for $javCode")
-                            webView.destroy()
-                            callback(null)
-                        } else {
-                            doDetail(webView, javCode, "https://javdb.com$href", callback)
-                        }
+        GeckoHeadless.loadSession(context, searchUrl, LOAD_TIMEOUT_MS) { session ->
+            mainHandler.post {
+                if (session == null) {
+                    callback(null)
+                    return@post
+                }
+                seedOver18AndReload(session, "javdb.com/search") { ok ->
+                    if (!ok) {
+                        close(session)
+                        callback(null)
+                        return@seedOver18AndReload
                     }
-                }, 2500)
+                    mainHandler.postDelayed({
+                        extractHref(session, javCode) { href ->
+                            if (href.isNullOrEmpty()) {
+                                android.util.Log.w("JavDbWebView", "No search result for $javCode")
+                                close(session)
+                                callback(null)
+                            } else {
+                                doDetail(session, javCode, "https://javdb.com$href", callback)
+                            }
+                        }
+                    }, SETTLE_DELAY_MS)
+                }
             }
         }
-        webView.loadUrl(searchUrl)
     }
 
-    private fun extractHref(webView: WebView, javCode: String, callback: (String?) -> Unit) {
+    private fun extractHref(session: GeckoSession, javCode: String, callback: (String?) -> Unit) {
         val escapedCode = javCode.uppercase().replace("'", "\\'")
         val js = """
             (function() {
@@ -74,7 +104,7 @@ class JavDbWebViewScraper(private val context: Context) {
             })()
         """.trimIndent()
 
-        webView.evaluateJavascript(js) { result ->
+        GeckoEval.evaluate(session, js) { result ->
             if (result == null || result == "null") {
                 callback(null)
             } else {
@@ -86,23 +116,24 @@ class JavDbWebViewScraper(private val context: Context) {
 
     // ── Step 2: detail page ───────────────────────────────────────────────────
 
-    private fun doDetail(webView: WebView, javCode: String, detailUrl: String, callback: (JavVideoDetail?) -> Unit) {
-        val urlWithLocale = if (detailUrl.contains("?")) "$detailUrl&locale=zh" else "$detailUrl?locale=zh"
-        var handled = false
-
-        webView.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView, url: String) {
-                if (handled) return
-                handled = true
-                mainHandler.postDelayed({
-                    extractDetailData(webView, javCode, detailUrl, callback)
-                }, 2500)
+    private fun doDetail(session: GeckoSession, javCode: String, detailUrl: String, callback: (JavVideoDetail?) -> Unit) {
+        val urlWithLocale = withLocale(detailUrl)
+        // 站内跳转：同一 session 里改 location.href，浏览器自动带上
+        // Referer（原 WebView loadUrl 的同款语义）。
+        GeckoEval.runJavascript(session, "location.href = '${urlWithLocale.replace("'", "\\'")}';")
+        waitForSessionPage(session, detailUrl, LOAD_TIMEOUT_MS / 2) { ok ->
+            if (!ok) {
+                close(session)
+                callback(null)
+                return@waitForSessionPage
             }
+            mainHandler.postDelayed({
+                extractDetailData(session, javCode, detailUrl, callback)
+            }, SETTLE_DELAY_MS)
         }
-        webView.loadUrl(urlWithLocale)
     }
 
-    private fun extractDetailData(webView: WebView, javCode: String, detailUrl: String, callback: (JavVideoDetail?) -> Unit) {
+    private fun extractDetailData(session: GeckoSession, javCode: String, detailUrl: String, callback: (JavVideoDetail?) -> Unit) {
         // Returns a JS object; WebView serialises it as JSON for the callback
         val js = """
             (function() {
@@ -170,12 +201,12 @@ class JavDbWebViewScraper(private val context: Context) {
             })()
         """.trimIndent()
 
-        webView.evaluateJavascript(js) { result ->
-            webView.destroy()
+        GeckoEval.evaluate(session, js) { result ->
+            close(session)
             if (result == null || result == "null") {
                 android.util.Log.w("JavDbWebView", "Null result for $javCode")
                 callback(null)
-                return@evaluateJavascript
+                return@evaluate
             }
             try {
                 val obj = JSONObject(result)
@@ -213,19 +244,70 @@ class JavDbWebViewScraper(private val context: Context) {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private fun createWebView(): WebView {
-        val wv = WebView(context)
-        wv.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    /**
+     * 首载后在 javdb.com 域内用 JS 种 over18 cookie，再重载一次，等页面
+     * 重新就绪后继续。原 WebView 版是在加载前用 CookieManager.setCookie
+     * 预置；任务简报给定的共享 API 里没有写 cookie 的接口，只能先载一个
+     * 同域页面再种 cookie（infra 实际还公开了 GeckoCookies.setCookie，
+     * 后续可简化，见 NOTES.md）。
+     * （若首载已是正常结果页，这次重载是多余的，但无害。）
+     */
+    private fun seedOver18AndReload(session: GeckoSession, marker: String, onReady: (Boolean) -> Unit) {
+        GeckoEval.runJavascript(session, "document.cookie = 'over18=1; path=/; domain=.javdb.com';")
+        GeckoEval.runJavascript(session, "location.reload();")
+        waitForSessionPage(session, marker, LOAD_TIMEOUT_MS / 2, initialDelayMs = 800L, onReady = onReady)
+    }
+
+    /**
+     * 等待同一 session 内的 JS 导航完成：轮询 location.href +
+     * document.readyState，直到地址含 [marker] 且 readyState 为 complete。
+     * 替代原 WebViewClient.onPageFinished（GeckoHeadless.loadSession 只
+     * 负责首次加载，站内跳转要自己等）。
+     */
+    private fun waitForSessionPage(
+        session: GeckoSession,
+        marker: String,
+        timeoutMs: Long,
+        initialDelayMs: Long = 500L,
+        onReady: (Boolean) -> Unit
+    ) {
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        var done = false
+        fun poll() {
+            if (done) return
+            if (SystemClock.uptimeMillis() >= deadline) {
+                done = true
+                onReady(false)
+                return
+            }
+            GeckoEval.evaluate(session, "(location.href + '|' + document.readyState)", 5_000L) { raw ->
+                if (done) return@evaluate
+                val text = raw?.trim()?.removeSurrounding("\"")?.replace("\\/", "/") ?: ""
+                val parts = text.split("|")
+                val href = parts.getOrElse(0) { "" }
+                val state = parts.getOrElse(1) { "" }
+                if (href.contains(marker, ignoreCase = true) && state == "complete") {
+                    done = true
+                    onReady(true)
+                } else {
+                    mainHandler.postDelayed({ poll() }, 500L)
+                }
+            }
         }
-        CookieManager.getInstance().apply {
-            setAcceptCookie(true)
-            setCookie("https://javdb.com", "over18=1; path=/; domain=.javdb.com")
-            flush()
-        }
-        return wv
+        mainHandler.postDelayed({ poll() }, initialDelayMs)
+    }
+
+    private fun withLocale(detailUrl: String): String =
+        if (detailUrl.contains("?")) "$detailUrl&locale=zh" else "$detailUrl?locale=zh"
+
+    private fun close(session: GeckoSession?) {
+        runCatching { session?.close() }
+    }
+
+    companion object {
+        /** 单次页面加载上限。原 WebView 版没有总超时；Gecko 版以此为界。 */
+        private const val LOAD_TIMEOUT_MS = 30_000L
+        /** 原 onPageFinished 后等渲染稳定的延时，原样保留。 */
+        private const val SETTLE_DELAY_MS = 2500L
     }
 }

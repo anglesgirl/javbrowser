@@ -21,6 +21,10 @@ import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
+import com.example.javbrowser.gecko.GeckoEval
+import com.example.javbrowser.gecko.GeckoHeadless
+import com.example.javbrowser.gecko.JavhdGeckoExtension
+import org.mozilla.geckoview.GeckoSession
 
 /** 九個來源共用的搜尋與結果頁。 */
 class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
@@ -41,7 +45,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
          * collide across videos; not cleared per-sniff so a picker
          * opened earlier still finds its referer. */
         val javhdEmbedRefererByUrl = mutableMapOf<String, String>()
-        /** Mobile UA used by the javhd hidden WebViews and as the
+        /** Mobile UA used by the javhd hidden Gecko sessions and as the
          * default for form POSTs. */
         const val JAVHD_MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
         /** Desktop UA for the javhd /api/play/ POST only. The site
@@ -261,7 +265,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * Result of the full-page play-address list (A方案 — replaces the
      * old "选择播放地址" dialog). Same echo-back contract as above:
      * pick plays it (recorded in the playback-data session), browser
-     * opens WebView, back press does nothing.
+     * opens the main browser, back press does nothing.
      */
     private val choiceLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
@@ -367,8 +371,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * to pick (auto-pick proved unreliable: it kept landing on ads
      * or unplayable URLs); the user taps one to play it in the
      * internal player, or chooses the browser to fall back to
-     * WebView. No candidates goes straight to WebView (current
-     * behavior).
+     * the main browser. No candidates goes straight to the browser
+     * (current behavior).
      */
     private fun openResult(item: SearchItem) {
         rememberReadAnchor()
@@ -379,7 +383,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         val sessionId = PlaybackDataStore.startSession(item.siteId, item.detailUrl)
         // javhdporn（2026-11-10 改走嵌頁直播）：嗅探取直鏈 + 原生播放器走不通
         // （播放器 onCreate 跑了、正片就是不出），改把 /api/play/ 拿到的嵌頁
-        // 直接裝進全螢幕 WebView，用站方 JWPlayer 原頁播，廣告攔掉、VAST 自動
+        // 直接裝進全螢幕 GeckoView（JavhdEmbedPlayerActivity），用站方 JWPlayer 原頁播，廣告攔掉、VAST 自動
         // 點跳過。拿不到嵌頁才回退舊的嗅探/選擇器流程。
         if (item.siteId == SearchSiteIds.JAVHD) {
             runOnUiThread {
@@ -402,7 +406,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // hentaimama: the real file only exists in the dt_embed JWPlayer
         // setup (video domain gdvid.info), never in static HTML — static
         // sniffing only finds snapshot thumbnails. Resolve it over HTTP,
-        // skipping the VAST ad entirely; any failure falls back to WebView.
+        // skipping the VAST ad entirely; any failure falls back to the browser.
         // NOTE: search results link to series intro pages (/tvshows/),
         // which have no player at all — only an episode list. Resolving
         // the intro page as if it were an episode always fails, so a
@@ -498,7 +502,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * Series intro page (/tvshows/): fetch its episode list,
      * then resolve the chosen episode. One episode resolves directly;
      * several show an episode picker. No episodes, or a fetch failure,
-     * falls back to WebView. Never throws.
+     * falls back to the browser. Never throws.
      */
     private fun resolveHentaiMamaSeries(item: SearchItem, sessionId: Long) {
         SearchScheduler.workers.execute {
@@ -536,7 +540,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     }
 
     /**
-     * Resolves javhdporn's real files through a hidden WebView. The detail
+     * Resolves javhdporn's real files through a hidden Gecko session. The detail
      * page carries no video URL at all. Older pages expose Server links
      * (Part1/Part2, a.srv[data-type="load-fv"]); newer pages expose a
      * data-mpu token on the player. The driver clicks the real Server link
@@ -550,8 +554,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * click is sometimes a no-op — retry once after 8s), then move to
      * the next part; a part that never produces a file is skipped after
      * 20s. Old Streamtape videos keep the generic play-click interception path.
-     * The hidden WebView loads plain now (ECH 攔截已隨 GeckoView
-     * 遷移刪除，見 docs/geckoview-migration.md).
+     * The hidden session loads over Gecko native ECH/DoH now.
      * The file host is geo-selected (us-a2 in the sandbox run), so the
      * interceptor also accepts any /file.mp4 path, not just vdcdn.xyz.
      * On failure the recorded reason carries the step that died
@@ -559,7 +562,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * the 播放數據 screen says where it stopped instead of just
      * "解析失敗". Callback on the UI thread with every part found
      * (label + URL), or null when none resolves — the caller then
-     * falls back to WebView. Never throws.
+     * falls back to the browser. Never throws.
      */
     /**
      * Fallback javhdporn resolver: direct extraction, no page clicks.
@@ -570,7 +573,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * POST /api/play/ (明文) -> the
      * handler's own .done() (binddata) decodes the embed URL -> embed
      * HTML (明文) -> bundled embed main.js decodes a non-ad MP4/HLS URL.
-     * Any step failing falls back to the hidden-WebView click path
+     * Any step failing falls back to the hidden-session click path
      * (resolveJavhdViaClick).
      */
     /** Trace clock for the javhd resolve log: reset at the start of
@@ -578,10 +581,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * (where it stuck is visible from the gaps). */
     private var javhdTraceT0 = 0L
 
-    /** Ad hosts blocked outright in javhd hidden WebViews (popunders,
+    /** Ad hosts blocked outright in javhd hidden sessions (popunders,
      * VAST, the paid-SMS scam creatives). The video file host and the
-     * embed host are NOT in this list. Shared by the click fallback
-     * and the network-sniff path.
+     * embed host are NOT in this list. Gecko edition: the blocking
+     * itself moved to the javhd extension's webRequest listener
+     * (assets/javhd-gecko/background.js AD_HOSTS — same 11 hosts);
+     * this list is the Kotlin-side mirror, kept in sync with it, and
+     * the NOTE below still applies to both.
      * NOTE (2026-11-10): tsyndicate.com (VAST pre-roll tag) was
      * blocked here in vc140, but the user confirmed on-device that
      * blocking it breaks playback — the Skip button never appears
@@ -635,8 +641,9 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * Primary javhdporn resolver (2026-11-08): network sniff on the
      * embed page. Trigger: the data-mpu token -> cast.js computes
      * `sources` -> POST /api/play/ (明文) -> embed URL, then the embed
-     * page loads in a hidden WebView and whatever video file
-     * (m3u8/mp4) it requests is caught via shouldInterceptRequest.
+     * page loads in a hidden Gecko session and whatever video file
+     * (m3u8/mp4) it requests is reported by the javhd extension's
+     * webRequest observer (JavhdGeckoExtension.attachMediaSniffer).
      * The video itself is never parsed out of the embed's
      * data-config/JWPlayer — that is the fragile old path. Clicking
      * .video-player alone never started anything (the player is built
@@ -665,12 +672,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         callback: (Pair<List<SniffCandidateRecord>, List<SniffCandidateRecord>>?) -> Unit,
     ) {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        var hiddenWebView: android.webkit.WebView? = null
+        var hiddenSession: GeckoSession? = null
         var done = false
         var setupDone = false
         var pageFinished = false
         var pageStarted = false
-        var maxProgress = 0
+        // No progress signal in the shared headless API (no
+        // WebChromeClient): failure text no longer carries a progress %.
         var lastLoadError: String? = null
         var clickCount = 0
         var finishScheduled = false
@@ -689,12 +697,12 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         var clickRunnable: Runnable? = null
         var skipRunnable: Runnable? = null
         var skipCount = 0
-        // Which page the sniff WebView ended up loading: the embed
+        // Which page the sniff session ended up loading: the embed
         // URL from /api/play/, or the detail page (trigger failed).
         // The failure reason names it so "嵌頁里没拦到视频" and
         // "详情页里没拦到视频" are distinguishable.
         var loadedEmbed = false
-        // The embed URL currently loaded in the sniff WebView. A
+        // The embed URL currently loaded in the sniff session. A
         // caught media URL must be remembered with this embed as
         // its Referer (javhdEmbedRefererByUrl): the CDN rejects
         // the detail page as referer (HTTP 403) and only accepts
@@ -728,8 +736,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             finishRunnable?.let { handler.removeCallbacks(it) }
             clickRunnable?.let { handler.removeCallbacks(it) }
             skipRunnable?.let { handler.removeCallbacks(it) }
-            hiddenWebView?.destroy()
-            hiddenWebView = null
+            hiddenSession?.let { s ->
+                JavhdGeckoExtension.detachMediaSniffer(s)
+                runCatching { s.close() }
+            }
+            hiddenSession = null
             if (foundUrls.isEmpty()) {
                 val media = if (mediaHosts.isEmpty()) "無" else mediaHosts.take(3).joinToString(",")
                 val err = lastLoadError?.let { "；$it" } ?: ""
@@ -796,11 +807,15 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
          * no-op when the ad is not in a skippable state, so it must
          * never shadow the button. Re-polls every 2s until a video
          * URL is found (the interceptor then schedules finish) or
-         * the sniff times out. Never throws. */
+         * the sniff times out. Never throws.
+         * (The javhd extension's content script also auto-clicks Skip
+         * on embed pages; this loop stays because only page-world JS
+         * can reach the jwplayer.skipAd() API fallback.) */
         fun skipAd() {
             if (done || foundUrls.isNotEmpty()) return
             skipCount++
-            hiddenWebView?.evaluateJavascript(
+            val session = hiddenSession ?: return
+            GeckoEval.evaluate(session,
                 "(function(){" +
                     "var btn=document.querySelector('.jw-skip');" +
                     "if(btn){try{btn.click();return 'clicked:.jw-skip';}catch(e){return 'jw-skip click err';}}" +
@@ -811,7 +826,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     "try{if(typeof jwplayer!=='undefined'){var p=jwplayer();if(p&&typeof p.skipAd==='function'){p.skipAd();return 'api:skipAd() no-button';}}}catch(e){}" +
                     "return 'no skip button';})();",
             ) { value ->
-                if (done || foundUrls.isNotEmpty()) return@evaluateJavascript
+                if (done || foundUrls.isNotEmpty()) return@evaluate
                 val s = value?.trim()?.removeSurrounding("\"").orEmpty()
                 if (s != "no skip button") {
                     traceJavhd(sessionId, "嗅探跳過廣告（第 $skipCount 次）：$s")
@@ -832,7 +847,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             if (done) return
             clickCount++
             traceJavhd(sessionId, "嗅探點擊播放器（第 $clickCount 次）")
-            hiddenWebView?.evaluateJavascript(
+            val session = hiddenSession ?: return
+            GeckoEval.evaluate(session,
                 "(function(){" +
                     "var s=['video','#mainvideo','.video-player','#video-player','[class*=\"video-player\"]','#overlay','[id*=\"play\"]','[class*=\"play\"]'];" +
                     "for(var i=0;i<s.length;i++){" +
@@ -847,146 +863,54 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             }
         }
 
+        /** One media URL reported by the extension's webRequest
+         * observer. The observer only reports non-ad .m3u8/.mp4 (it
+         * drops ad hosts, ad path segments and tsyndicate/VAST before
+         * reporting, and never reports .ts), so the ad branch below is
+         * unreachable until the extension reports ads separately —
+         * kept so the failure text survives that follow-up. The
+         * request itself always proceeds (the observer never blocks):
+         * the page's own player needs the bytes, and we only need the
+         * URL. The extension posts candidate callbacks on the main
+         * thread, so no handler.post hop is needed (the old
+         * interceptor ran off-thread). */
+        fun onMediaCandidate(reqUrl: String) {
+            if (done) return
+            if (!isVideoFile(reqUrl)) return
+            try {
+                val h = java.net.URL(reqUrl).host
+                if (mediaHosts.add(h)) traceJavhd(sessionId, "媒體請求：$h")
+            } catch (e: Exception) { }
+            // Ad-host video (e.g. streamhls.click): never return it as
+            // a candidate — the feature comes from vdcdn/tapecontent/
+            // streamtape, not here. Keep waiting for a feature URL
+            // instead of finishing on the ad.
+            if (isAdVideoHost(reqUrl)) {
+                if (!done && adUrlsSeen.add(reqUrl)) {
+                    val h = try { java.net.URL(reqUrl).host } catch (e: Exception) { "?" }
+                    adHostsSeen.add(h)
+                    traceJavhd(sessionId, "嗅探攔到廣告：$h ${reqUrl.take(80)}")
+                }
+                return
+            }
+            if (!done && foundUrls.add(reqUrl)) {
+                // Record the embed page as this file's Referer so the
+                // player sends it (not the detail page, which the CDN
+                // 403s).
+                sniffEmbedUrl?.let { javhdEmbedRefererByUrl[reqUrl] = it }
+                traceJavhd(sessionId, "嗅探攔到：${reqUrl.take(120)}")
+                if (pageFinished) scheduleFinish()
+            }
+        }
+
         timeoutRunnable = Runnable { finish() }
         handler.post {
-            val wv = android.webkit.WebView(this)
-            hiddenWebView = wv
-            wv.settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-                mediaPlaybackRequiresUserGesture = false
-                // Never serve this page from cache: a page that once failed
-                // sticks dead in the shared WebView cache (known app
-                // behaviour — only clearing the app cache revives it).
-                cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
-            }
-            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
-            wv.webChromeClient = object : android.webkit.WebChromeClient() {
-                override fun onProgressChanged(view: android.webkit.WebView?, newProgress: Int) {
-                    if (newProgress > maxProgress) maxProgress = newProgress
-                }
-            }
-            wv.webViewClient = object : android.webkit.WebViewClient() {
-                override fun shouldInterceptRequest(
-                    view: android.webkit.WebView?,
-                    request: android.webkit.WebResourceRequest?
-                ): android.webkit.WebResourceResponse? {
-                    val reqUrl = request?.url?.toString() ?: return null
-                    if (javhdAdHosts.any { reqUrl.contains(it) }) {
-                        return android.webkit.WebResourceResponse("text/plain", "utf-8",
-                            java.io.ByteArrayInputStream(ByteArray(0)))
-                    }
-                    if (reqUrl.contains(".mp4") || reqUrl.contains(".m3u8") || reqUrl.contains(".ts")) {
-                        try {
-                            val h = java.net.URL(reqUrl).host
-                            if (mediaHosts.add(h)) traceJavhd(sessionId, "媒體請求：$h")
-                        } catch (e: Exception) { }
-                    }
-                    if (isVideoFile(reqUrl)) {
-                        // Ad-host video (e.g. streamhls.click): let
-                        // the request proceed so the player flow is
-                        // undisturbed, but never return it as a
-                        // candidate — the feature comes from
-                        // vdcdn/tapecontent/streamtape, not here.
-                        // Keep waiting for a feature URL instead of
-                        // finishing on the ad.
-                        if (isAdVideoHost(reqUrl)) {
-                            handler.post {
-                                if (!done && adUrlsSeen.add(reqUrl)) {
-                                    val h = try { java.net.URL(reqUrl).host } catch (e: Exception) { "?" }
-                                    adHostsSeen.add(h)
-                                    traceJavhd(sessionId, "嗅探攔到廣告：$h ${reqUrl.take(80)}")
-                                }
-                            }
-                        } else {
-                            handler.post {
-                                if (!done && foundUrls.add(reqUrl)) {
-                                    // Record the embed page as this
-                                    // file's Referer so the player
-                                    // sends it (not the detail page,
-                                    // which the CDN 403s).
-                                    sniffEmbedUrl?.let { javhdEmbedRefererByUrl[reqUrl] = it }
-                                    traceJavhd(sessionId, "嗅探攔到：${reqUrl.take(120)}")
-                                    if (pageFinished) scheduleFinish()
-                                }
-                            }
-                        }
-                        // Let the request proceed: the page's own player
-                        // needs the bytes, and we only need the URL.
-                        // Fall through to default below.
-                    }
-                    // GeckoView 遷移後：ECH 攔截已刪，這個隱藏 WebView
-                    // 走明文載入（見 docs/geckoview-migration.md）。
-                    return null
-                }
-
-                override fun onPageStarted(view: android.webkit.WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                    super.onPageStarted(view, url, favicon)
-                    if (!pageStarted) traceJavhd(sessionId, "嗅探頁面開始加載：${url?.take(100)}")
-                    pageStarted = true
-                }
-
-                override fun onReceivedError(
-                    view: android.webkit.WebView?,
-                    request: android.webkit.WebResourceRequest?,
-                    error: android.webkit.WebResourceError?,
-                ) {
-                    super.onReceivedError(view, request, error)
-                    if (lastLoadError == null && error != null) {
-                        lastLoadError = "錯誤 ${request?.url?.host ?: "?"} ${error.errorCode} ${error.description}"
-                        traceJavhd(sessionId, "嗅探頁面錯誤：$lastLoadError")
-                    }
-                }
-
-                override fun onReceivedHttpError(
-                    view: android.webkit.WebView?,
-                    request: android.webkit.WebResourceRequest?,
-                    errorResponse: android.webkit.WebResourceResponse?,
-                ) {
-                    super.onReceivedHttpError(view, request, errorResponse)
-                    if (lastLoadError == null && errorResponse != null) {
-                        lastLoadError = "HTTP ${errorResponse.statusCode} ${request?.url?.host ?: "?"}"
-                        traceJavhd(sessionId, "嗅探頁面錯誤：$lastLoadError")
-                    }
-                }
-
-                override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
-                    super.onPageFinished(view, url)
-                    if (setupDone || done) return
-                    setupDone = true
-                    pageFinished = true
-                    traceJavhd(sessionId, "嗅探頁面完成加載（進度 $maxProgress%）")
-                    // If the player auto-loaded, a candidate may already
-                    // be in hand; otherwise trigger it generically.
-                    handler.postDelayed({
-                        if (done) return@postDelayed
-                        if (foundUrls.isEmpty()) {
-                            clickPlayer()
-                            // One retry: the first click is sometimes a no-op.
-                            clickRunnable = Runnable {
-                                if (!done && foundUrls.isEmpty()) clickPlayer()
-                            }
-                            handler.postDelayed(clickRunnable!!, 8000)
-                            // The VAST pre-roll must load and show its
-                            // Skip button — start polling for it once
-                            // playback is triggered; skipAd re-polls
-                            // itself until the feature URL arrives.
-                            handler.postDelayed({ if (!done) skipAd() }, 5000)
-                        } else {
-                            scheduleFinish()
-                        }
-                    }, 2000)
-                }
-            }
-            // Trigger: token -> /api/play/ -> embed URL, then load
-            // the embed page here and sniff the video out of it.
-            // Clicking .video-player never started anything — the
-            // player is built by JS and needs /api/play/ first, and
-            // the token sits unused in the page. The video itself is
-            // still caught by sniffing (never by parsing the embed's
-            // data-config/JWPlayer), and the player-area click stays
-            // as an auxiliary trigger in onPageFinished below.
+            // Gecko: the embed page loads directly (native ECH/DoH).
+            // The old OkHttp pre-fetch + loadDataWithBaseURL existed
+            // because the hidden WebView's own plaintext request to
+            // video1 reset; GeckoSession has no loadDataWithBaseURL
+            // equivalent in the shared API, and a direct load is the
+            // point of the move.
             javhdTraceT0 = android.os.SystemClock.elapsedRealtime()
             traceJavhd(sessionId, "嗅探開始：${item.detailUrl}")
             traceJavhd(sessionId, "嗅探觸發：取令牌 → /api/play/ → 嵌頁")
@@ -995,7 +919,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 callback = { _, _ -> },
                 onEmbed = { embeds, reason ->
                     if (done) return@resolveJavhdDirect
-                    if (embeds.isNullOrEmpty()) {
+                    val targetUrl = if (embeds.isNullOrEmpty()) {
                         // Say which step died: token / api/play /
                         // embed decode — not just "嗅探失敗".
                         val step = when {
@@ -1009,44 +933,61 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                         }
                         traceJavhd(sessionId, step)
                         traceJavhd(sessionId, "嗅探開始：載入詳情頁（改點播放器） ${item.detailUrl}")
-                        wv.loadUrl(item.detailUrl)
+                        item.detailUrl
                     } else {
                         val embedUrl = embeds[0].second
                         loadedEmbed = true
                         sniffEmbedUrl = embedUrl
                         traceJavhd(sessionId, "嗅探觸發：載入嵌頁 ${embedUrl.take(120)}")
-                        // WebView's own main-frame request to video1 can reset even
-                        // though SearchHttpFetcher can fetch it.
-                        // Load that exact response under the signed embed origin so its
-                        // original scripts and relative player requests still run here.
-                        SearchScheduler.workers.execute {
-                            val site = sites.firstOrNull { it.id == item.siteId }
-                            val embed = try {
-                                site?.let {
-                                    SearchHttpFetcher().fetch(embedUrl, SearchCancellation(), it)
-                                }
-                            } catch (e: Exception) {
-                                null
-                            }
-                            handler.post {
-                                if (done) return@post
-                                if (embed != null && embed.transportError == null &&
-                                    embed.statusCode in 200..299 && embed.body.isNotBlank()
-                                ) {
-                                    val baseUrl = embed.finalUrl.ifBlank { embedUrl }
-                                    traceJavhd(
-                                        sessionId,
-                                        "嗅探嵌頁預載：HTTP ${embed.statusCode}，${embed.body.length}字節；交由 WebView 執行原頁腳本",
-                                    )
-                                    wv.loadDataWithBaseURL(baseUrl, embed.body, "text/html", "utf-8", baseUrl)
-                                } else {
-                                    val reason = embed?.transportError
-                                        ?: "HTTP ${embed?.statusCode ?: 0} 或空回應"
-                                    traceJavhd(sessionId, "嗅探嵌頁預載失敗（$reason），回退 WebView 直載")
-                                    wv.loadUrl(embedUrl)
-                                }
-                            }
+                        embedUrl
+                    }
+                    // Ad blocking is the extension's job now (same 11
+                    // hosts, webRequest listener — tsyndicate/VAST
+                    // never blocked). The observer can only attach once
+                    // the session exists (onReady), so a video request
+                    // in the first instants of the load can be missed —
+                    // the pre-roll/feature requests this sniff waits for
+                    // come seconds later (after the click/skip).
+                    JavhdGeckoExtension.ensureInstalled(this)
+                    pageStarted = true
+                    traceJavhd(sessionId, "嗅探頁面開始加載：${targetUrl.take(100)}")
+                    GeckoHeadless.loadSession(this, targetUrl, timeoutMs = 45_000L) { loaded ->
+                        if (done) return@loadSession
+                        if (loaded == null) {
+                            lastLoadError = "頁面載入失敗（逾時或連線失敗）"
+                            traceJavhd(sessionId, "嗅探頁面錯誤：$lastLoadError")
+                            finish()
+                            return@loadSession
                         }
+                        hiddenSession = loaded
+                        // onReady is the page-loaded signal (replaces
+                        // onPageFinished): the 2s delayed trigger below
+                        // is unchanged.
+                        if (setupDone) return@loadSession
+                        setupDone = true
+                        pageFinished = true
+                        traceJavhd(sessionId, "嗅探頁面完成加載")
+                        JavhdGeckoExtension.attachMediaSniffer(loaded) { reqUrl ->
+                            onMediaCandidate(reqUrl)
+                        }
+                        handler.postDelayed({
+                            if (done) return@postDelayed
+                            if (foundUrls.isEmpty()) {
+                                clickPlayer()
+                                // One retry: the first click is sometimes a no-op.
+                                clickRunnable = Runnable {
+                                    if (!done && foundUrls.isEmpty()) clickPlayer()
+                                }
+                                handler.postDelayed(clickRunnable!!, 8000)
+                                // The VAST pre-roll must load and show its
+                                // Skip button — start polling for it once
+                                // playback is triggered; skipAd re-polls
+                                // itself until the feature URL arrives.
+                                handler.postDelayed({ if (!done) skipAd() }, 5000)
+                            } else {
+                                scheduleFinish()
+                            }
+                        }, 2000)
                     }
                     handler.postDelayed(timeoutRunnable, 45000)
                 },
@@ -1075,7 +1016,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         timeoutMs: Long = 75000,
     ) {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        var hiddenWebView: android.webkit.WebView? = null
+        var hiddenSession: GeckoSession? = null
+        // Generation guard for evalJs: bumping this drops callbacks
+        // from a session that has already been replaced (setupCastPage
+        // / setupEmbedPage swap sessions; the old one's pending evals
+        // must not feed the new round). WebView.destroy() used to
+        // cancel them.
+        var evalGen = 0
         var done = false
         val foundParts = LinkedHashMap<Int, String>()
         var partLabels: List<String> = emptyList()
@@ -1122,8 +1069,9 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             if (done) return
             done = true
             handler.removeCallbacks(timeoutRunnable)
-            hiddenWebView?.destroy()
-            hiddenWebView = null
+            evalGen++
+            hiddenSession?.let { runCatching { it.close() } }
+            hiddenSession = null
             if (onEmbed != null) {
                 // Embed-only mode (sniff trigger): the
                 // direct-extraction callback and picker are not used.
@@ -1208,20 +1156,29 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             }
         }
 
-        /** One-shot JS eval on the hidden WebView; result is the raw
-         * evaluateJavascript string (JSON-quoted). Never throws. */
-        fun evalJs(js: String, cb: (String?) -> Unit) {
+        /** One-shot JS eval on the hidden Gecko session; result is the
+         * raw GeckoEval string (JSON-quoted, same as evaluateJavascript).
+         * Never throws. `timeoutMs` is 10s by default; the bundled
+         * script injections pass 30s (a cold Gecko eval of ~90KB of
+         * jQuery must not be cut off). */
+        fun evalJs(js: String, cb: (String?) -> Unit, timeoutMs: Long = 10_000L) {
             if (done) return
+            val gen = evalGen
+            val session = hiddenSession
+            if (session == null) {
+                cb(null)
+                return
+            }
             try {
-                hiddenWebView?.evaluateJavascript(js) { value ->
-                    if (!done) cb(value)
-                } ?: cb(null)
+                GeckoEval.evaluate(session, js, timeoutMs) { value ->
+                    if (!done && gen == evalGen) cb(value)
+                }
             } catch (e: Exception) {
                 cb(null)
             }
         }
 
-        /** Unquote an evaluateJavascript string result (JSON string). */
+        /** Unquote a GeckoEval string result (JSON string). */
         fun unquoteJs(value: String?): String? {
             val raw = value?.trim().orEmpty()
             if (raw.isEmpty() || raw == "null") return null
@@ -1342,8 +1299,9 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     }
                     done = true
                     handler.removeCallbacks(timeoutRunnable)
-                    hiddenWebView?.destroy()
-                    hiddenWebView = null
+                    evalGen++
+                    hiddenSession?.let { runCatching { it.close() } }
+                    hiddenSession = null
                     if (embeds.isEmpty()) {
                         onEmbed(null, lastPartFailReason ?: "api/play 未回嵌頁")
                     } else {
@@ -1539,41 +1497,55 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
 
         fetchEmbedFn = ::fetchEmbedAndDecode
 
-        /** Reuse the hidden WebView for the embed stage: fresh blank
-         * page holding only the jwplayer div, then the embed driver
+        /** Reuse the hidden session for the embed stage: a fresh
+         * session holding only the jwplayer div, then the embed driver
          * and the bundled embed main.js. The cast page is no longer
-         * needed (all sources were collected up front). */
+         * needed (all sources were collected up front), so the old
+         * session is closed first — same effect as navigating the
+         * WebView to the embed page. */
         fun setupEmbedPage(partIdx: Int, embedUrl: String, config: String) {
             if (done) return
             val pageHtml = "<html><head></head><body><div id=\"jwplayer\" data-config=\"$config\"></div></body></html>"
-            val client = object : android.webkit.WebViewClient() {
-                override fun shouldInterceptRequest(
-                    view: android.webkit.WebView?,
-                    request: android.webkit.WebResourceRequest?,
-                ): android.webkit.WebResourceResponse? {
-                    return android.webkit.WebResourceResponse("text/plain", "utf-8", java.io.ByteArrayInputStream(ByteArray(0)))
+            // Gecko: no loadDataWithBaseURL in the shared API. The
+            // minimal page carries its data inline (data-config), so it
+            // is loaded as a data: URL. document.baseURI becomes the
+            // data: URL, not the embed URL — the bundled embed script
+            // decodes the inline config and does not read location
+            // (verify on-device: a Part that decodes here proves it).
+            val dataUrl = "data:text/html;base64," +
+                android.util.Base64.encodeToString(pageHtml.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+            evalGen++
+            hiddenSession?.let { runCatching { it.close() } }
+            hiddenSession = null
+            GeckoHeadless.loadSession(this, dataUrl, timeoutMs = 30_000L) { loaded ->
+                if (done) return@loadSession
+                if (loaded == null) {
+                    lastPartFailReason = "嵌頁沙盒載入失敗"
+                    decodePart(partIdx + 1)
+                    return@loadSession
                 }
-
-                override fun shouldOverrideUrlLoading(
-                    view: android.webkit.WebView?,
-                    request: android.webkit.WebResourceRequest?,
-                ): Boolean = true
-
-                override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
-                    super.onPageFinished(view, url)
-                    if (done) return
-                    val driver = driverEmbedJs
-                    val main = embedMainJs
-                    if (driver == null || main == null) {
-                        fail("直取失敗：內置腳本缺失")
-                        return
+                hiddenSession = loaded
+                val driver = driverEmbedJs
+                val main = embedMainJs
+                if (driver == null || main == null) {
+                    fail("直取失敗：內置腳本缺失")
+                    return@loadSession
+                }
+                // Wait for the data: document to be parsed (onReady may
+                // fire when the session opens, before load finishes).
+                pollJs("document.getElementById('jwplayer') ? 'ready' : ''", 10000) { ready ->
+                    if (done) return@pollJs
+                    if (ready.isNullOrEmpty()) {
+                        lastPartFailReason = "嵌頁沙盒未就緒"
+                        decodePart(partIdx + 1)
+                        return@pollJs
                     }
-                    evalJs(driver) {
-                        evalJs(main) {
+                    evalJs(driver, timeoutMs = 30_000L) {
+                        evalJs(main, timeoutMs = 30_000L) {
                             pollJs("window.__jwSetup ? window.__jwSetup : ''", 10000) { setup ->
                                 if (done) return@pollJs
                                 // setup is already unquoted by pollJs
-                                // (it unquotes the evaluateJavascript
+                                // (it unquotes the GeckoEval
                                 // result once). Do NOT unquote it again:
                                 // unquoteJs on a JSON object string
                                 // returns null (JSONTokener yields a
@@ -1622,8 +1594,6 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     }
                 }
             }
-            hiddenWebView?.webViewClient = client
-            hiddenWebView?.loadDataWithBaseURL(embedUrl, pageHtml, "text/html", "utf-8", null)
         }
 
         setupEmbedFn = ::setupEmbedPage
@@ -1631,10 +1601,33 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         /** Strip the page's own scripts: the bundled cast.js is the
          * only script the sandbox runs. Theme/ad/analytics scripts are
          * removed so they cannot run, rewrite the DOM, or phone home;
-         * the static DOM they would have read stays intact. */
+         * the static DOM they would have read stays intact.
+         * (Iframe/video sources are neutralised as well — see the
+         * inline comments — because Gecko cannot intercept requests.) */
         fun stripScripts(html: String): String {
             return html.replace(Regex("(?is)<script\\b[^>]*>.*?</script>"), "")
                 .replace(Regex("(?is)<script\\b[^>]*/>"), "")
+                // Gecko sandbox: there is no shouldInterceptRequest in
+                // the shared API, so loads the page itself could start
+                // are neutralised in the HTML. <iframe
+                // id="playeriframe"> must STAY (cast.js reads it) —
+                // only its src/srcdoc are removed, so it loads nothing
+                // and cannot navigate the sandbox away.
+                .replace(Regex("(?is)<iframe\\b([^>]*)>")) { m ->
+                    "<iframe" + m.groupValues[1]
+                        .replace(Regex("(?i)\\s+src\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)"), "")
+                        .replace(Regex("(?i)\\s+srcdoc\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)"), "") + ">"
+                }
+                // <video>/<audio>/<source> keep their elements (cast.js
+                // reads the player area) but lose their src, so nothing
+                // autoplays or downloads in the sandbox. Images and
+                // stylesheets still load (they cannot run scripts).
+                .replace(Regex("(?is)<(video|audio|source)\\b([^>]*)>")) { m ->
+                    "<" + m.groupValues[1] + m.groupValues[2]
+                        .replace(Regex("(?i)\\s+src\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)"), "") + ">"
+                }
+                // A refresh meta would navigate the sandbox session away.
+                .replace(Regex("(?is)<meta\\b[^>]*http-equiv\\s*=\\s*[\"']?refresh[\"']?[^>]*>"), "")
         }
 
         /** Trigger every Part's click on the cast page and collect the
@@ -1704,44 +1697,50 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
          * hand-built blank: cast.js reads elements the blank page did
          * not have (video-player-area, video-player, playeriframe) and
          * throws at load when they are missing, so no handler is ever
-         * registered. The WebView is a pure JS sandbox — every network
-         * request is blocked; the app does all network natively. */
+         * registered. The Gecko session is a pure JS sandbox — scripts
+         * are stripped and iframe/video sources neutralised in
+         * stripScripts (there is no shouldInterceptRequest in the
+         * shared Gecko API); the app does all network natively. */
         fun setupCastPage() {
             if (done) return
-            val wv = android.webkit.WebView(this)
-            hiddenWebView = wv
-            wv.settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-                cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
-            }
-            wv.webViewClient = object : android.webkit.WebViewClient() {
-                override fun shouldInterceptRequest(
-                    view: android.webkit.WebView?,
-                    request: android.webkit.WebResourceRequest?,
-                ): android.webkit.WebResourceResponse? {
-                    return android.webkit.WebResourceResponse("text/plain", "utf-8", java.io.ByteArrayInputStream(ByteArray(0)))
+            // Sandbox: the page is loaded as a data: URL — the shared
+            // GeckoHeadless API takes a URL, and GeckoSession has no
+            // loadDataWithBaseURL, so document.baseURI becomes the
+            // data: URL, not the detail URL. cast.js reads `location`
+            // in two obfuscated spots and jQuery resolves ajax URLs
+            // against location.href — verify on-device that Part
+            // triggering still works (see NOTES.md); if it does not,
+            // the infra API needs a loadData-with-base equivalent.
+            val dataUrl = "data:text/html;base64," +
+                android.util.Base64.encodeToString(detailHtml.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+            evalGen++
+            hiddenSession?.let { runCatching { it.close() } }
+            hiddenSession = null
+            GeckoHeadless.loadSession(this, dataUrl, timeoutMs = 30_000L) { loaded ->
+                if (done) return@loadSession
+                if (loaded == null) {
+                    fail("直取失敗：沙盒頁載入失敗")
+                    return@loadSession
                 }
-
-                override fun shouldOverrideUrlLoading(
-                    view: android.webkit.WebView?,
-                    request: android.webkit.WebResourceRequest?,
-                ): Boolean = true
-
-                override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
-                    super.onPageFinished(view, url)
-                    if (done) return
-                    val jquery = jqueryJs
-                    val driver = driverCastJs
-                    val cast = castJs
-                    if (jquery == null || driver == null || cast == null) {
-                        fail("直取失敗：內置腳本缺失")
-                        return
+                hiddenSession = loaded
+                val jquery = jqueryJs
+                val driver = driverCastJs
+                val cast = castJs
+                if (jquery == null || driver == null || cast == null) {
+                    fail("直取失敗：內置腳本缺失")
+                    return@loadSession
+                }
+                // Wait for the data: document to be parsed (onReady may
+                // fire when the session opens, before load finishes).
+                pollJs("document.readyState === 'complete' ? 'ready' : ''", 10000) { ready ->
+                    if (done) return@pollJs
+                    if (ready.isNullOrEmpty()) {
+                        fail("直取失敗：沙盒頁未就緒")
+                        return@pollJs
                     }
-                    evalJs(jquery) {
-                        evalJs(driver) {
-                            evalJs(cast) {
+                    evalJs(jquery, timeoutMs = 30_000L) {
+                        evalJs(driver, timeoutMs = 30_000L) {
+                            evalJs(cast, timeoutMs = 30_000L) {
                                 // Probe what the sandbox actually holds
                                 // before triggering: jQuery present?
                                 // how many click handlers registered on
@@ -1771,7 +1770,6 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     }
                 }
             }
-            wv.loadDataWithBaseURL(item.detailUrl, detailHtml, "text/html", "utf-8", null)
         }
 
         // Step 1 (worker): read the bundled site scripts, then fetch
@@ -1838,14 +1836,14 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 handler.post {
                     if (done) return@post
                     // Fresh attempt: drop the previous round's
-                    // per-Part captures and its cast WebView so the
+                    // per-Part captures and its cast session so the
                     // new token's sources do not mix with the old.
                     if (detailRefetchCount > 0) {
                         apiPlayDataByPart.clear()
                         apiPlayIndexByPart.clear()
                         embedUrlByPart.clear()
-                        try { hiddenWebView?.destroy() } catch (_: Exception) { }
-                        hiddenWebView = null
+                        // The old cast session is closed by setupCastPage
+                        // below when it opens the new one.
                     }
                     tokens = pairs.map { it.first }
                     partLabels = pairs.mapIndexed { i, (_, label) ->
@@ -1865,7 +1863,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         fetchDetailAndSetupCast()
     }
 
-    /** Hidden-WebView click path (live site JS): fallback when the
+    /** Hidden-session click path (live site JS): fallback when the
      * direct extraction chain fails, e.g. the bundled site JS goes
      * stale. Kept intact; tryResolveJavhdRealUrl is the primary
      * direct chain. */
@@ -1876,9 +1874,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         callback: (List<Pair<String, String>>?) -> Unit,
     ) {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        var hiddenWebView: android.webkit.WebView? = null
+        var hiddenSession: GeckoSession? = null
         var done = false
-        var chasedEmbed = false
         var setupDone = false
         var partLabels: List<String> = emptyList()
         var partIdx = 0
@@ -1893,7 +1890,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // the video.javhdporn.net/p/ iframe was requested; mediaHosts =
         // every host that served a .mp4/.m3u8/.ts (matched or not — a
         // file from an unexpected host shows up here, not in silence).
-        // pageStarted/maxProgress/lastLoadError pin a stalled load:
+        // pageStarted/lastLoadError pin a stalled load:
         // started-but-never-finished with a progress % and the last
         // error is a very different failure from never-started.
         // jQueryLoaded/domAfterClick/lastClickedPart separate "the
@@ -1901,7 +1898,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // the click) from "the embed request failed".
         var pageFinished = false
         var pageStarted = false
-        var maxProgress = 0
+        // No progress signal in the shared headless API (no
+        // WebChromeClient): failure text no longer carries a progress %.
         var lastLoadError: String? = null
         var jQueryLoaded: Boolean? = null
         var domAfterClick: String? = null
@@ -1910,8 +1908,8 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         val mediaHosts = LinkedHashSet<String>()
         val pageSlug = item.detailUrl.trimEnd('/').substringAfterLast('/')
 
-        // Ad hosts (see javhdAdHosts) are blocked outright in this
-        // hidden WebView so the resolve never runs any of them.
+        // Ad hosts (see javhdAdHosts) are blocked outright by the javhd
+        // extension, so the resolve never runs any of them.
 
         /** Step-level failure reason for the 播放數據 screen. Never throws. */
         fun javhdFailReason(): String {
@@ -1925,12 +1923,12 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             val dom = domAfterClick?.let { "；點擊後$it" } ?: ""
             return when {
                 !pageStarted -> "javhd解析失敗 [$pageSlug]：頁面未開始加載"
-                !pageFinished -> "javhd解析失敗 [$pageSlug]：頁面未完成加載（進度$maxProgress%" +
+                !pageFinished -> "javhd解析失敗 [$pageSlug]：頁面未完成加載" +
                     (lastLoadError?.let { "，$it" } ?: "") + ")"
                 partLabels.isEmpty() -> "javhd解析失敗 [$pageSlug]：頁面已載、無Server連結；媒體host=$media$err$jq"
                 !embedSeen -> "javhd解析失敗 [$pageSlug]：srv=${partLabels.size} " +
                     (if (lastClickedPart > 0) "已點Part$lastClickedPart、" else "") +
-                    "嵌頁未載入；媒體host=$media$jq$dom$err"
+                    "嵌頁請求未觀測到（Gecko 擴展只回報視頻文件）；媒體host=$media$jq$dom$err"
                 else -> "javhd解析失敗 [$pageSlug]：srv=${partLabels.size} 嵌頁已載、未見文件；媒體host=$media$err"
             }
         }
@@ -1940,8 +1938,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             done = true
             handler.removeCallbacks(timeoutRunnable)
             checker?.let { handler.removeCallbacks(it) }
-            hiddenWebView?.destroy()
-            hiddenWebView = null
+            hiddenSession?.let { s ->
+                JavhdGeckoExtension.detachMediaSniffer(s)
+                runCatching { s.close() }
+            }
+            hiddenSession = null
             val result = if (foundParts.isEmpty()) null else foundParts.entries.map { (i, url) ->
                 val label = if (i in partLabels.indices) partLabels[i] else ""
                 label to url
@@ -1970,12 +1971,12 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             partClicks++
             lastClickedPart = i + 1
             traceJavhd(sessionId, "點擊 Part${i + 1}（第 $partClicks 次）")
-            hiddenWebView?.evaluateJavascript(
-                "(function(){var a=document.querySelectorAll('a.srv');" +
-                    "if(a.length>" + i + "){a[" + i + "].click();return 'clicked';}" +
-                    "return 'no-srv';})();",
-                null,
-            )
+            hiddenSession?.let {
+                GeckoEval.runJavascript(it,
+                    "(function(){var a=document.querySelectorAll('a.srv');" +
+                        "if(a.length>" + i + "){a[" + i + "].click();return 'clicked';}" +
+                        "return 'no-srv';})();")
+            }
         }
 
         /** Before giving up, look at the DOM once: an embed iframe in
@@ -1984,28 +1985,36 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
          * means the handler never ran. The 75s timeout still calls
          * finish() directly if this probe never returns. */
         fun finishWithDomProbe() {
-            hiddenWebView?.evaluateJavascript(
+            val session = hiddenSession
+            if (session == null) {
+                if (!done) finish()
+                return
+            }
+            GeckoEval.evaluate(session,
                 "(function(){var f=document.querySelectorAll('iframe').length;" +
                     "var e=document.querySelector('iframe[src*=\"video.javhdporn.net\"]');" +
                     "return 'iframes='+f+'|'+(e?'embed':'no-embed');})();",
             ) { value ->
                 val s = value?.trim()?.removeSurrounding("\"").orEmpty()
-                if (s.isNotEmpty() && s != "null") domAfterClick = s
+                if (s.isNotEmpty() && s != "null") {
+                    domAfterClick = s
+                    if (s.endsWith("|embed")) embedSeen = true
+                }
                 traceJavhd(sessionId, "DOM 探針：$domAfterClick")
                 if (!done) finish()
             }
         }
 
         fun clickLegacyPlay() {
-            hiddenWebView?.evaluateJavascript(
-                "(function(){" +
-                    "var s=['#overlay','#mainvideo','video','[id*=\"play\"]','[class*=\"play\"]','[class*=\"btn\"]'];" +
-                    "for(var i=0;i<s.length;i++){" +
-                    "var el=document.querySelector(s[i]);" +
-                    "if(el){el.click();return 'clicked:'+s[i];}}" +
-                    "return 'no element found';})();",
-                null,
-            )
+            hiddenSession?.let {
+                GeckoEval.runJavascript(it,
+                    "(function(){" +
+                        "var s=['#overlay','#mainvideo','video','[id*=\"play\"]','[class*=\"play\"]','[class*=\"btn\"]'];" +
+                        "for(var i=0;i<s.length;i++){" +
+                        "var el=document.querySelector(s[i]);" +
+                        "if(el){el.click();return 'clicked:'+s[i];}}" +
+                        "return 'no element found';})();")
+            }
         }
 
         fun parseSrvLabels(value: String?): List<String> {
@@ -2021,12 +2030,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         }
 
         fun listSrv(attempt: Int) {
-            hiddenWebView?.evaluateJavascript(
+            val session = hiddenSession ?: return
+            GeckoEval.evaluate(session,
                 "(function(){var a=document.querySelectorAll('a.srv');var out=[];" +
                     "for(var i=0;i<a.length;i++){out.push((a[i].textContent||'').trim()||('Part'+(i+1)));}" +
                     "return JSON.stringify(out);})();"
             ) { value ->
-                if (done) return@evaluateJavascript
+                if (done) return@evaluate
                 partLabels = parseSrvLabels(value)
                 if (partLabels.isEmpty()) {
                     // No Server links yet — the page may still be
@@ -2046,7 +2056,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     // ajax.googleapis.com). If jQuery never loaded, the
                     // clicks are dead on arrival — that is a different
                     // failure from a dead embed request.
-                    hiddenWebView?.evaluateJavascript(
+                    GeckoEval.evaluate(session,
                         "(function(){return (typeof jQuery!=='undefined')?'jq-yes':'jq-no';})();",
                     ) { value ->
                         val s = value?.trim()?.removeSurrounding("\"").orEmpty()
@@ -2059,9 +2069,65 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             }
         }
 
+        /** One media URL reported by the extension's webRequest
+         * observer. Differences from the old shouldInterceptRequest:
+         * - Ad hosts are already blocked by the extension (same 11);
+         *   only non-ad .m3u8/.mp4 arrive here, so the ad branch and
+         *   the .ts media-host recording are gone.
+         * - The embed-page request (video.javhdporn.net/p/) is a page
+         *   load, not a video file — the observer never reports it, so
+         *   embedSeen is probed from the DOM instead (probeEmbed).
+         * - A captured file is NOT blocked any more (the extension has
+         *   no per-URL response blocking): the hidden session's player
+         *   downloads it instead of getting an empty response.
+         * - The streamtape /e/ chase is dropped: a page navigation is
+         *   not a video file, so the observer never reports it. The
+         *   /e/ page's own player still requests the file, which IS
+         *   reported, so the file is still caught.
+         * The extension posts candidate callbacks on the main thread,
+         * so no handler.post hop is needed (the old interceptor ran
+         * off-thread). */
+        fun onMediaRequest(reqUrl: String) {
+            if (done) return
+            try {
+                val h = java.net.URL(reqUrl).host
+                if (mediaHosts.add(h)) traceJavhd(sessionId, "媒體請求：$h")
+            } catch (e: Exception) { }
+            val isReal = (reqUrl.contains("streamtape") && reqUrl.contains("get_video")) ||
+                (reqUrl.contains("tapecontent") &&
+                    (reqUrl.contains(".mp4") || reqUrl.contains(".ts") || reqUrl.contains("m3u8"))) ||
+                (reqUrl.contains("vdcdn.xyz") &&
+                    (reqUrl.contains(".mp4") || reqUrl.contains("m3u8"))) ||
+                // The file host is geo-selected (us-a2 in the
+                // sandbox run); any /file.mp4 is the JWPlayer
+                // file, whatever region host serves it.
+                reqUrl.contains("/file.mp4")
+            if (isReal && !done) {
+                val key = if (partLabels.isEmpty()) -1 else partIdx
+                if (!foundParts.containsKey(key)) {
+                    foundParts[key] = reqUrl
+                    traceJavhd(sessionId, "直鏈請求：${reqUrl.take(120)}")
+                }
+            }
+        }
+
+        // The extension sniffer reports video files only, so the embed
+        // iframe is probed from the DOM instead (same query the old
+        // shouldInterceptRequest answered from the request stream).
+        fun probeEmbed() {
+            if (done || embedSeen) return
+            val session = hiddenSession ?: return
+            GeckoEval.evaluate(session,
+                "(function(){var e=document.querySelector('iframe[src*=\"video.javhdporn.net\"]');return e?'embed':'no-embed';})();"
+            ) { value ->
+                if (value?.trim()?.removeSurrounding("\"") == "embed") embedSeen = true
+            }
+        }
+
         checker = object : Runnable {
             override fun run() {
                 if (done) return
+                probeEmbed()
                 if (partLabels.isEmpty()) {
                     // Legacy video (no Server links): the single play
                     // click was already sent; the 20s cutoff ends it.
@@ -2106,127 +2172,35 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
 
         timeoutRunnable = Runnable { finish() }
         handler.post {
-            val wv = android.webkit.WebView(this)
-            hiddenWebView = wv
-            wv.settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-                mediaPlaybackRequiresUserGesture = false
-                // Never serve this page from cache: a page that once failed
-                // sticks dead in the shared WebView cache (known app
-                // behaviour — only clearing the app cache revives it), and
-                // a dead cached page has no Server links to click. The
-                // resolver must always see the live page.
-                cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
-            }
-            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
-            wv.webChromeClient = object : android.webkit.WebChromeClient() {
-                override fun onProgressChanged(view: android.webkit.WebView?, newProgress: Int) {
-                    if (newProgress > maxProgress) maxProgress = newProgress
-                }
-            }
-            wv.webViewClient = object : android.webkit.WebViewClient() {
-                override fun shouldInterceptRequest(
-                    view: android.webkit.WebView?,
-                    request: android.webkit.WebResourceRequest?
-                ): android.webkit.WebResourceResponse? {
-                    val reqUrl = request?.url?.toString() ?: return null
-                    if (javhdAdHosts.any { reqUrl.contains(it) }) {
-                        return android.webkit.WebResourceResponse("text/plain", "utf-8",
-                            java.io.ByteArrayInputStream(ByteArray(0)))
-                    }
-                    if (reqUrl.contains("video.javhdporn.net/p/")) {
-                        if (!embedSeen) {
-                            embedSeen = true
-                            traceJavhd(sessionId, "嵌頁請求：${reqUrl.take(100)}")
-                        } else {
-                            embedSeen = true
-                        }
-                    }
-                    if (reqUrl.contains(".mp4") || reqUrl.contains(".m3u8") || reqUrl.contains(".ts")) {
-                        try {
-                            val h = java.net.URL(reqUrl).host
-                            if (mediaHosts.add(h)) traceJavhd(sessionId, "媒體請求：$h")
-                        } catch (e: Exception) { }
-                    }
-                    val isReal = (reqUrl.contains("streamtape") && reqUrl.contains("get_video")) ||
-                        (reqUrl.contains("tapecontent") &&
-                            (reqUrl.contains(".mp4") || reqUrl.contains(".ts") || reqUrl.contains("m3u8"))) ||
-                        (reqUrl.contains("vdcdn.xyz") &&
-                            (reqUrl.contains(".mp4") || reqUrl.contains("m3u8"))) ||
-                        // The file host is geo-selected (us-a2 in the
-                        // sandbox run); any /file.mp4 is the JWPlayer
-                        // file, whatever region host serves it.
-                        reqUrl.contains("/file.mp4")
-                    if (isReal) {
-                        handler.post {
-                            if (!done) {
-                                val key = if (partLabels.isEmpty()) -1 else partIdx
-                                if (!foundParts.containsKey(key)) {
-                                    foundParts[key] = reqUrl
-                                    traceJavhd(sessionId, "直鏈請求：${reqUrl.take(120)}")
-                                }
-                            }
-                        }
-                        return android.webkit.WebResourceResponse("text/plain", "utf-8",
-                            java.io.ByteArrayInputStream(ByteArray(0)))
-                    }
-                    if (!chasedEmbed && reqUrl.contains("streamtape") && reqUrl.contains("/e/")) {
-                        chasedEmbed = true
-                        traceJavhd(sessionId, "跳轉 streamtape：${reqUrl.take(100)}")
-                        handler.post { hiddenWebView?.loadUrl(reqUrl) }
-                        return android.webkit.WebResourceResponse("text/plain", "utf-8",
-                            java.io.ByteArrayInputStream(ByteArray(0)))
-                    }
-                    // GeckoView 遷移後：ECH 攔截已刪，這個隱藏 WebView
-                    // 走明文載入（見 docs/geckoview-migration.md）。
-                    return null
-                }
-
-                override fun onPageStarted(view: android.webkit.WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                    super.onPageStarted(view, url, favicon)
-                    if (!pageStarted) traceJavhd(sessionId, "頁面開始加載：${url?.take(100)}")
-                    pageStarted = true
-                }
-
-                override fun onReceivedError(
-                    view: android.webkit.WebView?,
-                    request: android.webkit.WebResourceRequest?,
-                    error: android.webkit.WebResourceError?,
-                ) {
-                    super.onReceivedError(view, request, error)
-                    if (lastLoadError == null && error != null) {
-                        lastLoadError = "錯誤 ${request?.url?.host ?: "?"} ${error.errorCode} ${error.description}"
-                        traceJavhd(sessionId, "頁面錯誤：$lastLoadError")
-                    }
-                }
-
-                override fun onReceivedHttpError(
-                    view: android.webkit.WebView?,
-                    request: android.webkit.WebResourceRequest?,
-                    errorResponse: android.webkit.WebResourceResponse?,
-                ) {
-                    super.onReceivedHttpError(view, request, errorResponse)
-                    if (lastLoadError == null && errorResponse != null) {
-                        lastLoadError = "HTTP ${errorResponse.statusCode} ${request?.url?.host ?: "?"}"
-                        traceJavhd(sessionId, "頁面錯誤：$lastLoadError")
-                    }
-                }
-
-                override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
-                    super.onPageFinished(view, url)
-                    if (setupDone || done) return
-                    setupDone = true
-                    pageFinished = true
-                    traceJavhd(sessionId, "頁面完成加載（進度 $maxProgress%）")
-                    handler.postDelayed({
-                        if (!done) listSrv(0)
-                    }, 2000)
-                }
-            }
-            wv.loadUrl(item.detailUrl)
+            // Gecko: observation moves to the extension's webRequest
+            // observer (same 11 ad hosts blocked there; tsyndicate/VAST
+            // never blocked). Video bytes can no longer be blocked per
+            // URL — a captured file now downloads/plays in the hidden
+            // session instead of getting an empty response — but capture
+            // itself works the same (see onMediaRequest).
+            JavhdGeckoExtension.ensureInstalled(this)
             traceJavhd(sessionId, "點擊開始：載入 ${item.detailUrl}")
+            GeckoHeadless.loadSession(this, item.detailUrl, timeoutMs = 75_000L) { loaded ->
+                if (done) return@loadSession
+                if (loaded == null) {
+                    lastLoadError = "頁面載入失敗（逾時或連線失敗）"
+                    traceJavhd(sessionId, "頁面錯誤：$lastLoadError")
+                    finish()
+                    return@loadSession
+                }
+                hiddenSession = loaded
+                pageStarted = true
+                if (setupDone) return@loadSession
+                setupDone = true
+                pageFinished = true
+                traceJavhd(sessionId, "頁面完成加載")
+                JavhdGeckoExtension.attachMediaSniffer(loaded) { reqUrl ->
+                    onMediaRequest(reqUrl)
+                }
+                handler.postDelayed({
+                    if (!done) listSrv(0)
+                }, 2000)
+            }
             handler.postDelayed(timeoutRunnable, 75000)
         }
     }
@@ -2266,7 +2240,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         choiceLauncher.launch(VideoChoiceActivity.intent(this, item, candidates, sessionId, ads))
     }
 
-    /** Returns sniffed candidates (proven <60s m3u8 ads excluded), or empty to fall back to WebView. Never throws. */
+    /** Returns sniffed candidates (proven <60s m3u8 ads excluded), or empty to fall back to the browser. Never throws. */
     /**
      * Resolves HentaiMama's real file without ever running the player's
      * VAST ad: episode page -> post id -> admin-ajax POST
@@ -2274,7 +2248,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
      * (gdvid.info mp4). The ad domains (twinrdengine/marzaent/sacdnssedge)
      * only appear in the advertising block, which this path never executes.
      * Callback on the UI thread with the direct URL, or null on any failure
-     * — the caller then falls back to WebView. Never throws.
+     * — the caller then falls back to the browser. Never throws.
      */
     private fun tryResolveHentaiMamaRealUrl(item: SearchItem, sessionId: Long, callback: (String?) -> Unit) {
         SearchScheduler.workers.execute {
@@ -2286,24 +2260,24 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             }
             // Fast path failed — usually the admin-ajax POST is CF-challenged
             // on-device (the sandbox POST works because it comes from a
-            // foreign IP). Retry through a hidden WebView, which passes CF
+            // foreign IP). Retry through a hidden Gecko session, which passes CF
             // challenges exactly like a browser.
-            runOnUiThread { tryResolveHentaiMamaViaWebView(item, sessionId, callback) }
+            runOnUiThread { tryResolveHentaiMamaViaGecko(item, sessionId, callback) }
         }
     }
 
     /**
-     * Resolves HentaiMama's real file through a hidden WebView: load the
+     * Resolves HentaiMama's real file through a hidden Gecko session: load the
      * episode page (CF clearance happens like a browser), click the mirror
      * tab so the page itself runs get_player_contents, read the injected
      * dt_embed iframe src, then fetch the embed page and parse
      * the JWPlayer file. Callback on the UI thread with the URL, or null
-     * on timeout (15s) / failure — the caller then falls back to WebView.
+     * on timeout (15s) / failure — the caller then falls back to the browser.
      * Never throws.
      */
-    private fun tryResolveHentaiMamaViaWebView(item: SearchItem, sessionId: Long, callback: (String?) -> Unit) {
+    private fun tryResolveHentaiMamaViaGecko(item: SearchItem, sessionId: Long, callback: (String?) -> Unit) {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        var hiddenWebView: android.webkit.WebView? = null
+        var hiddenSession: GeckoSession? = null
         var done = false
         var timeoutRunnable: Runnable by kotlin.properties.Delegates.notNull()
         // No-op default: finish() may run before onPageFinished assigns the real poll.
@@ -2313,79 +2287,71 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             done = true
             handler.removeCallbacks(timeoutRunnable)
             handler.removeCallbacks(pollRunnable)
-            hiddenWebView?.destroy()
-            hiddenWebView = null
+            hiddenSession?.let { runCatching { it.close() } }
+            hiddenSession = null
             if (url != null) {
                 PlaybackDataStore.addCandidates(sessionId, listOf(resolverRecord(url, "resolver-hentaimama-webview")))
             } else {
-                PlaybackDataStore.recordFail(sessionId, "hentaimama解析失敗（ajax與WebView皆失敗）")
+                PlaybackDataStore.recordFail(sessionId, "hentaimama解析失敗（ajax與Gecko皆失敗）")
             }
             callback(url)
         }
         timeoutRunnable = Runnable { finish(null) }
         handler.post {
-            val wv = android.webkit.WebView(this)
-            hiddenWebView = wv
-            wv.settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-                mediaPlaybackRequiresUserGesture = false
-            }
-            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
-            wv.webViewClient = object : android.webkit.WebViewClient() {
-                override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
-                    super.onPageFinished(view, url)
-                    // Let the page settle, then click the mirror tab so the
-                    // page runs get_player_contents itself.
-                    handler.postDelayed({
-                        if (done) return@postDelayed
-                        view?.evaluateJavascript(
-                            "(function(){var t=document.querySelector('.dt-mi-tabs li a.selected')||document.querySelector('.dt-mi-tabs li a');if(t){t.click();return 'clicked';}return 'no-tab';})();",
-                            null
-                        )
-                    }, 2000)
-                    // Poll for the injected dt_embed iframe: the page
-                    // auto-loads its first mirror, but the AJAX can be
-                    // slow behind a CF challenge — a one-shot read at 5s
-                    // misses it. Poll every second until the 15s timeout.
-                    pollRunnable = Runnable {
-                        if (done) return@Runnable
-                        view?.evaluateJavascript(
-                            "(function(){var f=document.querySelector('iframe[src*=\"dt_embed\"]');return f?f.src:'';})();"
-                        ) { value ->
-                            if (done) return@evaluateJavascript
-                            val embedUrl = value?.removeSurrounding("\"").orEmpty()
-                            if (embedUrl.isBlank() || !embedUrl.contains("dt_embed")) {
-                                handler.postDelayed(pollRunnable, 1000)
-                                return@evaluateJavascript
-                            }
-                            SearchScheduler.workers.execute {
-                                val fileUrl = try {
-                                    val site = sites.firstOrNull { it.id == item.siteId }
-                                    if (site == null) {
+            GeckoHeadless.loadSession(this, item.detailUrl, timeoutMs = 15_000L) { loaded ->
+                if (done) return@loadSession
+                if (loaded == null) {
+                    finish(null)
+                    return@loadSession
+                }
+                hiddenSession = loaded
+                // onReady is the page-loaded signal (replaces
+                // onPageFinished). Same delays as before: click the
+                // mirror tab at 2s, poll the dt_embed iframe from 3s.
+                handler.postDelayed({
+                    if (done) return@postDelayed
+                    GeckoEval.runJavascript(loaded,
+                        "(function(){var t=document.querySelector('.dt-mi-tabs li a.selected')||document.querySelector('.dt-mi-tabs li a');if(t){t.click();return 'clicked';}return 'no-tab';})();")
+                }, 2000)
+                // Poll for the injected dt_embed iframe: the page
+                // auto-loads its first mirror, but the AJAX can be
+                // slow behind a CF challenge — a one-shot read at 5s
+                // misses it. Poll every second until the 15s timeout.
+                pollRunnable = Runnable {
+                    if (done) return@Runnable
+                    GeckoEval.evaluate(loaded,
+                        "(function(){var f=document.querySelector('iframe[src*=\"dt_embed\"]');return f?f.src:'';})();"
+                    ) { value ->
+                        if (done) return@evaluate
+                        val embedUrl = value?.removeSurrounding("\"").orEmpty()
+                        if (embedUrl.isBlank() || !embedUrl.contains("dt_embed")) {
+                            handler.postDelayed(pollRunnable, 1000)
+                            return@evaluate
+                        }
+                        SearchScheduler.workers.execute {
+                            val fileUrl = try {
+                                val site = sites.firstOrNull { it.id == item.siteId }
+                                if (site == null) {
+                                    null
+                                } else {
+                                    val embed = SearchHttpFetcher().fetch(
+                                        embedUrl, SearchCancellation(), site
+                                    )
+                                    if (embed.transportError != null || embed.statusCode !in 200..299 || embed.body.isBlank()) {
                                         null
                                     } else {
-                                        val embed = SearchHttpFetcher().fetch(
-                                            embedUrl, SearchCancellation(), site
-                                        )
-                                        if (embed.transportError != null || embed.statusCode !in 200..299 || embed.body.isBlank()) {
-                                            null
-                                        } else {
-                                            VideoExtractor.extractHentaiMamaVideoFile(embed.body)
-                                        }
+                                        VideoExtractor.extractHentaiMamaVideoFile(embed.body)
                                     }
-                                } catch (e: Exception) {
-                                    null
                                 }
-                                handler.post { finish(fileUrl) }
+                            } catch (e: Exception) {
+                                null
                             }
+                            handler.post { finish(fileUrl) }
                         }
                     }
-                    handler.postDelayed(pollRunnable, 3000)
                 }
+                handler.postDelayed(pollRunnable, 3000)
             }
-            wv.loadUrl(item.detailUrl)
             handler.postDelayed(timeoutRunnable, 15000)
         }
     }
@@ -2415,9 +2381,12 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             val requestBuilder = Request.Builder().url(url)
                 .header("User-Agent", userAgent)
                 .header("Referer", referer)
-            // CF clearance: the app's WebView may already hold __cf_bm for
-            // this host (from browsing the episode page); send it so the
-            // admin-ajax POST is not challenged the way a bare request is.
+            // CF clearance: the OkHttp-side cookie jar
+            // (android.webkit.CookieManager, still shared with
+            // SearchHttpFetcher) may already hold __cf_bm for this host;
+            // send it so the admin-ajax POST is not challenged the way
+            // a bare request is. Gecko page loads use their own cookie
+            // store and do not contribute here (known split, not bridged).
             val cookies = android.webkit.CookieManager.getInstance().getCookie(referer)
                 ?.takeIf { it.isNotEmpty() }
             if (!cookies.isNullOrEmpty()) requestBuilder.header("Cookie", cookies)
@@ -2436,7 +2405,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
 
     /**
      * Returns kept sniffed candidates (proven <60s m3u8 ads excluded), or
-     * empty to fall back to WebView. Every candidate — kept and dropped —
+     * empty to fall back to the browser. Every candidate — kept and dropped —
      * is recorded against the session with its score, source and drop
      * reason, so the analysis can see which signal actually predicted a
      * real play. Never throws. The second list is the folded ads: dropped

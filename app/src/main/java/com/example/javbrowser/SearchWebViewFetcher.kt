@@ -1,22 +1,69 @@
 package com.example.javbrowser
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.webkit.*
+import com.example.javbrowser.gecko.GeckoEval
+import com.example.javbrowser.gecko.GeckoHeadless
 import org.json.JSONObject
 import org.json.JSONTokener
+import org.mozilla.geckoview.GeckoSession
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
-/** No native bridge. One browser per process, released only after main-thread destruction. */
+/**
+ * Rendered search fetch, Gecko headless session edition (2026-11-14,
+ * search-cluster GeckoView migration).
+ *
+ * Same contract as the old WebView edition: fetch a search page with a
+ * real browser engine (JS runs, dynamic results render), poll the DOM
+ * until [SearchDomReadiness] says the result/empty snapshot is stable,
+ * and return the rendered HTML as a [SearchHttpResponse] with
+ * `rendered = true` so [SearchHtmlParser] treats
+ * DYNAMIC_RESULTS_NOT_READY as a timeout, not a parse error.
+ * The caller ([SiteHtmlSearchProvider]) only uses this as the
+ * `browserFallback` render path; the plain-OkHttp fetch stays primary.
+ *
+ * What changed (WebView -> Gecko, only the pipe):
+ * - Loading: [GeckoHeadless.loadSession] (headless GeckoSession, Gecko
+ *   native DoH + ECH) instead of a hidden WebView + loadUrl.
+ * - DOM polling: [GeckoEval.evaluate] with the same script, same 400ms
+ *   cadence, same result semantics (JSON-quoted string, "null" for
+ *   null/undefined, null on timeout/failure) as evaluateJavascript.
+ * - Redirect guard: the old shouldOverrideUrlLoading (block a main-frame
+ *   navigation to a non-allowed host) has no equivalent in the shared
+ *   headless API, so the poll script now also returns `location.href`
+ *   and the Kotlin side finishes 599 UNEXPECTED_REDIRECT_HOST when the
+ *   live URL leaves the site's allowlist (checked every poll, <=400ms
+ *   after the navigation).
+ *
+ * What the shared API cannot express (known loss, see
+ * NOTES.md in the migration folder):
+ * - No HTTP status / headers: no onReceivedHttpError equivalent, so
+ *   `cf-mitigated: challenge`, Cloudflare detection and Retry-After are
+ *   no longer populated (always null/false/0). Challenge pages are still
+ *   caught by the DOM `blocked` check in the poll script and by
+ *   [SearchPageClassifier] on the returned body. A 4xx page that loads
+ *   with content now reports status 200 instead of its real code, and
+ *   one with no matches runs to the full timeout (598) instead of
+ *   finishing early on its status.
+ * - No load-error codes: a failed load surfaces only as
+ *   `onReady(null)` (timeout or failure, indistinguishable) and maps to
+ *   598, where the old code distinguished DNS/CONNECT/TLS/timeout
+ *   (599 + DNS_FAILURE/CONNECT_FAILURE/TLS_FAILURE/HTTP_TIMEOUT).
+ * - No UA override in the shared API: the session runs Gecko's default
+ *   (Firefox) UA, where the old WebView sent
+ *   [SearchHttpFetcher.USER_AGENT] (Pixel 7 Chrome 124).
+ * - Images load (the old WebView had loadsImagesAutomatically=false).
+ * - Cookies: the Gecko session has its own cookie store. It neither
+ *   sends the OkHttp/webview jar's cookies nor contributes any back;
+ *   the task forbids bridging the two stores, so this stays split.
+ */
 class SearchWebViewFetcher(context: Context) {
     private val appContext = context.applicationContext
 
-    @SuppressLint("SetJavaScriptEnabled")
     fun fetchBlocking(url: String, site: SearchSite, rules: SearchParserRules,
                       cancellation: SearchCancellation, timeoutMs: Long = 25_000): SearchHttpResponse {
         cancellation.check()
@@ -25,23 +72,19 @@ class SearchWebViewFetcher(context: Context) {
         val latch = CountDownLatch(1)
         val finished = AtomicBoolean(false)
         val response = AtomicReference<SearchHttpResponse?>()
-        var view: WebView? = null
+        var session: GeckoSession? = null
         var lastHtml = ""
+        var lastFinalUrl = url
         var pageLoaded = false
-        var mainStatus = 200
-        var mitigated: String? = null
-        var fromCloudflare = false
-        var retryUntil = 0L
         val readiness = SearchDomReadiness()
         fun finish(status: Int, body: String = lastHtml, code: String? = null, retryAfter: Long = 0L) {
             if (!finished.compareAndSet(false, true)) return
-            response.set(SearchHttpResponse(status, view?.url ?: url, body, "text/html",
-                maxOf(retryAfter, retryUntil), code, mitigated, fromCloudflare, rendered = true))
+            response.set(SearchHttpResponse(status, lastFinalUrl, body, "text/html",
+                retryAfter, code, null, false, rendered = true))
             handler.removeCallbacksAndMessages(null)
             try {
-                view?.stopLoading()
-                view?.destroy()
-                view = null
+                session?.let { runCatching { it.close() } }
+                session = null
             } finally {
                 SearchScheduler.browserSlot.release()
                 latch.countDown()
@@ -52,62 +95,6 @@ class SearchWebViewFetcher(context: Context) {
             if (finished.get()) return@post
             if (cancellation.isCancelled) { finish(499, ""); return@post }
             try {
-                view = WebView(appContext).apply {
-                    settings.javaScriptEnabled = true
-                    settings.domStorageEnabled = true
-                    settings.loadsImagesAutomatically = false
-                    settings.mediaPlaybackRequiresUserGesture = true
-                    settings.javaScriptCanOpenWindowsAutomatically = false
-                    settings.setSupportMultipleWindows(false)
-                    settings.allowFileAccess = false
-                    settings.allowContentAccess = false
-                    settings.userAgentString = SearchHttpFetcher.USER_AGENT
-                    webViewClient = object : WebViewClient() {
-                        override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                            mainStatus = 200
-                            mitigated = null
-                            fromCloudflare = false
-                            retryUntil = 0L
-                            lastHtml = ""
-                            pageLoaded = false
-                            readiness.reset()
-                        }
-                        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                            val uri = request.url
-                            val blocked = uri.scheme !in listOf("http", "https") ||
-                                !site.isAllowedHost(uri.host.orEmpty())
-                            if (blocked && request.isForMainFrame) finish(599, "", "UNEXPECTED_REDIRECT_HOST")
-                            return blocked
-                        }
-                        override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                            if (request?.isForMainFrame == true) {
-                                val code = when (error?.errorCode) {
-                                    ERROR_HOST_LOOKUP -> "DNS_FAILURE"
-                                    ERROR_CONNECT -> "CONNECT_FAILURE"
-                                    ERROR_FAILED_SSL_HANDSHAKE -> "TLS_FAILURE"
-                                    ERROR_TIMEOUT -> "HTTP_TIMEOUT"
-                                    else -> "IO_ERROR"
-                                }
-                                finish(if (code == "HTTP_TIMEOUT") 598 else 599, "", code)
-                            }
-                        }
-                        override fun onReceivedSslError(view: WebView?, sslHandler: SslErrorHandler?, error: android.net.http.SslError?) {
-                            sslHandler?.cancel()
-                            finish(599, "", "TLS_FAILURE")
-                        }
-                        override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
-                            if (request?.isForMainFrame != true) return
-                            mainStatus = errorResponse?.statusCode ?: 599
-                            val headers = errorResponse?.responseHeaders.orEmpty()
-                            fun header(name: String) = headers.entries.firstOrNull { it.key.equals(name, true) }?.value
-                            mitigated = header("cf-mitigated")
-                            fromCloudflare = header("Server").orEmpty().contains("cloudflare", true) || header("cf-ray") != null
-                            retryUntil = SearchHttpFetcher.retryAfter(header("Retry-After"), System.currentTimeMillis())
-                            // Keep the error page alive long enough to inspect its DOM; do not discard it as a format error.
-                            if (mitigated.equals("challenge", true)) finish(mainStatus)
-                        }
-                    }
-                }
                 val script = """
                     (function() {
                       var hosts = [${site.allowedHosts.joinToString(",") { JSONObject.quote(it) }}];
@@ -161,27 +148,57 @@ class SearchWebViewFetcher(context: Context) {
                         });
                       return JSON.stringify({ready: matches.length > 0 || empty, blocked: blocked,
                         signature: matches.length > 0 ? matches.join('|') : (empty ? 'empty' : ''), loaded: document.readyState === 'complete',
+                        url: location.href,
                         html: document.documentElement ? document.documentElement.outerHTML.substring(0, 2000000) : ''});
                     })()
                 """.trimIndent()
                 val poll = object : Runnable {
                     override fun run() {
                         if (finished.get()) return
-                        view?.evaluateJavascript(script) { raw ->
-                            if (finished.get()) return@evaluateJavascript
+                        val current = session ?: return
+                        GeckoEval.evaluate(current, script) { raw ->
+                            if (finished.get()) return@evaluate
                             val json = runCatching { JSONObject(JSONTokener(raw).nextValue().toString()) }.getOrNull()
                             lastHtml = json?.optString("html").orEmpty()
                             pageLoaded = json?.optBoolean("loaded") == true
+                            // Redirect guard (replaces shouldOverrideUrlLoading):
+                            // the live main-frame URL must stay on an
+                            // allowed host with an http(s) scheme.
+                            json?.optString("url")?.takeIf { it.isNotBlank() }?.let { liveUrl ->
+                                lastFinalUrl = liveUrl
+                                val allowed = try {
+                                    val parsed = java.net.URL(liveUrl)
+                                    (parsed.protocol == "http" || parsed.protocol == "https") &&
+                                        site.isAllowedHost(parsed.host.orEmpty())
+                                } catch (_: Exception) {
+                                    false
+                                }
+                                if (!allowed) {
+                                    finish(599, "", "UNEXPECTED_REDIRECT_HOST")
+                                    return@evaluate
+                                }
+                            }
                             val ready = readiness.observe(pageLoaded, json?.optBoolean("ready") == true,
                                 json?.optBoolean("blocked") == true, json?.optString("signature").orEmpty())
-                            if (ready || (mainStatus >= 400 && pageLoaded && lastHtml.isNotBlank())) finish(mainStatus)
+                            if (ready) finish(200)
                             else handler.postDelayed(this, 400)
                         }
                     }
                 }
-                view!!.loadUrl(url)
-                handler.post(poll)
-                handler.postDelayed({ finish(if (pageLoaded && lastHtml.isNotBlank() || mainStatus >= 400) mainStatus else 598) }, timeoutMs)
+                GeckoHeadless.loadSession(appContext, url, timeoutMs) { loaded ->
+                    if (finished.get()) return@loadSession
+                    if (loaded == null) {
+                        // Load never completed (timeout or failure — the
+                        // shared API does not distinguish them, and
+                        // reports no error code). Same 598 the old code
+                        // used when the page never became readable.
+                        finish(598)
+                        return@loadSession
+                    }
+                    session = loaded
+                    handler.post(poll)
+                }
+                handler.postDelayed({ finish(if (pageLoaded && lastHtml.isNotBlank()) 200 else 598) }, timeoutMs)
             } catch (_: Exception) { finish(599, "") }
         }
         try {
