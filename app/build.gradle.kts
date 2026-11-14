@@ -17,8 +17,8 @@ android {
         // GeckoView 151 要求 minSdk 26（manifest merger 强制）。
         minSdk = 26
         targetSdk = 34
-        versionCode = 157
-        versionName = "1.2.9-gecko"
+        versionCode = 158
+        versionName = "1.2.10-gecko"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

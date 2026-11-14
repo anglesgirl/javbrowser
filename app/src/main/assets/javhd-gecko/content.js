@@ -17,7 +17,11 @@
 //    blob: URL cannot be played by the native player) and report a
 //    videoPlaying signal when playback actually starts, so the
 //    sniffer knows the feature is playing and can finish instead of
-//    timing out on ads.
+//    timing out on ads. 1.2.10 also sends a domScan every 2s (how
+//    many <video> elements, whether one is playing) so the Activity
+//    knows the ground truth, and injects page-probe.js into the
+//    page's own JS world to read jwplayer/videojs/hls.js objects
+//    that the isolated content-script world cannot see.
 
 (function () {
   "use strict";
@@ -67,6 +71,12 @@
   }
 
   // --- 2. Video-candidate monitoring (every page) ---
+  //
+  // 1.2.10: DOM 直读是主路。除了逐条上报 mediaCandidate，每次
+  // 扫描还上报一次 domScan（页面里有几个 <video>、是否在播、在
+  // 播的地址），让 Activity 拿得到“视频到底在没在播”的地面真相：
+  // 视频在播但只剩 blob: 地址时，Activity 知道要继续等、绝不报
+  // “页面载入失败”；页面里根本没有 <video> 时，才是真的没播。
   var reportedSrcs = new Set();
 
   function isReportableUrl(url) {
@@ -83,18 +93,59 @@
     sendMessage({ type: "mediaCandidate", url: url });
   }
 
-  function scanVideoElements() {
+  function collectVideoState() {
+    var state = { videoCount: 0, playing: false, playingSrc: "", srcs: [] };
     try {
       var media = document.querySelectorAll("video, audio");
+      state.videoCount = media.length;
       for (var i = 0; i < media.length; i++) {
         var el = media[i];
-        // <video currentSrc> is the resolved address the element is
-        // actually playing (covers <source> children too).
-        reportVideoCandidate(el.currentSrc || el.src || "");
+        var src = el.currentSrc || el.src || "";
+        if (isReportableUrl(src) && state.srcs.indexOf(src) === -1) {
+          state.srcs.push(src);
+        }
         var sources = el.querySelectorAll("source");
         for (var j = 0; j < sources.length; j++) {
-          reportVideoCandidate(sources[j].src || "");
+          var ssrc = sources[j].src || "";
+          if (isReportableUrl(ssrc) && state.srcs.indexOf(ssrc) === -1) {
+            state.srcs.push(ssrc);
+          }
         }
+        if (
+          el.tagName === "VIDEO" &&
+          !el.paused &&
+          el.currentTime > 0
+        ) {
+          state.playing = true;
+          state.playingSrc = src;
+        }
+      }
+    } catch (e) {
+      // Ignore; next tick retries.
+    }
+    return state;
+  }
+
+  function sendDomScan() {
+    try {
+      var state = collectVideoState();
+      sendMessage({
+        type: "domScan",
+        videoCount: state.videoCount,
+        playing: state.playing,
+        playingSrc: state.playingSrc,
+        srcs: state.srcs
+      });
+    } catch (e) {
+      // Ignore; next tick retries.
+    }
+  }
+
+  function scanVideoElements() {
+    try {
+      var state = collectVideoState();
+      for (var i = 0; i < state.srcs.length; i++) {
+        reportVideoCandidate(state.srcs[i]);
       }
     } catch (e) {
       // Ignore; next tick retries.
@@ -137,9 +188,63 @@
     // MutationObserver unavailable; polling below still covers it.
   }
 
-  // Poll every 2s (same cadence as the state reporting).
-  var scanTimer = setInterval(scanVideoElements, 2000);
+  // Poll every 2s (same cadence as the state reporting): read
+  // the <video> elements AND report the DOM state, so the Activity
+  // gets a fresh ground truth even when nothing new is found.
+  var scanTimer = setInterval(function () {
+    scanVideoElements();
+    sendDomScan();
+  }, 2000);
   scanVideoElements();
+  sendDomScan();
+
+  // --- 2b. Page-world probe (1.2.10) ---
+  //
+  // The player objects (jwplayer, videojs, hls.js instances) live
+  // in the page's own JS world, which this content script cannot
+  // see. Inject page-probe.js as a <script> tag so it runs in the
+  // page world, reads those objects, and posts the URLs back with
+  // window.postMessage. The probe file is a web-accessible
+  // resource (see manifest.json); if the page's CSP blocks the
+  // injected script this silently does nothing and the scans above
+  // still run.
+  function injectPageProbe() {
+    try {
+      if (document.querySelector('script[data-jb-sniff-probe]')) return;
+      var url = null;
+      try {
+        url = browser.runtime.getURL("page-probe.js");
+      } catch (e) {
+        return;
+      }
+      if (!url) return;
+      var script = document.createElement("script");
+      script.setAttribute("data-jb-sniff-probe", "1");
+      script.src = url;
+      (document.head || document.documentElement).appendChild(script);
+    } catch (e) {
+      // Ignore; the scans above still run.
+    }
+  }
+
+  window.addEventListener("message", function (event) {
+    try {
+      if (!event || event.source !== window) return;
+      var data = event.data;
+      if (!data || data.type !== "JB_SNIFF_PROBE") return;
+      var urls = data.urls || [];
+      for (var i = 0; i < urls.length; i++) {
+        reportVideoCandidate(urls[i]);
+      }
+      // The probe also knows whether a video is playing; fold that
+      // into the next domScan by triggering one now if it says so.
+      if (data.playing) sendDomScan();
+    } catch (e) {
+      // Ignore.
+    }
+  });
+
+  injectPageProbe();
 
   // The feature actually started playing. The URL may be a blob:
   // (unplayable natively) — the signal is what matters: the

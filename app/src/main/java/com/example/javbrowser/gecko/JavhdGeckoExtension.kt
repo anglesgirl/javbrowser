@@ -12,7 +12,7 @@ import org.mozilla.geckoview.WebExtension
 /**
  * 嵌頁播放器专用的内置 WebExtension（assets/javhd-gecko/）。
  *
- * 扩展做四件事（见 background.js / content.js）：
+ * 扩展做五件事（见 background.js / content.js）：
  * ① webRequest 拦 11 个广告域名，tsyndicate.com（VAST）永远不拦；
  * ② content script 轮询点跳过（DOM 点击，内容脚本访问不到页面
  *    的 jwplayer() 对象，故只用 DOM 方式）；
@@ -20,8 +20,12 @@ import org.mozilla.geckoview.WebExtension
  *    回传给 Activity，记播放进度；
  * ④ background 实时嗅探播放器实际请求的 .m3u8/.mp4（非阻塞观察，
  *    与 VideoPageSniffer 同款广告过滤），经 native 消息回传给嗅探
- *    会话（GeckoSniffActivity）。静态 HTML 只得广告的站（如 7mmtv）
- *    靠它拿正片。
+ *    会话（GeckoSniffActivity）。1.2.10 起降为辅助，DOM 直读是主路。
+ * ⑤ 内容脚本每 2 秒上报一次 DOM 扫描（domScan：页面里有几
+ *    个 <video>、是否在播、在播的地址），让嗅探会话（Activity）
+ *    拿得到“视频到底在没在播”的地面真相——不再只凭 webRequest
+ *    猜，也不再把 onPageStop(false) 误报成“页面载入失败”。
+ *    （1.2.10：DOM 直读是主路，webRequest 降为辅助。）
  *
  * 消息流：content script / background --runtime.sendMessage /
  * connectNative("javhdPlayer")--> Kotlin MessageDelegate.onMessage。
@@ -51,6 +55,9 @@ object JavhdGeckoExtension {
 
     /** 该 session 的“正片已开始播放”回调（GeckoSniffActivity）。 */
     private val videoPlayingHandlers = mutableMapOf<GeckoSession, (JSONObject) -> Unit>()
+
+    /** 该 session 的 DOM 扫描回调（GeckoSniffActivity，1.2.10 主路）。 */
+    private val domScanHandlers = mutableMapOf<GeckoSession, (JSONObject) -> Unit>()
 
     private val messageDelegate = object : WebExtension.MessageDelegate {
         override fun onMessage(
@@ -91,6 +98,15 @@ object JavhdGeckoExtension {
                     // 有一个嗅探会话在跑，不会串。
                     val handlers = synchronized(videoPlayingHandlers) {
                         videoPlayingHandlers.values.toList()
+                    }
+                    Handler(Looper.getMainLooper()).post {
+                        handlers.forEach { it(json) }
+                    }
+                } else if (type == "domScan") {
+                    // 内容脚本每 2 秒上报一次 DOM 扫描（页面里有几
+                    // 个 <video>、是否在播、在播的地址）。同上广播。
+                    val handlers = synchronized(domScanHandlers) {
+                        domScanHandlers.values.toList()
                     }
                     Handler(Looper.getMainLooper()).post {
                         handlers.forEach { it(json) }
@@ -148,6 +164,7 @@ object JavhdGeckoExtension {
                     videoStateHandlers.keys.forEach { attachSessionDelegate(it, installed) }
                     mediaCandidateHandlers.keys.forEach { attachSessionDelegate(it, installed) }
                     videoPlayingHandlers.keys.forEach { attachSessionDelegate(it, installed) }
+                    domScanHandlers.keys.forEach { attachSessionDelegate(it, installed) }
                     callbacks.forEach { it(installed) }
                 }
             }, { throwable ->
@@ -194,6 +211,16 @@ object JavhdGeckoExtension {
 
     fun detachVideoPlayingListener(session: GeckoSession) {
         videoPlayingHandlers.remove(session)
+    }
+
+    /** 把 DOM 扫描挂到一个 session 上（GeckoSniffActivity，1.2.10 主路）。 */
+    fun attachDomScanListener(session: GeckoSession, onDomScan: (JSONObject) -> Unit) {
+        domScanHandlers[session] = onDomScan
+        extension?.let { attachSessionDelegate(session, it) }
+    }
+
+    fun detachDomScanListener(session: GeckoSession) {
+        domScanHandlers.remove(session)
     }
 
     private fun attachSessionDelegate(session: GeckoSession, installed: WebExtension) {

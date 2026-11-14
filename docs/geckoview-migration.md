@@ -323,3 +323,50 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
   m3u8 时长）未动。
 - 待用户真机验：进嗅探页播正片，看正片地址是否被抓到、不再只有
   36 条广告。
+
+## 1.2.10-gecko（vc158，2026-11-14 晚）——嗅探换路线：DOM 直读是主路
+- 用户真机 19:24 报：1.2.9 嗅探还是不行，视频已经播了，嗅探没出
+  视频、还提示“页面失败”，又弹回只有广告的“选择播放地址”页。
+  用户明确要求“改个路线”。网络抓包这条路试了两轮（URL 后缀、
+  猫抓三信号 + 内容脚本）都不行，不再修它，换一条。
+- 前两轮失败的根因（已定位）：扩展是异步装的，Activity 调
+  ensureInstalled 后不等装好就 loadUri，页面、播放器、manifest
+  请求可能全在扩展装好之前发生——webRequest 监听器还没注册、
+  内容脚本还没注入，等装好时正片早已用 blob:/MSE 播起来了，
+  currentSrc 是 blob:（不可播）、manifest 请求已错过，于是零
+  候选。
+- API 事实（动手前核实过，不是凭印象）：GeckoView 151 的
+  GeckoSession 没有 evaluateJS 方法（对 AAR 的 GeckoSession 类
+  查过，常量池里连 "eval" 都没有）；Mozilla 官方文档写明“唯一
+  受支持的办法就是写一个内置 WebExtension 并安装它”；loadUri
+  ("javascript:...") 经用户报告在 GeckoView 里跑不起来。所以
+  “Activity 侧 JS 求值”的等价实现是：Activity 控制时序（扩展
+  装好再加载页面），JS 执行仍走内置扩展的内容脚本 + 页面探针，
+  Activity 侧按内容脚本每 2 秒上报的 domScan 做轮询与收尾决策。
+- 新路线（DOM 直读是主路，webRequest 降为辅助、留着不删）：
+  - 先装后载：GeckoSniffActivity 等 ensureInstalled onReady 才
+    loadUri（8 秒安装超时也加载，扩展晚装上后内容脚本还能注入
+    已加载的页面）；总超时 20 秒从加载开始算。
+  - 内容脚本（content.js）每 2 秒上报 domScan：页面里几个
+    <video>/<audio>、是否在播、在播地址、全部 http(s) 元素地址。
+    Activity 拿这个当地面真相轮询节拍：读到非广告地址即候选；
+    读到在播即收尾信号（补 playing 事件在注入前已错过的情况）。
+  - 页面探针（新增 page-probe.js，经 web_accessible_resources
+    注入页面自己的 JS 世界）：读 jwplayer() 的 getPlaylist/
+    getConfig()、videojs 播放器实例、hls.js 实例的 .url（hls.js
+    播 HLS 时 currentSrc 是 blob:，真 m3u8 在 hls.url 里），经
+    window.postMessage 回传给内容脚本、再当 mediaCandidate 上报。
+    内容脚本的隔离世界看不到这些对象，所以必须走注入脚本；页面
+    CSP 拦住注入时静默失效，其他信号照常工作。
+  - 修“页面失败”误报：onPageStop(success=false) 只记不报——视
+    频在播时它也可能报 false（重定向/子资源）；只有超时时既无
+    候选、DOM 里又没见过 video、且最后一次 onPageStop 确实失败，
+    才报“页面载入失败”；视频在播但没读到地址时报“视频在播，但
+    未读到播放地址”；状态文案按地面真相写（正在准备浏览器…/
+    正在读播放地址…/视频已在播，正在读播放地址…）。
+  - 候选处理不变：非广告排前面、广告沉底折叠；去重；回传走现有
+    EXTRA_CANDIDATE_URLS。VAST、11 广告域、/api/play/ 桌面 UA
+    未动；MainActivity、UnifiedSearchActivity、
+    FullscreenInternalPlayerActivity 未动（另一个全量迁移任务在做）。
+- 待用户真机验：进嗅探页等视频播起来，看正片地址是否被抓到、不
+  再报页面失败。
