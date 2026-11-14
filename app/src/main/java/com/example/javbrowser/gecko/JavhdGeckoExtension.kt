@@ -49,6 +49,9 @@ object JavhdGeckoExtension {
      */
     private val mediaCandidateHandlers = mutableMapOf<GeckoSession, (String) -> Unit>()
 
+    /** 该 session 的“正片已开始播放”回调（GeckoSniffActivity）。 */
+    private val videoPlayingHandlers = mutableMapOf<GeckoSession, (JSONObject) -> Unit>()
+
     private val messageDelegate = object : WebExtension.MessageDelegate {
         override fun onMessage(
             nativeApp: String,
@@ -81,6 +84,16 @@ object JavhdGeckoExtension {
                         Handler(Looper.getMainLooper()).post {
                             handlers.forEach { it(url) }
                         }
+                    }
+                } else if (type == "videoPlaying") {
+                    // 内容脚本报“正片已开始播放”（playing 事件）。同
+                    // mediaCandidate 一样广播给已挂回调——同一时间只
+                    // 有一个嗅探会话在跑，不会串。
+                    val handlers = synchronized(videoPlayingHandlers) {
+                        videoPlayingHandlers.values.toList()
+                    }
+                    Handler(Looper.getMainLooper()).post {
+                        handlers.forEach { it(json) }
                     }
                 }
                 GeckoResult.fromValue(null)
@@ -134,6 +147,7 @@ object JavhdGeckoExtension {
                     }
                     videoStateHandlers.keys.forEach { attachSessionDelegate(it, installed) }
                     mediaCandidateHandlers.keys.forEach { attachSessionDelegate(it, installed) }
+                    videoPlayingHandlers.keys.forEach { attachSessionDelegate(it, installed) }
                     callbacks.forEach { it(installed) }
                 }
             }, { throwable ->
@@ -170,6 +184,16 @@ object JavhdGeckoExtension {
 
     fun detachMediaSniffer(session: GeckoSession) {
         mediaCandidateHandlers.remove(session)
+    }
+
+    /** 把“正片已开始播放”信号挂到一个 session 上（GeckoSniffActivity）。 */
+    fun attachVideoPlayingListener(session: GeckoSession, onVideoPlaying: (JSONObject) -> Unit) {
+        videoPlayingHandlers[session] = onVideoPlaying
+        extension?.let { attachSessionDelegate(session, it) }
+    }
+
+    fun detachVideoPlayingListener(session: GeckoSession) {
+        videoPlayingHandlers.remove(session)
     }
 
     private fun attachSessionDelegate(session: GeckoSession, installed: WebExtension) {

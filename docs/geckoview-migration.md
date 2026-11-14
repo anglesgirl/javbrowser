@@ -287,3 +287,39 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
   （Application.getProcessName()，API 28 以下走 ActivityManager
   回退），防以后再有独立进程 Activity 踩同一个坑。
 - 待用户真机验：点“最小测试”应进测试页，8 秒后出结论并截图发回。
+
+## 1.2.9-gecko（vc157，2026-11-14 晚）——猫抓嗅探核心集成
+- 用户真机 19:00 报：嗅探页里正片已经播了，嗅探没抓到，跳回“选择
+  播放地址”只剩 36 条 n39s.1024cdn.sx 疑似广告 mp4。根因是旧嗅探
+  只认一招：webRequest onBeforeRequest 里 URL 以 .m3u8/.mp4 结尾。
+  带签名/不带后缀的正片地址、以及 blob:/MSE 播放（网络请求里只有
+  .ts 分片、没有可播地址）全都漏掉；另有收尾 bug：首个候选（常是
+  广告）到后 3 秒就收尾，正片在 VAST 跳过后才来、被截断。
+- 做法：集成猫抓（CatCatch，https://github.com/xifangczy/cat-catch，
+  GPL-3.0；许可证全文在 app/src/main/assets/javhd-gecko/
+  CAT_CATCH_LICENSE，background.js/content.js 头有来源声明）。只
+  集成嗅探核心，不集成它的弹窗 UI 与下载功能（GeckoView 没有扩展
+  弹窗/下载 UI，我们也不需要——已有自己的“选择播放地址”与播放
+  逻辑）；m3u8.js 的解析/合并也不移植，Media3/ExoPlayer 原生播
+  HLS（含 AES-128，播放器自己取密钥），我们只要地址。
+- 移植的三信号（background.js，任一命中即上报 mediaCandidate，
+  仍过同一套广告过滤，VAST 与 11 广告域拦截原样保留）：
+  ① URL 后缀：.m3u8/.mp4/.mpd（路径末尾才算）；
+  ② 响应 Content-Type：onResponseStarted 读响应头，video/*、
+  audio/*、application/vnd.apple.mpegurl、application/x-mpegurl、
+  application/dash+xml；
+  ③ 浏览器资源类型：details.type == "media"（<video>/<audio>
+  元素发起的请求）。
+  另加 background 内去重（同一 URL 只报一次，500 条清一次）。
+- 内容脚本（content.js，matches 由两个 javhd 嵌頁域名放宽到
+  <all_urls>；VAST 跳过与 videoState 上报仍只在 javhd 嵌頁域名
+  跑）：MutationObserver + 2 秒轮询读全部 <video>/<audio> 与
+  <source> 的 currentSrc/src（http(s) 才上报，blob: 不可播不报），
+  另在 playing 事件报 videoPlaying 信号（正片真的开始播了）。
+- 收尾逻辑（GeckoSniffActivity）：只有非广告候选到后才开始 3 秒
+  收尾；videoPlaying 到时有候选立刻收尾、无候选延长 10 秒；回包
+  时非广告排前面、广告沉底，去重仍由 linkedSetOf 保证。下游
+  UnifiedSearchActivity 的 filterSniffCandidates（广告过滤/折叠/
+  m3u8 时长）未动。
+- 待用户真机验：进嗅探页播正片，看正片地址是否被抓到、不再只有
+  36 条广告。
