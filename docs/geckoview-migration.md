@@ -148,3 +148,19 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
   铁律、搜索解析器、选集均未动。
 - 嗅探窗口：首个候选到后等 3 秒收尾，20 秒超时空手返回；可点 ✕
   或返回键提前结束。
+
+## 交付 1.2.3-gecko（2026-11-14 01:01）
+- 提交：cddc16a（两项修复本体）→ 9812e9b（修 CI 编译错误 3 处：
+  onLocationChange 4 参、canGoBack 用 onCanGoBack 维护、
+  item.code orEmpty()）。
+- CI 全绿（run 43537080365，build + release 均为 success）。
+- Release：build-20261114-9812e9b，asset app-debug-arm64.apk，
+  109,056,173 字节。
+- 镜像：https://gh.anglesya.win/anglesgirl/javbrowser/releases/download/build-20261114-9812e9b/app-debug-arm64.apk
+  （实测 200，字节数与 release 一致）。
+- 验包（androguard）：包名 com.example.javbrowser.ech、versionCode
+  151、versionName 1.2.3-gecko、minSdk 26、targetSdk 34；
+  含 libxul.so（GeckoView）与 assets/javhd-gecko/manifest.json。
+- 待真机验：①首页点 JavDB/JavTrailers/Stripchat/Pornhub/XVideos
+  能正常加载（GeckoView，不再断网）；②7mmtv 搜详情→静态只得广
+  告→自动进播放页实时嗅探→选择器里出现正片地址→能播。
