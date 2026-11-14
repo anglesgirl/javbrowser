@@ -164,3 +164,25 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
 - 待真机验：①首页点 JavDB/JavTrailers/Stripchat/Pornhub/XVideos
   能正常加载（GeckoView，不再断网）；②7mmtv 搜详情→静态只得广
   告→自动进播放页实时嗅探→选择器里出现正片地址→能播。
+
+## 白屏修 1.2.4-gecko（2026-11-14）
+- 用户真机：首页点 JavDB，GeckoBrowserActivity 打开，顶栏显示
+  https://javdb.com/，内容区全白；当时状态栏速率 0.75 KB/s。
+- 根因（不是渲染搭错）：与能播的嵌頁播放器逐项核对过——同一
+  Runtime、同一 open → setSession → loadUri 顺序；布局是标准顶栏
+  + weight=1 的 GeckoView；追踪防护只拦第三方追踪器，不拦主文档；
+  默认 Firefox UA 不至于让 javdb.com 空白。真正的问题是加载慢/
+  失败时零反馈：页面在极慢网络下极慢或失败（RST/超时），旧版没
+  有任何加载进度，失败只有一个 2 秒就消失的 Toast——慢和失败看
+  起来都是白屏。
+- 修法（只改 GeckoBrowserActivity）：①可见进度条（onProgressChange
+  0–100）+“正在加载…”状态行；②NavigationDelegate.onLoadError
+  拿 WebRequestError 真实错误码（已核对 GeckoView javadoc：
+  onLoadError 返回 GeckoResult<String>，返回 null 停掉加载；
+  code 常量如 ERROR_UNKNOWN_HOST / ERROR_NET_TIMEOUT /
+  ERROR_NET_RESET / ERROR_CONNECTION_REFUSED 等），翻译成人话附
+  错误码，显示在失败页上；③失败页 + 重试按钮（重载当前地址）；
+  ④30 秒加载超时也进失败页；⑤onPageStop(success=false) 只作
+  兜底（失败页未显示时才显示通用原因，不覆盖 onLoadError 的具体
+  原因）。追踪防护保持开（浏览器广告拦截靠它），不装 javhd 扩展，
+  不改 UA；搜索、播放、嗅探、/api/play/ 桌面 UA、VAST 放行均未动。
