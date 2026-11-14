@@ -175,6 +175,12 @@
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:screenOrientation="fullSensor"
             android:theme="@style/Theme.AppCompat.NoActionBar" />
+        <activity
+            android:name=".GeckoBrowserActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+        <activity
+            android:name=".GeckoSniffActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
         <service
             android:name=".VideoDownloadService"
             android:exported="false"

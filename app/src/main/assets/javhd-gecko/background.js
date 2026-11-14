@@ -46,6 +46,71 @@ browser.webRequest.onBeforeRequest.addListener(
   ["blocking"]
 );
 
+// --- Live media sniffing (Issue 2: 7mmtv static HTML only yields ads) ---
+//
+// Observes (never blocks) every request. When the player actually asks
+// for a video file (.m3u8/.mp4, extension must terminate the path —
+// same rule as VideoPageSniffer, so "...Episode-1.mp4_snapshot_
+// 05.21_....webp" thumbnails never match), and the URL is not an ad,
+// it is reported to Kotlin as a mediaCandidate. The native side only
+// collects while a sniff session is attached (GeckoSniffActivity);
+// otherwise the messages are dropped harmlessly.
+//
+// Ad filter (same as VideoPageSniffer.adSegment): a URL segment that
+// is exactly ad/ads/preview/trailer/thumb/sample/snapshot, a host in
+// AD_HOSTS, or tsyndicate.com (VAST — the pre-roll itself is an ad
+// video, never a feature candidate). VAST is never blocked either.
+const AD_SEGMENTS = new Set(["ad", "ads", "preview", "trailer", "thumb", "sample", "snapshot"]);
+
+function isVideoFile(url) {
+  try {
+    const clean = url.split("?")[0].split("#")[0].toLowerCase();
+    return clean.endsWith(".m3u8") || clean.endsWith(".mp4");
+  } catch (e) {
+    return false;
+  }
+}
+
+function isAdUrl(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    if (host === "tsyndicate.com" || host.endsWith(".tsyndicate.com")) return true;
+    if (isAdHost(host)) return true;
+    const tokens = url.toLowerCase().split(/[^a-z0-9]+/);
+    for (const t of tokens) {
+      if (AD_SEGMENTS.has(t)) return true;
+    }
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
+function reportMediaCandidate(url) {
+  if (!nativePort) return;
+  try {
+    nativePort.postMessage({ type: "mediaCandidate", url: url });
+  } catch (e) {
+    // Port closed; drop.
+  }
+}
+
+browser.webRequest.onBeforeRequest.addListener(
+  function (details) {
+    try {
+      if (isVideoFile(details.url) && !isAdUrl(details.url)) {
+        reportMediaCandidate(details.url);
+      }
+    } catch (e) {
+      // Ignore; never break the request.
+    }
+    return {};
+  },
+  { urls: ["<all_urls>"] },
+  ["blocking"]
+);
+
 // Native-messaging port to Kotlin (JavhdGeckoExtension sets the
 // MessageDelegate for the native app name "javhdPlayer").
 let nativePort = null;

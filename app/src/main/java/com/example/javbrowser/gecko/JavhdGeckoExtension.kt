@@ -12,15 +12,19 @@ import org.mozilla.geckoview.WebExtension
 /**
  * 嵌頁播放器专用的内置 WebExtension（assets/javhd-gecko/）。
  *
- * 扩展做三件事（见 background.js / content.js）：
+ * 扩展做四件事（见 background.js / content.js）：
  * ① webRequest 拦 11 个广告域名，tsyndicate.com（VAST）永远不拦；
  * ② content script 轮询点跳过（DOM 点击，内容脚本访问不到页面
  *    的 jwplayer() 对象，故只用 DOM 方式）；
  * ③ content script 读 <video> 状态，经 background → native 消息
- *    回传给 Activity，记播放进度。
+ *    回传给 Activity，记播放进度；
+ * ④ background 实时嗅探播放器实际请求的 .m3u8/.mp4（非阻塞观察，
+ *    与 VideoPageSniffer 同款广告过滤），经 native 消息回传给嗅探
+ *    会话（GeckoSniffActivity）。静态 HTML 只得广告的站（如 7mmtv）
+ *    靠它拿正片。
  *
- * 消息流：content script --runtime.sendMessage--> background
- * --connectNative("javhdPlayer")--> Kotlin MessageDelegate.onMessage。
+ * 消息流：content script / background --runtime.sendMessage /
+ * connectNative("javhdPlayer")--> Kotlin MessageDelegate.onMessage。
  * 扩展只装一次（全局单例），每个 GeckoSession 另挂一个
  * session 级 MessageDelegate 才能收到该 session 里内容脚本的消息。
  */
@@ -37,6 +41,13 @@ object JavhdGeckoExtension {
 
     /** 该 session 的 videoState 回调（Activity 在 onPause 时用最新状态记进度）。 */
     private val videoStateHandlers = mutableMapOf<GeckoSession, (JSONObject) -> Unit>()
+
+    /**
+     * 该 session 的实时嗅探回调（GeckoSniffActivity）。background 的
+     * webRequest 观察者不知道请求属于哪个 session，故 mediaCandidate
+     * 会广播给全部已挂回调——同一时间只有一个嗅探会话在跑，不会串。
+     */
+    private val mediaCandidateHandlers = mutableMapOf<GeckoSession, (String) -> Unit>()
 
     private val messageDelegate = object : WebExtension.MessageDelegate {
         override fun onMessage(
@@ -60,6 +71,16 @@ object JavhdGeckoExtension {
                     }
                     Handler(Looper.getMainLooper()).post {
                         handlers.forEach { it(json) }
+                    }
+                } else if (type == "mediaCandidate") {
+                    val url = json.optString("url")
+                    if (url.isNotBlank()) {
+                        val handlers = synchronized(mediaCandidateHandlers) {
+                            mediaCandidateHandlers.values.toList()
+                        }
+                        Handler(Looper.getMainLooper()).post {
+                            handlers.forEach { it(url) }
+                        }
                     }
                 }
                 GeckoResult.fromValue(null)
@@ -112,6 +133,7 @@ object JavhdGeckoExtension {
                         pendingReady.toList().also { pendingReady.clear() }
                     }
                     videoStateHandlers.keys.forEach { attachSessionDelegate(it, installed) }
+                    mediaCandidateHandlers.keys.forEach { attachSessionDelegate(it, installed) }
                     callbacks.forEach { it(installed) }
                 }
             }, { throwable ->
@@ -138,6 +160,16 @@ object JavhdGeckoExtension {
                 Log.w(TAG, "detach session delegate 失败", e)
             }
         }
+    }
+
+    /** 把实时嗅探挂到一个 session 上（GeckoSniffActivity）。 */
+    fun attachMediaSniffer(session: GeckoSession, onCandidate: (String) -> Unit) {
+        mediaCandidateHandlers[session] = onCandidate
+        extension?.let { attachSessionDelegate(session, it) }
+    }
+
+    fun detachMediaSniffer(session: GeckoSession) {
+        mediaCandidateHandlers.remove(session)
     }
 
     private fun attachSessionDelegate(session: GeckoSession, installed: WebExtension) {

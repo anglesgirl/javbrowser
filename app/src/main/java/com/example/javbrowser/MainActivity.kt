@@ -1569,11 +1569,16 @@ class MainActivity : LocalizedActivity() {
             @android.webkit.JavascriptInterface
             fun navigateToUrl(url: String) {
                 runOnUiThread {
-                    Toast.makeText(this@MainActivity, "Connecting...", Toast.LENGTH_SHORT).show()
-                    progressBar.visibility = View.VISIBLE
-                    progressBar.progress = 10
-                    webView.loadUrl(domainConfig.updateUrlIfNeeded(url))
-                    startLoadTimeout()
+                    // 首页“直接前往”的站（无原生解析器）：走 GeckoView 打开。
+                    // 原 WebView 方案在迁移时把 ECH 拦截改成放行（明文
+                    // SNI），在用户网络上直接被 RST、断网。Gecko 原生
+                    // DoH + ECH，不明文 SNI，不会被 RST。
+                    startActivity(
+                        GeckoBrowserActivity.intent(
+                            this@MainActivity,
+                            domainConfig.updateUrlIfNeeded(url)
+                        )
+                    )
                 }
             }
             

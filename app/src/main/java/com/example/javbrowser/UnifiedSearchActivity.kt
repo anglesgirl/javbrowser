@@ -289,6 +289,79 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     }
 
     /**
+     * 实时嗅探回包（GeckoSniffActivity，2026-11-14）：静态 HTML 只得
+     * 广告的站（7mmtv）进播放页实时抓。抓到的候选过同一套
+     * filterSniffCandidates（广告过滤/去重/簇折叠/m3u8 时长），有正
+     * 片就开选择器；空手则回落原有逻辑（无广告→浏览器，有广告→广
+     * 告选择器）。挂起的 item/sessionId/ads 存在字段里（一次只跑一
+     * 个嗅探）。过滤在 worker 线程跑（m3u8Duration 要联网取播放列
+     * 表，取不到返回 null、候选照留，不影响）。
+     */
+    private var pendingSniffItem: SearchItem? = null
+    private var pendingSniffSessionId: Long = -1L
+    private var pendingSniffAds: List<SniffCandidateRecord> = emptyList()
+
+    private val sniffLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val item = pendingSniffItem
+        val sessionId = pendingSniffSessionId
+        val ads = pendingSniffAds
+        pendingSniffItem = null
+        pendingSniffSessionId = -1L
+        pendingSniffAds = emptyList()
+        if (result.resultCode != Activity.RESULT_OK || item == null || sessionId < 0) {
+            if (item != null && sessionId >= 0) {
+                if (ads.isEmpty()) BrowserNavigator.open(this, item.detailUrl)
+                else showSniffPicker(item, emptyList(), sessionId, ads)
+            }
+            return@registerForActivityResult
+        }
+        val urls = result.data
+            ?.getStringArrayListExtra(GeckoSniffActivity.EXTRA_CANDIDATE_URLS)
+            .orEmpty()
+        if (urls.isEmpty()) {
+            if (ads.isEmpty()) BrowserNavigator.open(this, item.detailUrl)
+            else showSniffPicker(item, emptyList(), sessionId, ads)
+            return@registerForActivityResult
+        }
+        val site = sites.firstOrNull { it.id == item.siteId }
+        if (site == null) {
+            if (ads.isEmpty()) BrowserNavigator.open(this, item.detailUrl)
+            else showSniffPicker(item, emptyList(), sessionId, ads)
+            return@registerForActivityResult
+        }
+        // 实时抓到的候选过同一套过滤，与静态候选同分同排；Referer
+        // 仍是详情页（正片就是该页请求的）。
+        SearchScheduler.workers.execute {
+            val scored = VideoPageSniffer.sniffScored(
+                urls.joinToString("\n"), item.detailUrl, item.code
+            )
+            val (kept, liveAds) = filterSniffCandidates(scored, site, sessionId)
+            val allAds = (ads + liveAds).distinctBy { it.url }
+            runOnUiThread {
+                if (kept.isEmpty()) {
+                    if (allAds.isEmpty()) BrowserNavigator.open(this, item.detailUrl)
+                    else showSniffPicker(item, emptyList(), sessionId, allAds)
+                } else {
+                    showSniffPicker(item, kept, sessionId, allAds)
+                }
+            }
+        }
+    }
+
+    /** 静态只得广告（或什么都没有）时，进播放页实时嗅探。 */
+    private fun launchLiveSniff(item: SearchItem, sessionId: Long, ads: List<SniffCandidateRecord>) {
+        pendingSniffItem = item
+        pendingSniffSessionId = sessionId
+        pendingSniffAds = ads
+        Toast.makeText(this,
+            LanguageManager.text(this, "正在进入播放页嗅探…", "Sniffing the player page…"),
+            Toast.LENGTH_SHORT).show()
+        sniffLauncher.launch(
+            GeckoSniffActivity.intent(this, item.detailUrl, item.siteId, item.title, item.code)
+        )
+    }
+
+    /**
      * Opens a search result. Sniff the detail page HTML fetched
      * (plain OkHttp) and list the candidate video URLs for the user
      * to pick (auto-pick proved unreliable: it kept landing on ads
@@ -350,10 +423,13 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         SearchScheduler.workers.execute {
             val (candidates, ads) = trySniffVideoCandidates(item, sessionId)
             runOnUiThread {
-                if (candidates.isEmpty() && ads.isEmpty()) {
-                    BrowserNavigator.open(this, item.detailUrl)
-                } else {
+                if (candidates.isNotEmpty()) {
                     showSniffPicker(item, candidates, sessionId, ads)
+                } else {
+                    // 静态只得广告（或什么都没有）：进播放页实时嗅探。
+                    // 7mmtv 的正片是 JS 动态加载的，静态 HTML 里没有，
+                    // 只有进了播放页、播放器真正发请求才能抓到。
+                    launchLiveSniff(item, sessionId, ads)
                 }
             }
         }
