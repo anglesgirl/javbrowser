@@ -244,3 +244,28 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
   定位写进失败页；失败页同时显示诊断快照（会话是否打开 / 视图
   是否挂载 / 视图有会话 / 视图尺寸）。搜索、播放、嗅探、
   /api/play/ 桌面 UA、VAST 放行均未动。
+
+## 1.2.7-gecko：自检 about:blank 也加载不了——逐行对照 hyper-browser
+
+- 用户真机决定性结果：1.2.6 失败页诊断快照全对（会话已打开=true，
+  视图已挂载=true，视图有会话=true，视图尺寸=1280x2357），但自检
+  （新会话加载 about:blank）5 秒内也不触发 onPageStart。about:blank
+  不走网络/DNS/ECH，说明 GeckoView 内核根本不处理加载，不是网络
+  问题，不是时序问题。1.2.2 的“播放可以”可能是原生播放器
+  （Media3/OkHttp），不是 GeckoView 嵌頁播放器——GeckoView 可能
+  在这个 App 里从来就没工作过。
+- 逐行对照结果（javbrowser vs hyper-browser，同一台手机、同一
+  GeckoView 151.0.20260525130955）：DoH provider URL（同款 Gateway）、
+  bootstrap 池（同 5 个 IP）、TRR ONLY、ECH prefs、config 文件内容、
+  ContentBlocking、runtime 创建方式、INTERNET 权限、arm64 splits、
+  APK 内含 libxul.so + omni.ja + dex——全部一致。唯一的实质差异：
+  javbrowser 的 app/build.gradle.kts 设了 packaging.jniLibs.
+  useLegacyPackaging = true（.so 全压缩、安装时解压），hyper-browser
+  没设（默认未压缩、直接从 APK 加载）。该 workaround 只针对
+  AGP <= 8.5 的 16KB 对齐问题，javbrowser 已是 AGP 8.9.1，不再需要。
+- 修法：删掉 useLegacyPackaging，与 hyper-browser 对齐。另加
+  GeckoMinimalTestActivity（独立进程 :geckotest，默认 runtime——
+  不写 config、不设 DoH/ECH，只加载 about:blank，8 秒后出结论），
+  入口在 GeckoBrowserActivity 失败页“最小测试”按钮：若默认设置
+  下 about:blank 能加载，问题在主进程配置；若也加载不了，问题在
+  更底层（打包 / native 库 / 运行环境），与 config 无关。

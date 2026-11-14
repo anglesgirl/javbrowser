@@ -17,8 +17,8 @@ android {
         // GeckoView 151 要求 minSdk 26（manifest merger 强制）。
         minSdk = 26
         targetSdk = 34
-        versionCode = 154
-        versionName = "1.2.6-gecko"
+        versionCode = 155
+        versionName = "1.2.7-gecko"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -46,14 +46,14 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
-    // AGP 8.2 cannot emit 16 KB-aligned ZIP offsets for uncompressed JNI
-    // libraries. Compress them so Android extracts the already 16 KB-aligned
-    // ELF libraries at install time (official workaround for AGP <= 8.5).
-    packaging {
-        jniLibs {
-            useLegacyPackaging = true
-        }
-    }
+    // 1.2.7-gecko：删掉 useLegacyPackaging。AGP 8.9.1 已能直接输出
+    // 16KB 对齐的未压缩 JNI 库（该 workaround 只针对 AGP <= 8.5），
+    // 而 hyper-browser（同款 GeckoView 151、同一台手机能跑）根本
+    // 没设它——javbrowser 是唯一设了它的。压缩后安装时解压的
+    // .so 是两边 setup 唯一的实质差异，且 GeckoView 内核（libxul
+    // 与内容进程）是对 native 库加载方式最敏感的组件；1.2.6 自检
+    // 证实连 about:blank 都加载不了（与网络/DNS/ECH 无关），
+    // 先把打包方式与 hyper-browser 对齐。
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

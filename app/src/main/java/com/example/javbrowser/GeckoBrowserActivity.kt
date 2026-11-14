@@ -104,6 +104,7 @@ class GeckoBrowserActivity : LocalizedActivity() {
     private lateinit var errorMessage: TextView
     private lateinit var retryButton: Button
     private lateinit var selfCheckButton: Button
+    private lateinit var minimalTestButton: Button
     /** 由 NavigationDelegate.onCanGoBack 维护（GeckoSession 没有 canGoBack() 方法）。 */
     private var canGoBack = false
     /** 当前正在载入的地址（重试用；跳转后由 onLocationChange 更新）。 */
@@ -287,10 +288,26 @@ class GeckoBrowserActivity : LocalizedActivity() {
                 topMargin = dp(12)
             }
         }
+        minimalTestButton = Button(this).apply {
+            text = "最小测试"
+            setOnClickListener {
+                startActivity(
+                    Intent(this@GeckoBrowserActivity, GeckoMinimalTestActivity::class.java)
+                )
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                topMargin = dp(12)
+            }
+        }
         errorView.addView(errorTitle)
         errorView.addView(errorMessage)
         errorView.addView(retryButton)
         errorView.addView(selfCheckButton)
+        errorView.addView(minimalTestButton)
         contentFrame.addView(errorView)
         root.addView(contentFrame)
         setContentView(root)

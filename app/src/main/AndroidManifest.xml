@@ -181,6 +181,11 @@
         <activity
             android:name=".GeckoSniffActivity"
             android:configChanges="orientation|screenSize|keyboardHidden" />
+        <activity
+            android:name=".GeckoMinimalTestActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:process=":geckotest" />
         <service
             android:name=".VideoDownloadService"
             android:exported="false"
