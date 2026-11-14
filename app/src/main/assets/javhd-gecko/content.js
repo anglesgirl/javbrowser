@@ -87,17 +87,20 @@
     );
   }
 
-  function reportVideoCandidate(url) {
+  function reportVideoCandidate(url, source) {
     if (!isReportableUrl(url) || reportedSrcs.has(url)) return;
     reportedSrcs.add(url);
-    sendMessage({ type: "mediaCandidate", url: url });
+    // 1.2.12：带上来源标注（"dom" 是内容脚本读 <video>，"probe"
+    // 是页面探针 jwplayer/videojs/hls.js），供嗅探诊断面板分路计数。
+    sendMessage({ type: "mediaCandidate", url: url, source: source || "dom" });
   }
 
   function collectVideoState() {
-    var state = { videoCount: 0, playing: false, playingSrc: "", srcs: [] };
+    var state = { videoCount: 0, playing: false, playingSrc: "", srcs: [], paused: true, currentTime: 0 };
     try {
       var media = document.querySelectorAll("video, audio");
       state.videoCount = media.length;
+      var firstVideoSeen = false;
       for (var i = 0; i < media.length; i++) {
         var el = media[i];
         var src = el.currentSrc || el.src || "";
@@ -110,6 +113,13 @@
           if (isReportableUrl(ssrc) && state.srcs.indexOf(ssrc) === -1) {
             state.srcs.push(ssrc);
           }
+        }
+        // 1.2.12：首个 <video> 的 paused/currentTime，供诊断面板
+        // 印证“播放器显示 2 小时多、视频到底在没在播”。
+        if (el.tagName === "VIDEO" && !firstVideoSeen) {
+          firstVideoSeen = true;
+          state.paused = el.paused;
+          state.currentTime = el.currentTime || 0;
         }
         if (
           el.tagName === "VIDEO" &&
@@ -134,6 +144,8 @@
         videoCount: state.videoCount,
         playing: state.playing,
         playingSrc: state.playingSrc,
+        paused: state.paused,
+        currentTime: state.currentTime,
         srcs: state.srcs
       });
     } catch (e) {
@@ -234,8 +246,17 @@
       if (!data || data.type !== "JB_SNIFF_PROBE") return;
       var urls = data.urls || [];
       for (var i = 0; i < urls.length; i++) {
-        reportVideoCandidate(urls[i]);
+        reportVideoCandidate(urls[i], "probe");
       }
+      // 1.2.12：把探针的完整上报（找到了哪些播放器对象、读到了
+      // 哪些地址）原样转给 native，供嗅探诊断面板显示；候选本身
+      // 仍走上面的 mediaCandidate，不改嗅探逻辑。
+      sendMessage({
+        type: "probeReport",
+        urls: urls,
+        playing: !!data.playing,
+        found: data.found || {}
+      });
       // The probe also knows whether a video is playing; fold that
       // into the next domScan by triggering one now if it says so.
       if (data.playing) sendDomScan();

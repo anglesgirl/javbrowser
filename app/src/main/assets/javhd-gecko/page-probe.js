@@ -33,6 +33,9 @@
 
   var MARKER = "JB_SNIFF_PROBE";
   var reported = new Set();
+  // 1.2.12：记下找到了哪些播放器对象，供嗅探诊断面板显示
+  // （探针到底跑没跑、页面上到底有没有它认识的播放器）。
+  var found = { jwplayer: false, videojs: false, hls: false };
 
   function isHttpUrl(u) {
     return (
@@ -53,6 +56,7 @@
     try {
       // --- JWPlayer (the javhd embed player and many other sites) ---
       if (typeof window.jwplayer === "function") {
+        found.jwplayer = true;
         try {
           var p = window.jwplayer();
           if (p) {
@@ -82,6 +86,7 @@
 
       // --- video.js ---
       if (window.videojs && typeof window.videojs.getPlayers === "function") {
+        found.videojs = true;
         try {
           var players = window.videojs.getPlayers();
           var keys = Object.keys(players);
@@ -109,6 +114,7 @@
       // Native HLS keeps currentSrc as the .m3u8 itself, so this
       // only matters for MSE playback, where currentSrc is blob:.
       if (window.hls && typeof window.hls.url === "string") {
+        found.hls = true;
         add(window.hls.url);
       }
       // Bounded scan: own enumerable window props only, no
@@ -128,6 +134,7 @@
             typeof v.url === "string" &&
             v.url.indexOf(".m3u8") !== -1
           ) {
+            found.hls = true;
             add(v.url);
           }
         }
@@ -163,7 +170,7 @@
     if (urls.length > 0 || playing) {
       try {
         window.postMessage(
-          { type: MARKER, urls: urls, playing: playing },
+          { type: MARKER, urls: urls, playing: playing, found: found },
           "*"
         );
       } catch (e) {}

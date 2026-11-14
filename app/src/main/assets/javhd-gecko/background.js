@@ -155,7 +155,9 @@ function reportMediaCandidate(url) {
   if (reportedUrls.size >= 500) reportedUrls.clear();
   reportedUrls.add(url);
   try {
-    nativePort.postMessage({ type: "mediaCandidate", url: url });
+    // 1.2.12：带上来源标注（source: "webRequest"），供嗅探诊断面
+    // 板分路计数；不改过滤与上报逻辑。
+    nativePort.postMessage({ type: "mediaCandidate", url: url, source: "webRequest" });
   } catch (e) {
     // Port closed; drop.
   }

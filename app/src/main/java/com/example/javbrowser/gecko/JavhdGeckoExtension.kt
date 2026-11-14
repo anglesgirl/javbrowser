@@ -43,15 +43,42 @@ object JavhdGeckoExtension {
     private var installing = false
     private val pendingReady = mutableListOf<(WebExtension) -> Unit>()
 
+    /** 扩展是否已装好（供嗅探诊断面板读状态）。 */
+    val isInstalled: Boolean get() = extension != null
+
+    /** 扩展版本号（读 assets/javhd-gecko/manifest.json，读不到返回 "?"）。 */
+    private var cachedExtensionVersion: String? = null
+    fun extensionVersion(context: Context): String {
+        cachedExtensionVersion?.let { return it }
+        val version = try {
+            context.assets.open("javhd-gecko/manifest.json").bufferedReader().use { reader ->
+                JSONObject(reader.readText()).optString("version", "?")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "读扩展版本失败", e)
+            "?"
+        }
+        cachedExtensionVersion = version
+        return version
+    }
+
     /** 该 session 的 videoState 回调（Activity 在 onPause 时用最新状态记进度）。 */
     private val videoStateHandlers = mutableMapOf<GeckoSession, (JSONObject) -> Unit>()
 
-    /**
-     * 该 session 的实时嗅探回调（GeckoSniffActivity）。background 的
+    /** 该 session 的实时嗅探回调（GeckoSniffActivity）。background 的
      * webRequest 观察者不知道请求属于哪个 session，故 mediaCandidate
      * 会广播给全部已挂回调——同一时间只有一个嗅探会话在跑，不会串。
      */
     private val mediaCandidateHandlers = mutableMapOf<GeckoSession, (String) -> Unit>()
+
+    /**
+     * 同上，但带来源标注（webRequest/dom/domScan/probe，供嗅探诊断
+     * 面板分路计数；1.2.12 诊断用，不改嗅探逻辑）。
+     */
+    private val mediaCandidateSourceHandlers = mutableMapOf<GeckoSession, (String, String) -> Unit>()
+
+    /** 该 session 的页面探针上报回调（GeckoSniffActivity，1.2.12 诊断用）。 */
+    private val probeReportHandlers = mutableMapOf<GeckoSession, (JSONObject) -> Unit/>
 
     /** 该 session 的“正片已开始播放”回调（GeckoSniffActivity）。 */
     private val videoPlayingHandlers = mutableMapOf<GeckoSession, (JSONObject) -> Unit>()
@@ -84,13 +111,29 @@ object JavhdGeckoExtension {
                     }
                 } else if (type == "mediaCandidate") {
                     val url = json.optString("url")
+                    // 来源标注（background.js 标 webRequest，content.js
+                    // 标 dom/probe）；老消息没这个字段时默认 webRequest。
+                    val source = json.optString("source", "webRequest")
                     if (url.isNotBlank()) {
                         val handlers = synchronized(mediaCandidateHandlers) {
                             mediaCandidateHandlers.values.toList()
                         }
+                        val sourceHandlers = synchronized(mediaCandidateSourceHandlers) {
+                            mediaCandidateSourceHandlers.values.toList()
+                        }
                         Handler(Looper.getMainLooper()).post {
                             handlers.forEach { it(url) }
+                            sourceHandlers.forEach { it(url, source) }
                         }
+                    }
+                } else if (type == "probeReport") {
+                    // 页面探针（page-probe.js）上报：找到了哪些播放器
+                    // 对象、读到了哪些地址。只作诊断，不参与嗅探收尾。
+                    val handlers = synchronized(probeReportHandlers) {
+                        probeReportHandlers.values.toList()
+                    }
+                    Handler(Looper.getMainLooper()).post {
+                        handlers.forEach { it(json) }
                     }
                 } else if (type == "videoPlaying") {
                     // 内容脚本报“正片已开始播放”（playing 事件）。同
@@ -127,8 +170,16 @@ object JavhdGeckoExtension {
         }
     }
 
-    /** 装扩展（幂等）。装好后回调 onReady。 */
-    fun ensureInstalled(context: Context, onReady: (WebExtension) -> Unit = {}) {
+    /**
+     * 装扩展（幂等）。装好后回调 onReady；装失败回调 onError（1.2.12
+     * 诊断用：嗅探页要把“扩展装没装上、为什么失败”写进面板——以前
+     * 失败只写 Logcat，用户在真机上完全看不到）。
+     */
+    fun ensureInstalled(
+        context: Context,
+        onReady: (WebExtension) -> Unit = {},
+        onError: (Throwable?) -> Unit = {}
+    ) {
         extension?.let {
             onReady(it)
             return
@@ -152,6 +203,9 @@ object JavhdGeckoExtension {
                         pendingReady.clear()
                     }
                     Log.e(TAG, "javhd 扩展安装返回 null")
+                    Handler(Looper.getMainLooper()).post {
+                        onError(IllegalStateException("ensureBuiltIn 返回 null"))
+                    }
                     return@accept
                 }
                 Handler(Looper.getMainLooper()).post {
@@ -163,6 +217,8 @@ object JavhdGeckoExtension {
                     }
                     videoStateHandlers.keys.forEach { attachSessionDelegate(it, installed) }
                     mediaCandidateHandlers.keys.forEach { attachSessionDelegate(it, installed) }
+                    mediaCandidateSourceHandlers.keys.forEach { attachSessionDelegate(it, installed) }
+                    probeReportHandlers.keys.forEach { attachSessionDelegate(it, installed) }
                     videoPlayingHandlers.keys.forEach { attachSessionDelegate(it, installed) }
                     domScanHandlers.keys.forEach { attachSessionDelegate(it, installed) }
                     callbacks.forEach { it(installed) }
@@ -173,6 +229,7 @@ object JavhdGeckoExtension {
                     pendingReady.clear()
                 }
                 Log.e(TAG, "javhd 扩展安装失败", throwable)
+                Handler(Looper.getMainLooper()).post { onError(throwable) }
             })
     }
 
@@ -201,6 +258,26 @@ object JavhdGeckoExtension {
 
     fun detachMediaSniffer(session: GeckoSession) {
         mediaCandidateHandlers.remove(session)
+    }
+
+    /** 同上，但回调带来源标注（webRequest/dom/domScan/probe，诊断用）。 */
+    fun attachMediaSnifferWithSource(session: GeckoSession, onCandidate: (String, String) -> Unit) {
+        mediaCandidateSourceHandlers[session] = onCandidate
+        extension?.let { attachSessionDelegate(session, it) }
+    }
+
+    fun detachMediaSnifferWithSource(session: GeckoSession) {
+        mediaCandidateSourceHandlers.remove(session)
+    }
+
+    /** 把页面探针上报挂到一个 session 上（GeckoSniffActivity，1.2.12 诊断用）。 */
+    fun attachProbeReportListener(session: GeckoSession, onProbeReport: (JSONObject) -> Unit) {
+        probeReportHandlers[session] = onProbeReport
+        extension?.let { attachSessionDelegate(session, it) }
+    }
+
+    fun detachProbeReportListener(session: GeckoSession) {
+        probeReportHandlers.remove(session)
     }
 
     /** 把“正片已开始播放”信号挂到一个 session 上（GeckoSniffActivity）。 */

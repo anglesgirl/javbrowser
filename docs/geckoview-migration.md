@@ -465,3 +465,29 @@ Gecko 原生自带 DoH + ECH，不再配网络基建。包大一点没关系。
 6. 收藏夹里 JavDB 手动框、今日新片、SearchSource 打开一个站（验证可见浏览器页）。
 7. 若多站同时搜寻时结果串了（A 站的结果出现在 B 站），就是 token 退化串话，
    报给我，修 token 通道（改走 background 按 tab 路由，不再靠 javascript: URL）。
+
+### 1.2.12-gecko（vc160）：嗅探页实时诊断面板 + 一键复制诊断
+
+- 动因：1.2.10 用户真机仍失败（还是 36 条广告，视频在播、播放器显示 2 小时
+  多，嗅探没出视频）；用户指“嗅探还是老的工作模式，扩展好像根本没有任何提示
+  和使用”，且 App 里没有能导出嗅探日志的入口（“查看日誌”只看传输日志）。
+  对真机上发生的事完全没有可见性，不能再盲猜发版。
+- GeckoSniffActivity 顶部（状态栏下方）加默认展开的实时诊断面板（200dp
+  高、可滚动、等宽字）+“复制诊断”按钮。面板实时写：扩展状态（已装好复用 /
+  开始安装 / 已安装耗时 / 安装失败原因）、页面开始/停止、每次 domScan（几个
+  video、playing、paused/currentTime、在播地址、前 3 条 srcs）、每次探针上报
+  （jwplayer/videojs/hls 找到没、读到的地址）、每条候选（来源 webRequest/dom/
+  domScan/probe + 广告/正片）、收尾计时、超时延长、收尾原因 + 全部候选清单。
+- “复制诊断”把面板全部内容 + 应用版本、扩展版本（读 manifest.json）、页面
+  URL、开始时间、扩展状态、runtime、收尾原因、候选清单（含来源计数）复制到
+  剪贴板，Toast“已复制”——用户截图或粘贴发回就能定位。
+- 为此补的诊断管道（只加标签与上报，不改嗅探逻辑）：候选消息带 source 标注
+  （background.js 标 webRequest、content.js 标 dom/probe）；page-probe.js
+  上报 found{jwplayer,videojs,hls}，content.js 另发 probeReport 给 native；
+  domScan 补首个 video 的 paused/currentTime；JavhdGeckoExtension 加
+  isInstalled、extensionVersion、ensureInstalled 的 onError 回调、
+  attachMediaSnifferWithSource、attachProbeReportListener。嗅探逻辑本身
+  （DOM 直读、webRequest 三信号、收尾、VAST、11 广告域、/api/play/ 桌面 UA）
+  一字未动。
+- 用法：进嗅探页看面板（扩展装好没、domScan 到没到、探针找到播放器没），
+  出结果或超时后点“复制诊断”发回。

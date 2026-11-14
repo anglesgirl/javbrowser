@@ -1,18 +1,27 @@
 package com.example.javbrowser
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
+import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.TextUtils
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import java.text.SimpleDateFormat
+import java.util.ArrayDeque
+import java.util.Date
+import java.util.Locale
 import com.example.javbrowser.gecko.GeckoRuntimeProvider
 import com.example.javbrowser.gecko.JavhdGeckoExtension
 import org.json.JSONArray
@@ -59,6 +68,14 @@ import org.mozilla.geckoview.GeckoView
  * 地址”；视频在播但没读到地址时报“视频在播，但未读到播放地址”。
  * tsyndicate.com VAST 永远不拦、也不当候选；javhd 的 /api/play/
  * 桌面 UA 铁律不碰（本页不走 /api/play/）。
+ *
+ * 1.2.12 诊断面板：1.2.10 用户真机仍失败（还是 36 条广告，视频
+ * 在播、播放器显示 2 小时多，嗅探没出视频），用户指“嗅探还是老
+ * 的工作模式，扩展好像根本没有任何提示和使用”，且 App 里没有能
+ * 导出嗅探日志的入口。于是本页顶部加一块默认展开的实时诊断面板
+ * （扩展装好没、domScan 每次结果、探针找到播放器没、候选从哪条
+ * 路来的、收尾原因）+“复制诊断”按钮（一键复制全部诊断发回），
+ * 不再盲猜发版。面板只记录、不改嗅探逻辑。
  */
 class GeckoSniffActivity : LocalizedActivity() {
 
@@ -120,28 +137,53 @@ class GeckoSniffActivity : LocalizedActivity() {
     private var sawPlaying = false
     /** 最近一次 onPageStop 的结果；null 表示正在加载。只记不报。 */
     private var lastPageStopSuccess: Boolean? = null
-    private val finishRunnable = Runnable { finishWithResults() }
+
+    // —— 诊断面板（1.2.12）——
+    private lateinit var diagScroll: ScrollView
+    private lateinit var diagTextView: TextView
+    /** 诊断日志行（带时间戳，最多留 300 行）。 */
+    private val diagLines = ArrayDeque<String>()
+    private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+    private var startMs = 0L
+    private var installStartMs = 0L
+    private var installReadyMs = 0L
+    private var installError: String? = null
+    private var domScanCount = 0
+    private var probeReportCount = 0
+    /** 各路候选计数（webRequest/dom/domScan/probe）。 */
+    private val candidateBySource = mutableMapOf<String, Int>()
+    /** 收尾原因（“进行中”表示还没收尾）。 */
+    private var finishReason = "进行中"
+
+    private val finishRunnable = Runnable { finishWithResults("非广告候选后 3 秒收尾") }
     private val timeoutRunnable = Runnable {
         if (!finished) {
-            when {
+            val reason = when {
                 candidates.isNotEmpty() -> {
                     // 只有广告时 grace 从不排期，走到这里是正常回包。
+                    "超时（20 秒，仅广告候选）"
                 }
                 sawVideoElement -> {
                     Toast.makeText(this, "视频在播，但未读到播放地址", Toast.LENGTH_SHORT).show()
+                    "超时（视频在播但未读到播放地址）"
                 }
                 lastPageStopSuccess == false -> {
                     // 页面真的没加载出来，且 DOM 里也读不到 video。
                     Toast.makeText(this, "页面载入失败", Toast.LENGTH_SHORT).show()
+                    "超时（页面载入失败）"
                 }
                 else -> {
                     Toast.makeText(this, "未嗅探到播放地址", Toast.LENGTH_SHORT).show()
+                    "超时（20 秒，无候选）"
                 }
             }
-            finishWithResults()
+            finishWithResults(reason)
         }
     }
-    private val installTimeoutRunnable = Runnable { startLoading() }
+    private val installTimeoutRunnable = Runnable {
+        diagLog("扩展：安装超时（8 秒），先加载页面")
+        startLoading()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -181,7 +223,7 @@ class GeckoSniffActivity : LocalizedActivity() {
         }
         val closeButton = Button(this).apply {
             text = "✕"
-            setOnClickListener { finishWithResults() }
+            setOnClickListener { finishWithResults("用户点了关闭") }
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -191,6 +233,58 @@ class GeckoSniffActivity : LocalizedActivity() {
         bar.addView(closeButton)
         root.addView(bar)
 
+        // 诊断面板（1.2.12）：默认展开，不藏二级菜单。用户要一眼
+        // 看到扩展到底在干什么——装好没、domScan 到没到、探针找到
+        // 播放器没、候选从哪条路来的、最后为什么收尾。
+        val diagHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Color.parseColor("#252525"))
+            setPadding(16, 8, 16, 8)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        val diagTitle = TextView(this).apply {
+            text = "诊断"
+            setTextColor(Color.parseColor("#BBBBBB"))
+            textSize = 13f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val copyButton = Button(this).apply {
+            text = "复制诊断"
+            setOnClickListener { copyDiagnosis() }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        diagHeader.addView(diagTitle)
+        diagHeader.addView(copyButton)
+        root.addView(diagHeader)
+
+        diagScroll = ScrollView(this).apply {
+            setBackgroundColor(Color.parseColor("#0D0D0D"))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(200)
+            )
+        }
+        diagTextView = TextView(this).apply {
+            text = ""
+            setTextColor(Color.parseColor("#BBBBBB"))
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+            setPadding(16, 8, 16, 8)
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        diagScroll.addView(diagTextView)
+        root.addView(diagScroll)
+
         geckoView = GeckoView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -199,6 +293,9 @@ class GeckoSniffActivity : LocalizedActivity() {
         }
         root.addView(geckoView)
         setContentView(root)
+
+        startMs = System.currentTimeMillis()
+        diagLog("嗅探开始 页面=$detailUrl")
 
         val runtime = GeckoRuntimeProvider.get(this)
         geckoSession = GeckoSession()
@@ -212,6 +309,7 @@ class GeckoSniffActivity : LocalizedActivity() {
         geckoSession.progressDelegate = object : GeckoSession.ProgressDelegate {
             override fun onPageStart(session: GeckoSession, url: String) {
                 lastPageStopSuccess = null
+                diagLog("页面开始加载：$url")
             }
 
             override fun onPageStop(session: GeckoSession, success: Boolean) {
@@ -219,20 +317,25 @@ class GeckoSniffActivity : LocalizedActivity() {
                 // 能报 false（重定向/子资源失败），以 DOM 里有没
                 // 有 <video> 为准（见 domScan 与超时时的判定）。
                 lastPageStopSuccess = success
+                diagLog("页面停止：success=$success")
             }
         }
         geckoSession.open(runtime)
         geckoView.setSession(geckoSession)
 
-        JavhdGeckoExtension.attachMediaSniffer(geckoSession) { url ->
-            onCandidate(url)
+        JavhdGeckoExtension.attachMediaSnifferWithSource(geckoSession) { url, source ->
+            onCandidate(url, source)
         }
-        JavhdGeckoExtension.attachVideoPlayingListener(geckoSession) {
-            onPlayingDetected()
+        JavhdGeckoExtension.attachVideoPlayingListener(geckoSession) { json ->
+            onPlayingDetected(json)
         }
         JavhdGeckoExtension.attachDomScanListener(geckoSession) { json ->
             onDomScan(json)
         }
+        JavhdGeckoExtension.attachProbeReportListener(geckoSession) { json ->
+            onProbeReport(json)
+        }
+        diagLog("已挂嗅探回调（候选/domScan/playing/探针）")
 
         // 主路的关键时序：扩展装好再加载页面。扩展是异步装的，
         // 不等装好就 loadUri，页面、播放器、manifest 请求会全在
@@ -240,7 +343,21 @@ class GeckoSniffActivity : LocalizedActivity() {
         // 本进程里只装一次，后续嗅探 onReady 立即回调，不多等。
         // 8 秒还没装好也加载（扩展晚装上后内容脚本还能注入已
         // 加载的页面，domScan 随后会到），不等死。
-        JavhdGeckoExtension.ensureInstalled(this) { startLoading() }
+        installStartMs = System.currentTimeMillis()
+        val extAlreadyInstalled = JavhdGeckoExtension.isInstalled
+        diagLog(if (extAlreadyInstalled) "扩展：已装好（复用）" else "扩展：开始安装…")
+        JavhdGeckoExtension.ensureInstalled(
+            this,
+            onReady = {
+                installReadyMs = System.currentTimeMillis()
+                diagLog("扩展：已安装（耗时 ${installReadyMs - installStartMs}ms）版本=${JavhdGeckoExtension.extensionVersion(this)}")
+                startLoading()
+            },
+            onError = { e ->
+                installError = e?.let { "${it.javaClass.simpleName}: ${it.message}" } ?: "未知错误"
+                diagLog("扩展：安装失败：$installError（8 秒后仍加载页面）")
+            }
+        )
         handler.postDelayed(installTimeoutRunnable, INSTALL_TIMEOUT_MS)
     }
 
@@ -250,20 +367,24 @@ class GeckoSniffActivity : LocalizedActivity() {
         loadStarted = true
         handler.removeCallbacks(installTimeoutRunnable)
         statusText.text = "正在读播放地址…"
+        diagLog("开始加载页面")
         handler.postDelayed(timeoutRunnable, TIMEOUT_MS)
         geckoSession.loadUri(detailUrl)
     }
 
-    private fun onCandidate(url: String) {
+    private fun onCandidate(url: String, source: String = "webRequest") {
         if (finished) return
         val added = candidates.add(url)
         if (!added) return
+        candidateBySource[source] = (candidateBySource[source] ?: 0) + 1
+        diagLog("候选[$source][${if (looksAd(url)) "广告" else "正片"}]：$url")
         updateStatus()
         // 旧逻辑的坑：首个候选（常是广告）到后 3 秒就收尾，正片
         // 常在 VAST 跳过后才来，容易被截断。改成只有非广告候选
         // 到后才开始 3 秒收尾；只来广告时等满 20 秒超时再回。
         if (!graceScheduled && !looksAd(url)) {
             graceScheduled = true
+            diagLog("收尾计时开始（首个非广告候选，3 秒）")
             handler.postDelayed(finishRunnable, GRACE_MS)
         }
     }
@@ -277,15 +398,29 @@ class GeckoSniffActivity : LocalizedActivity() {
      */
     private fun onDomScan(json: JSONObject) {
         if (finished) return
+        domScanCount++
         val videoCount = json.optInt("videoCount", 0)
         if (videoCount > 0) sawVideoElement = true
         val playing = json.optBoolean("playing", false)
+        val paused = json.optBoolean("paused", true)
+        val currentTime = json.optDouble("currentTime", 0.0)
+        val playingSrc = json.optString("playingSrc", "")
         val srcs: JSONArray? = json.optJSONArray("srcs")
+        val srcList = mutableListOf<String>()
         if (srcs != null) {
             for (i in 0 until srcs.length()) {
                 val url = srcs.optString(i)
-                if (url.isNotBlank()) onCandidate(url)
+                if (url.isNotBlank()) srcList.add(url)
             }
+        }
+        diagLog(
+            "domScan#$domScanCount：video=$videoCount playing=$playing " +
+                "(paused=$paused currentTime=${String.format(Locale.US, "%.1f", currentTime)}s) " +
+                "playingSrc=${playingSrc.ifBlank { "-" }} srcs=${srcList.size}条" +
+                if (srcList.isNotEmpty()) " [${srcList.take(3).joinToString(" | ") { it.take(100) }}]" else ""
+        )
+        for (url in srcList) {
+            onCandidate(url, "domScan")
         }
         if (finished) return
         if (playing) {
@@ -296,24 +431,61 @@ class GeckoSniffActivity : LocalizedActivity() {
     }
 
     /**
+     * 页面探针（page-probe.js）上报：它在页面的 JS 世界里找到
+     * 了哪些播放器对象、读到了哪些地址。只作诊断——候选本身已
+     * 经由内容脚本以 source="probe" 上报过，这里不重复当候选。
+     * 探针一次都没上报，本身就是诊断信号（注入被 CSP 拦住，或
+     * 页面上没有它认识的播放器）。
+     */
+    private fun onProbeReport(json: JSONObject) {
+        if (finished) return
+        probeReportCount++
+        val found = json.optJSONObject("found")
+        val urls: JSONArray? = json.optJSONArray("urls")
+        val urlList = mutableListOf<String>()
+        if (urls != null) {
+            for (i in 0 until urls.length()) {
+                val url = urls.optString(i)
+                if (url.isNotBlank()) urlList.add(url)
+            }
+        }
+        diagLog(
+            "探针#$probeReportCount：jwplayer=${found?.optBoolean("jwplayer", false)} " +
+                "videojs=${found?.optBoolean("videojs", false)} " +
+                "hls=${found?.optBoolean("hls", false)} " +
+                "playing=${json.optBoolean("playing", false)} urls=${urlList.size}条" +
+                if (urlList.isNotEmpty()) " [${urlList.take(3).joinToString(" | ") { it.take(100) }}]" else ""
+        )
+    }
+
+    /**
      * 正片已开始播放（playing 事件，或 domScan 发现已在播的视频
      * ——后者补“视频在内容脚本注入前就已开播、事件已错过”的情况）。
      * 有候选就立刻收尾（正片地址已在手里）；没候选就把超时延长
      * 一次——正片在播，说明播放器已拿到流，它的地址可能还在路上
      * （或走了一条刚补上的检测路径）。
      */
-    private fun onPlayingDetected() {
+    private fun onPlayingDetected(json: JSONObject? = null) {
         if (finished) return
         sawPlaying = true
+        if (json != null) {
+            val duration = json.optDouble("duration", 0.0)
+            val src = json.optString("src", "")
+            diagLog(
+                "playing 事件：duration=${String.format(Locale.US, "%.1f", duration)}s " +
+                    "src=${src.ifBlank { "-" }}"
+            )
+        }
         if (candidates.isNotEmpty()) {
             statusText.text = "正片已开始播放，收尾…"
-            finishWithResults()
+            finishWithResults("视频已播且已有候选，立即收尾")
             return
         }
         if (!timeoutExtended) {
             timeoutExtended = true
             handler.removeCallbacks(timeoutRunnable)
             handler.postDelayed(timeoutRunnable, TIMEOUT_EXTENSION_MS)
+            diagLog("超时延长 10 秒（视频在播但无候选）")
             statusText.text = "视频已在播，正在读播放地址…"
         } else {
             updateStatus()
@@ -337,15 +509,20 @@ class GeckoSniffActivity : LocalizedActivity() {
         return AD_SEGMENT.containsMatchIn(url)
     }
 
-    private fun finishWithResults() {
+    private fun finishWithResults(reason: String = "用户关闭") {
         if (finished) return
         finished = true
+        finishReason = reason
         handler.removeCallbacks(finishRunnable)
         handler.removeCallbacks(timeoutRunnable)
         handler.removeCallbacks(installTimeoutRunnable)
         // 去重已由 linkedSetOf 保证；回包时非广告排前面（下游
         // 选择器同分同排，顺序只是保底），广告沉底。
         val (feature, ads) = candidates.partition { !looksAd(it) }
+        diagLog("收尾：$reason 候选=${candidates.size}条（正片 ${feature.size} / 广告 ${ads.size}）")
+        candidates.forEachIndexed { i, url ->
+            diagLog("  [${i + 1}][${if (looksAd(url)) "广告" else "正片"}] $url")
+        }
         val result = Intent().apply {
             putStringArrayListExtra(EXTRA_CANDIDATE_URLS, ArrayList(feature + ads))
         }
@@ -354,19 +531,80 @@ class GeckoSniffActivity : LocalizedActivity() {
     }
 
     override fun onBackPressed() {
-        finishWithResults()
+        finishWithResults("用户按返回")
     }
 
     override fun onDestroy() {
         if (::geckoSession.isInitialized) {
             JavhdGeckoExtension.detachMediaSniffer(geckoSession)
+            JavhdGeckoExtension.detachMediaSnifferWithSource(geckoSession)
             JavhdGeckoExtension.detachVideoPlayingListener(geckoSession)
             JavhdGeckoExtension.detachDomScanListener(geckoSession)
+            JavhdGeckoExtension.detachProbeReportListener(geckoSession)
             geckoSession.close()
         }
         handler.removeCallbacks(finishRunnable)
         handler.removeCallbacks(timeoutRunnable)
         handler.removeCallbacks(installTimeoutRunnable)
         super.onDestroy()
+    }
+
+    // —— 诊断面板（1.2.12）——
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density + 0.5f).toInt()
+
+    /** 诊断面板写一行（带时间戳，最多留 300 行，自动滚到底）。 */
+    private fun diagLog(line: String) {
+        diagLines.addLast("[${timeFormat.format(Date())}] $line")
+        while (diagLines.size > 300) diagLines.removeFirst()
+        diagTextView.text = diagLines.joinToString("\n")
+        diagScroll.post { diagScroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    /** “复制诊断”：把面板全部内容 + 关键状态复制到剪贴板。 */
+    private fun copyDiagnosis() {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("javbrowser 嗅探诊断", buildDiagCopyText()))
+        Toast.makeText(this, "已复制", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun buildDiagCopyText(): String {
+        val appVersion = try {
+            val pi = packageManager.getPackageInfo(packageName, 0)
+            val vc = if (android.os.Build.VERSION.SDK_INT >= 28) pi.longVersionCode else pi.versionCode.toLong()
+            "${pi.versionName} ($vc)"
+        } catch (e: Exception) {
+            "?"
+        }
+        val (feature, ads) = candidates.partition { !looksAd(it) }
+        return buildString {
+            appendLine("javbrowser 嗅探诊断")
+            appendLine("应用版本：$appVersion")
+            appendLine("扩展版本：${JavhdGeckoExtension.extensionVersion(this@GeckoSniffActivity)}")
+            appendLine("页面 URL：$detailUrl")
+            appendLine("开始时间：${timeFormat.format(Date(startMs))}")
+            appendLine(
+                "扩展状态：" + when {
+                    installReadyMs > 0 -> "已安装（耗时 ${installReadyMs - installStartMs}ms）"
+                    installError != null -> "安装失败：$installError"
+                    else -> "安装中/未完成"
+                }
+            )
+            appendLine("runtime：已取得（GeckoRuntimeProvider 单例）")
+            appendLine("收尾原因：$finishReason")
+            appendLine("候选：${candidates.size} 条（正片 ${feature.size} / 广告 ${ads.size}）")
+            appendLine(
+                "候选来源：webRequest=${candidateBySource["webRequest"] ?: 0} / " +
+                    "dom=${candidateBySource["dom"] ?: 0} / " +
+                    "domScan=${candidateBySource["domScan"] ?: 0} / " +
+                    "probe=${candidateBySource["probe"] ?: 0}"
+            )
+            candidates.forEachIndexed { i, url ->
+                appendLine("  [${i + 1}][${if (looksAd(url)) "广告" else "正片"}] $url")
+            }
+            appendLine("—— 诊断日志 ——")
+            append(diagLines.joinToString("\n"))
+        }
     }
 }
