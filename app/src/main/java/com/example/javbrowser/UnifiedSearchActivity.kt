@@ -357,7 +357,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             LanguageManager.text(this, "正在进入播放页嗅探…", "Sniffing the player page…"),
             Toast.LENGTH_SHORT).show()
         sniffLauncher.launch(
-            GeckoSniffActivity.intent(this, item.detailUrl, item.siteId, item.title, item.code)
+            GeckoSniffActivity.intent(this, item.detailUrl, item.siteId, item.title, item.code.orEmpty())
         )
     }
 

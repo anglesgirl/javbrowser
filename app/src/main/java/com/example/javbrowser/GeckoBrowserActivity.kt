@@ -44,6 +44,8 @@ class GeckoBrowserActivity : LocalizedActivity() {
     private lateinit var geckoView: GeckoView
     private lateinit var geckoSession: GeckoSession
     private lateinit var urlText: TextView
+    /** 由 NavigationDelegate.onCanGoBack 维护（GeckoSession 没有 canGoBack() 方法）。 */
+    private var canGoBack = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -126,8 +128,17 @@ class GeckoBrowserActivity : LocalizedActivity() {
             }
         }
         geckoSession.navigationDelegate = object : GeckoSession.NavigationDelegate {
-            override fun onLocationChange(session: GeckoSession, url: String?) {
+            override fun onLocationChange(
+                session: GeckoSession,
+                url: String?,
+                perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>,
+                hasUserGesture: Boolean
+            ) {
                 if (url != null) urlText.text = url
+            }
+
+            override fun onCanGoBack(session: GeckoSession, canGoBack: Boolean) {
+                this@GeckoBrowserActivity.canGoBack = canGoBack
             }
         }
         geckoSession.open(runtime)
@@ -137,7 +148,7 @@ class GeckoBrowserActivity : LocalizedActivity() {
     }
 
     override fun onBackPressed() {
-        if (::geckoSession.isInitialized && geckoSession.canGoBack()) {
+        if (::geckoSession.isInitialized && canGoBack) {
             geckoSession.goBack()
             return
         }
