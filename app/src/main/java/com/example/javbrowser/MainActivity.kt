@@ -132,14 +132,20 @@ class MainActivity : LocalizedActivity() {
     private val landingDiagLog = mutableListOf<String>()
     private var landingProbeSession: GeckoSession? = null
     private var landingProbeRunning = false
-    private var landingProbeStarted = false
+    // 1.2.16 三地址探针状态（依次在新会话上试 resource:// / https / moz-extension://）。
+    private val landingProbeTargets = mutableListOf<Pair<String, String>>()
+    private var landingProbeIndex = -1
+    private var landingProbeStepDone = false
+    private val landingProbeStepResults = mutableListOf<String>()
     private val landingWatchdogRunnable = Runnable { onLandingWatchdog() }
     /** 首个首页加载是否已发出（post 与兜底延时只发一次）。 */
     private var landingInitialLoadStarted = false
     /** 首个首页加载兜底发出（geckoView.post 没跑起来时用）。 */
     private val landingLoadFallbackRunnable = Runnable { startInitialLandingLoad() }
     private val landingProbeTimeoutRunnable = Runnable {
-        if (landingProbeRunning && !landingProbeStarted) finishLandingSelfCheck(false, "about:blank 5 秒内没有开始加载")
+        if (landingProbeRunning && !landingProbeStepDone) {
+            finishLandingProbeStep("TIMEOUT（5 秒内无任何回调）")
+        }
     }
     private lateinit var favoritesManager: FavoritesManager
     private lateinit var privacySettings: PrivacySettings
@@ -7101,7 +7107,7 @@ class MainActivity : LocalizedActivity() {
         fun rel(t: Long?): String =
             if (t == null || landingLoadIssuedAt == 0L) "未触发" else "已触发（+${t - landingLoadIssuedAt}ms）"
         return buildString {
-            appendLine("诊断快照（1.2.14-gecko）：")
+            appendLine("诊断快照（1.2.16-gecko）：")
             appendLine("会话已打开=$open，视图已挂载=$attached，视图有会话=$hasSession，视图尺寸=${w}x$h")
             appendLine("桥扩展已装=$bridgeInstalled（gecko-bridge），javhd 扩展已装=$javhdInstalled")
             appendLine("onPageStart=${rel(landingPageStartAt)}")
@@ -7242,37 +7248,64 @@ class MainActivity : LocalizedActivity() {
     }
 
     /**
-     * 自检：用同一 runtime 新开一个探测 session 加载 about:blank
-     * （不走网络）。5 秒内 onPageStart 来了就是内核与会话正常，
-     * 问题在首页加载本身；没来就是内核或运行环境异常。
+     * 自检（三地址探针，1.2.16-gecko）：用同一 runtime 新开一个探测
+     * session，依次加载三个地址，看哪个能触发 onPageStart——
+     *   A resource://android/assets/landing.html（首页本体，不带 hash 数据）
+     *   B https://example.com（纯网络加载，测内核+网络通路）
+     *   C moz-extension://<gecko-bridge>/probe.html（扩展页，hyper-browser 同款机制）
+     * 每个地址 5 秒：onPageStart 来了记 STARTED，onLoadError 记 ERROR，
+     * 5 秒无回调记 TIMEOUT。一次定性：是 resource:// 本身不行、
+     * 还是主会话的问题、还是整个加载都有问题。
      * （GeckoBrowserActivity.runSelfCheck 同款做法。）
      */
     private fun runLandingSelfCheck() {
         if (landingProbeRunning) return
         if (!::geckoSession.isInitialized) return
+        // 组装三个探针目标；C 取不到扩展地址时跳过并记一笔。
+        landingProbeTargets.clear()
+        landingProbeTargets += "A resource://" to LANDING_ASSET_URL
+        landingProbeTargets += "B https" to "https://example.com"
+        val bridgeBase = GeckoBridgeExtension.baseUrl
+        if (bridgeBase != null) {
+            landingProbeTargets += "C moz-extension://" to "${bridgeBase}probe.html"
+        }
+        landingProbeStepResults.clear()
+        landingProbeIndex = -1
         landingProbeRunning = true
-        landingProbeStarted = false
         landingDiagSelfCheckBtn?.isEnabled = false
         landingDiagSelfCheckBtn?.text = "自检中…"
-        landingDiagLogLine("自检：新会话加载 about:blank…")
+        landingDiagLogLine("自检：新会话依次试 ${landingProbeTargets.size} 个地址（resource:// / https / moz-extension://），每个 5 秒…")
+        if (bridgeBase == null) {
+            landingDiagLogLine("自检：C moz-extension:// 跳过（未取到 gecko-bridge 扩展地址）")
+        }
         landingDiagMessage?.text = buildLandingDiagText(landingDiagStatus?.text?.toString().orEmpty())
         val runtime = GeckoRuntimeProvider.get(this)
         val probe = GeckoSession()
         probe.progressDelegate = object : GeckoSession.ProgressDelegate {
             override fun onPageStart(session: GeckoSession, url: String) {
-                if (!landingProbeStarted) {
-                    landingProbeStarted = true
-                    geckoMainHandler.removeCallbacks(landingProbeTimeoutRunnable)
-                    finishLandingSelfCheck(true, "about:blank 已开始加载")
+                if (landingProbeRunning && !landingProbeStepDone) {
+                    finishLandingProbeStep("STARTED（onPageStart 已触发）")
                 }
             }
 
             override fun onPageStop(session: GeckoSession, success: Boolean) {
-                if (!landingProbeStarted) {
-                    landingProbeStarted = true
-                    geckoMainHandler.removeCallbacks(landingProbeTimeoutRunnable)
-                    finishLandingSelfCheck(true, "about:blank 已加载完成")
+                // onPageStart 已记过 STARTED 就不再重复；没来过 onPageStart
+                // 却直接 onPageStop 的，也算有反应，记一笔。
+                if (landingProbeRunning && !landingProbeStepDone) {
+                    finishLandingProbeStep("STOPPED（onPageStop success=$success，未见 onPageStart）")
                 }
+            }
+        }
+        probe.navigationDelegate = object : GeckoSession.NavigationDelegate {
+            override fun onLoadError(
+                session: GeckoSession,
+                uri: String?,
+                error: WebRequestError
+            ): GeckoResult<String>? {
+                if (landingProbeRunning && !landingProbeStepDone) {
+                    finishLandingProbeStep("ERROR（onLoadError code=${error.code}）")
+                }
+                return null
             }
         }
         landingProbeSession = probe
@@ -7281,16 +7314,58 @@ class MainActivity : LocalizedActivity() {
             geckoView.setSession(probe)
             probe.setActive(true)
             probe.setFocused(true)
-            probe.loadUri("about:blank")
         }.onFailure {
             android.util.Log.w("GeckoLanding", "自检启动失败", it)
-            finishLandingSelfCheck(false, "探测会话启动失败：${it.message}")
+            landingProbeSession = null
+            landingProbeRunning = false
+            landingDiagSelfCheckBtn?.isEnabled = true
+            landingDiagSelfCheckBtn?.text = "自检"
+            landingDiagLogLine("自检：探测会话启动失败：${it.message}")
+            landingDiagMessage?.text = buildLandingDiagText(landingDiagStatus?.text?.toString().orEmpty())
             return
         }
-        geckoMainHandler.postDelayed(landingProbeTimeoutRunnable, LANDING_PROBE_TIMEOUT_MS)
+        runLandingProbeStep()
     }
 
-    private fun finishLandingSelfCheck(ok: Boolean, detail: String) {
+    /** 探针下一步：发当前地址并挂 5 秒超时；发完则等待回调或超时。 */
+    private fun runLandingProbeStep() {
+        landingProbeIndex++
+        if (landingProbeIndex >= landingProbeTargets.size) {
+            finishLandingProbe()
+            return
+        }
+        val (label, url) = landingProbeTargets[landingProbeIndex]
+        landingProbeStepDone = false
+        landingDiagLogLine("探针 $label：加载 $url …")
+        landingDiagMessage?.text = buildLandingDiagText(landingDiagStatus?.text?.toString().orEmpty())
+        val probe = landingProbeSession ?: run {
+            finishLandingProbe()
+            return
+        }
+        geckoMainHandler.removeCallbacks(landingProbeTimeoutRunnable)
+        geckoMainHandler.postDelayed(landingProbeTimeoutRunnable, LANDING_PROBE_TIMEOUT_MS)
+        runCatching { probe.loadUri(url) }.onFailure {
+            android.util.Log.w("GeckoLanding", "探针 $label 发出失败", it)
+            finishLandingProbeStep("ERROR（loadUri 抛错：${it.message}）")
+        }
+    }
+
+    /** 探针某一步有结论（STARTED/ERROR/TIMEOUT）：记结果，进下一步。 */
+    private fun finishLandingProbeStep(result: String) {
+        if (!landingProbeRunning || landingProbeStepDone) return
+        landingProbeStepDone = true
+        geckoMainHandler.removeCallbacks(landingProbeTimeoutRunnable)
+        val (label, _) = landingProbeTargets.getOrNull(landingProbeIndex) ?: return
+        val line = "探针 $label：$result"
+        landingProbeStepResults += line
+        landingDiagLogLine(line)
+        landingDiagMessage?.text = buildLandingDiagText(landingDiagStatus?.text?.toString().orEmpty())
+        // 下一步 post 出去，避免在回调栈里直接重入 loadUri。
+        geckoMainHandler.post { runLandingProbeStep() }
+    }
+
+    /** 三地址探针全部跑完：恢复主会话，汇总定性结论。 */
+    private fun finishLandingProbe() {
         geckoMainHandler.removeCallbacks(landingProbeTimeoutRunnable)
         // 先把主会话挂回视图并激活，再关探测会话。
         if (::geckoSession.isInitialized) {
@@ -7306,13 +7381,30 @@ class MainActivity : LocalizedActivity() {
         landingProbeRunning = false
         landingDiagSelfCheckBtn?.isEnabled = true
         landingDiagSelfCheckBtn?.text = "自检"
-        val verdict = if (ok) {
-            "自检：内核与新会话正常（$detail），问题在首页加载本身，点“重试”再载一次"
-        } else {
-            "自检：新会话也无法加载（$detail）——内核或运行环境异常，请把这段话发给开发者"
-        }
+        val verdict = buildLandingProbeVerdict()
         landingDiagLogLine(verdict)
         landingDiagMessage?.text = buildLandingDiagText(landingDiagStatus?.text?.toString().orEmpty())
+    }
+
+    /** 按三地址结果定性：STARTED 或 STOPPED 都算该地址有反应，拼一句话结论。 */
+    private fun buildLandingProbeVerdict(): String {
+        fun responded(labelPrefix: String) =
+            landingProbeStepResults.any {
+                it.startsWith("探针 $labelPrefix") && (it.contains("STARTED") || it.contains("STOPPED"))
+            }
+        val cAttempted = landingProbeTargets.any { it.first.startsWith("C") }
+        val aOk = responded("A")
+        val bOk = responded("B")
+        val cOk = responded("C")
+        return when {
+            !aOk && bOk && cOk -> "自检结论：resource:// 导航被拦（A 无反应），https 与扩展页都正常——首页应改走扩展页（moz-extension://）加载"
+            !aOk && !bOk && !cOk -> "自检结论：新会话三个地址全无反应——内核或运行环境异常，请把这段话发给开发者"
+            aOk -> "自检结论：resource:// 在新会话上能加载（A 正常）——问题在主会话本身，不在地址"
+            !aOk && bOk && !cOk && cAttempted -> "自检结论：resource:// 与扩展页都不行，只有 https 正常——本地地址加载有问题"
+            !aOk && !bOk && cOk -> "自检结论：只有扩展页正常，resource:// 与 https 都不行——本地 resource:// 与网络都有问题"
+            !aOk && bOk && !cAttempted -> "自检结论：resource:// 不行（A 无反应），https 正常，扩展页未测（未取到扩展地址）——首页应改走扩展页加载，须先确认扩展地址"
+            else -> "自检结论：见上方三条探针结果"
+        }
     }
 
     /** “复制诊断”：把失败页全部内容 + 应用版本复制到剪贴板。 */

@@ -63,6 +63,9 @@ internal object GeckoBridgeExtension {
 
     /** 桥扩展是否已装好（1.2.14 首页诊断快照用；与 JavhdGeckoExtension.isInstalled 同款）。 */
     val isInstalled: Boolean get() = extension != null
+
+    /** 扩展的 moz-extension:// 根地址（1.2.16 三地址探针用；未装好返回 null）。 */
+    val baseUrl: String? get() = extension?.metaData?.baseUrl
     private val pendingReady = mutableListOf<(WebExtension) -> Unit>()
     private val pendingError = mutableListOf<() -> Unit>()
 
