@@ -12,6 +12,10 @@ on:
         required: false
         default: false
         type: boolean
+      apk_upload_id:
+        description: 'Resume a 24-hour Oracle upload session for the exact same APK SHA-256'
+        required: false
+        type: string
 
 jobs:
   build:
@@ -58,6 +62,37 @@ jobs:
           # 別只警告然後讓 release 找不到 artifact。
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+      - name: Submit APK to Oracle smoke test
+        id: oracle_smoke
+        if: github.ref == 'refs/heads/feat/geckoview'
+        env:
+          APK_TEST_API_TOKEN: ${{ secrets.APK_TEST_API_TOKEN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.APK_TEST_CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.APK_TEST_CF_ACCESS_CLIENT_SECRET }}
+          APK_UPLOAD_ID: ${{ github.event.inputs.apk_upload_id }}
+        run: bash scripts/oracle-apk-smoke.sh
+
+      - name: Upload Oracle smoke-test evidence
+        if: always() && github.ref == 'refs/heads/feat/geckoview'
+        uses: actions/upload-artifact@v4
+        with:
+          name: oracle-smoke-${{ github.sha }}
+          path: ${{ runner.temp }}/apk-test-evidence
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Fail the build if Oracle smoke test did not pass
+        if: always() && github.ref == 'refs/heads/feat/geckoview'
+        env:
+          ORACLE_TEST_RESULT: ${{ steps.oracle_smoke.outputs.result }}
+        run: |
+          if [[ "$ORACLE_TEST_RESULT" != 'passed' ]]; then
+            echo "::error::Oracle smoke test result: ${ORACLE_TEST_RESULT:-missing}"
+            exit 1
+          fi
+
+
 
   release:
     name: Publish release
