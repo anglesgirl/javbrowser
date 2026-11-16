@@ -84,6 +84,17 @@ internal object GeckoBridgeExtension {
     private val sessionTokens: MutableMap<GeckoSession, String> =
         Collections.synchronizedMap(WeakHashMap())
 
+    /** Set only while the app-owned main-session landing document is active. */
+    private var landingMessageHandler: ((JSONObject) -> Unit)? = null
+
+    fun setLandingMessageHandler(handler: ((JSONObject) -> Unit)?) {
+        landingMessageHandler = handler
+    }
+
+    fun sendToLanding(payload: JSONObject) {
+        sendToBackground(JSONObject().put("type", "landingMessage").put("payload", payload))
+    }
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     /** 线程工具：GeckoSession / Port 的方法都要求主线程调。 */
@@ -279,6 +290,9 @@ internal object GeckoBridgeExtension {
             "cookieResult", "cookieSetDone" -> GeckoCookies.handleCookieMessage(json)
             "bridgeCall" -> GeckoBridge.handleBridgeMessage(json)
             "bridgeLog" -> Log.d(TAG, "bridge: ${json.optString("message")}")
+            "landingReady", "landingBridgeCall", "landingPong" -> runOnMain {
+                landingMessageHandler?.invoke(json)
+            }
             else -> Log.d(TAG, "忽略未知类型扩展消息：${json.optString("type")}")
         }
     }

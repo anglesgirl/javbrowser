@@ -41,4 +41,13 @@ class LandingUrlMapperTest {
         )
         assertNull(mapper.map(null))
     }
+
+    @Test fun extensionLandingIdentityMatchesOnlyTheExactDocument() {
+        val url = "moz-extension://example-id/landing.html"
+        mapper.beginLandingLoad(url)
+        assertEquals("about:blank", mapper.map("about:blank"))
+        assertEquals("https://javbrowser.app/", mapper.map("$url#data=%7B%7D"))
+        assertEquals("$url.evil", mapper.map("$url.evil"))
+        assertEquals(url, mapper.map(url))
+    }
 }

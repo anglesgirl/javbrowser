@@ -23,15 +23,137 @@
 
 let nativePort = null;
 let reconnectTimer = null;
+let landingPort = null;
+const pendingNativeMessages = [];
+const pendingLandingMessages = [];
+const MAX_PENDING_MESSAGES = 32;
+const MAX_LANDING_MESSAGE_BYTES = 256 * 1024;
+
+function isWithinLandingMessageLimit(value) {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).length <= MAX_LANDING_MESSAGE_BYTES;
+  } catch (e) {
+    return false;
+  }
+}
+
+function postNativeMessage(message) {
+  if (!isWithinLandingMessageLimit(message)) return;
+  if (!nativePort) {
+    if (pendingNativeMessages.length >= MAX_PENDING_MESSAGES) pendingNativeMessages.shift();
+    pendingNativeMessages.push(message);
+    return;
+  }
+  try {
+    nativePort.postMessage(message);
+  } catch (e) {
+    if (pendingNativeMessages.length >= MAX_PENDING_MESSAGES) pendingNativeMessages.shift();
+    pendingNativeMessages.push(message);
+  }
+}
+
+function flushPendingNativeMessages() {
+  while (nativePort && pendingNativeMessages.length > 0) {
+    try {
+      nativePort.postMessage(pendingNativeMessages[0]);
+      pendingNativeMessages.shift();
+    } catch (e) {
+      break;
+    }
+  }
+}
+
+function postLandingMessage(payload) {
+  if (!isWithinLandingMessageLimit(payload)) return;
+  // Do not retain private clipboard data for a later document. Native resends
+  // current state after the new landing page announces readiness.
+  if (!landingPort) return;
+  try {
+    landingPort.postMessage(payload);
+  } catch (e) {
+    // The document disappeared; a future ready event will refresh state.
+  }
+}
+
+function flushPendingLandingMessages(port) {
+  while (landingPort === port && pendingLandingMessages.length > 0) {
+    try {
+      port.postMessage(pendingLandingMessages[0]);
+      pendingLandingMessages.shift();
+    } catch (e) {
+      break;
+    }
+  }
+}
+
+function isTrustedLandingPort(port) {
+  const senderUrl = port && port.sender && port.sender.url;
+  if (typeof senderUrl !== "string") return false;
+  const hash = senderUrl.indexOf("#");
+  const withoutHash = hash === -1 ? senderUrl : senderUrl.slice(0, hash);
+  const expectedUrl = browser.runtime.getURL("landing.html");
+  const expectedHash = expectedUrl.indexOf("#");
+  return withoutHash === (expectedHash === -1 ? expectedUrl : expectedUrl.slice(0, expectedHash));
+}
+
+browser.runtime.onConnect.addListener((port) => {
+  if (!port || port.name !== "landing-page" || !isTrustedLandingPort(port)) {
+    try { port.disconnect(); } catch (e) {}
+    return;
+  }
+
+  const previousPort = landingPort;
+  pendingNativeMessages.length = 0;
+  pendingLandingMessages.length = 0;
+  landingPort = port;
+  if (previousPort && previousPort !== port) {
+    try { previousPort.disconnect(); } catch (e) {}
+  }
+
+  port.onMessage.addListener((message) => {
+    if (landingPort !== port || !message || typeof message.type !== "string") return;
+    if (message.type === "bridgeCall") {
+      if (typeof message.method !== "string" || message.method.length === 0 || message.method.length > 128 ||
+          typeof message.argsJson !== "string") return;
+      postNativeMessage({
+        type: "landingBridgeCall",
+        method: message.method,
+        argsJson: message.argsJson
+      });
+    } else if (message.type === "pong") {
+      if (!isWithinLandingMessageLimit(message.id)) return;
+      postNativeMessage({ type: "landingPong", id: message.id });
+    }
+  });
+
+  port.onDisconnect.addListener(() => {
+    if (landingPort === port) {
+      landingPort = null;
+      pendingNativeMessages.length = 0;
+      pendingLandingMessages.length = 0;
+    }
+  });
+
+  try {
+    port.postMessage({ type: "landingReady" });
+    postNativeMessage({ type: "landingReady" });
+    flushPendingLandingMessages(port);
+  } catch (e) {
+    if (landingPort === port) landingPort = null;
+  }
+});
 
 function connectNative() {
   try {
-    nativePort = browser.runtime.connectNative("geckoBridge");
-    nativePort.onMessage.addListener(onNativeMessage);
-    nativePort.onDisconnect.addListener(() => {
+    const port = browser.runtime.connectNative("geckoBridge");
+    nativePort = port;
+    port.onMessage.addListener(onNativeMessage);
+    port.onDisconnect.addListener(() => {
+      if (nativePort !== port) return;
       nativePort = null;
       scheduleReconnect();
     });
+    flushPendingNativeMessages();
   } catch (e) {
     nativePort = null;
     scheduleReconnect();
@@ -50,6 +172,8 @@ connectNative();
 
 // Content script -> background -> native (no reply needed).
 browser.runtime.onMessage.addListener((message, sender) => {
+  // Ordinary pages must never be able to forge the trusted landing protocol.
+  if (!message || !["bridgeCall", "evalResult", "bridgeLog"].includes(message.type)) return;
   if (nativePort) {
     try {
       nativePort.postMessage(message);
@@ -71,6 +195,12 @@ function onNativeMessage(message) {
       break;
     case "setCookie":
       setCookie(message);
+      break;
+    case "landingMessage":
+      if (message.payload && typeof message.payload === "object" && !Array.isArray(message.payload) &&
+          ["clipboard", "prefill", "ping", "batchProgress"].includes(message.payload.type)) {
+        postLandingMessage(message.payload);
+      }
       break;
     default:
       break;

@@ -62,6 +62,23 @@ object GeckoBridge {
         GeckoBridgeExtension.forgetSession(session)
     }
 
+    /** Calls from the packaged extension landing page are limited to home actions. */
+    internal fun handleLandingBridgeCall(session: GeckoSession, message: JSONObject) {
+        val allowed = setOf(
+            "checkClipboard", "openClipboardLink", "dismissClipboardLink",
+            "openUnifiedSearch", "openSiteBrowse", "navigateToUrl", "showHelpDialog",
+            "saveJavCodes", "openTodayNew", "openSalesRankings", "openPlaybackHistory"
+        )
+        val method = message.optString("method")
+        if (method !in allowed) {
+            Log.w(TAG, "首页桥拒绝未允许的方法：$method")
+            return
+        }
+        val args = runCatching { JSONArray(message.optString("argsJson")) }.getOrNull() ?: return
+        val handler = handlersBySession[session]?.get(method) ?: return
+        runCatching { handler(args) }.onFailure { Log.w(TAG, "首页桥调用失败：$method", it) }
+    }
+
     /** 扩展侧回来的 bridge 调用（GeckoBridgeExtension.dispatch 调）。 */
     internal fun handleBridgeMessage(message: JSONObject) {
         GeckoBridgeExtension.runOnMain {
