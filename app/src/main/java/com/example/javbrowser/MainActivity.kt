@@ -123,6 +123,7 @@ class MainActivity : LocalizedActivity() {
     private var landingDiagSelfCheckBtn: Button? = null
     private var landingDiagCopyBtn: Button? = null
     private var landingLoadActive = false
+    private var landingLoadGeneration = 0L
     private var landingLoadIssuedAt = 0L
     private var landingPageStartAt: Long? = null
     private var landingPageStopAt: Long? = null
@@ -2222,6 +2223,7 @@ class MainActivity : LocalizedActivity() {
     /** 主会话导航（替代 webView.loadUrl）：显式激活后发 loadUri。 */
     private fun loadGeckoUrl(url: String) {
         if (!::geckoSession.isInitialized) return
+        endLandingDiagnosticsForNavigation()
         landingUrlMapper.clearLandingLoad()
         activateSession()
         geckoSession.loadUri(url)
@@ -2657,6 +2659,9 @@ class MainActivity : LocalizedActivity() {
                 // onPageStart 在 onLocationChange 之前到：先更新地址，
                 // onGeckoPageStart 里的 isOnLandingPage() 才能读到新页。
                 mapGeckoUrl(url)?.let { geckoCurrentUrl = it }
+                if (url != "about:blank" && geckoCurrentUrl != LANDING_URL) {
+                    endLandingDiagnosticsForNavigation()
+                }
                 onGeckoPageStart(geckoCurrentUrl)
                 onLandingPageStarted()
             }
@@ -6971,8 +6976,7 @@ class MainActivity : LocalizedActivity() {
         val url = "$LANDING_ASSET_URL#data=$encoded"
         geckoCurrentUrl = LANDING_URL
         landingUrlMapper.beginLandingLoad()
-        activateSession()
-        geckoSession.loadUri(url)
+        landingLoadGeneration++
         // 1.2.14 诊断：记录加载发出时间，亮起加载状态，启动 5 秒看门狗。
         landingLoadIssuedAt = SystemClock.elapsedRealtime()
         landingPageStartAt = null
@@ -6987,6 +6991,8 @@ class MainActivity : LocalizedActivity() {
         landingDiagLogLine("发出首页加载（$LANDING_ASSET_URL，启动数据约 ${data.toString().length} 字符）")
         showLandingLoading()
         armLandingWatchdog()
+        activateSession()
+        geckoSession.loadUri(url)
     }
     
     // ── 首页加载诊断（1.2.14-gecko 诊断版，1.2.15 保留）──────────────────
@@ -7014,6 +7020,14 @@ class MainActivity : LocalizedActivity() {
 
     private fun cancelLandingWatchdog() {
         geckoMainHandler.removeCallbacks(landingWatchdogRunnable)
+    }
+
+    /** 离开首页时丢弃旧诊断及异步桥探针结果，不覆盖新的页面。 */
+    private fun endLandingDiagnosticsForNavigation() {
+        landingLoadGeneration++
+        landingLoadActive = false
+        cancelLandingWatchdog()
+        hideLandingDiagOverlay()
     }
 
     /** 看门狗：发出后 5 秒 onPageStart 还没来，加载被静默丢弃。 */
@@ -7082,11 +7096,13 @@ class MainActivity : LocalizedActivity() {
             return
         }
         landingDiagLogLine("桥探针：查 window.Android…")
+        val probeGeneration = landingLoadGeneration
         GeckoEval.evaluate(
             geckoSession,
             "(typeof window.Android === 'object' || typeof window.Android === 'function') ? 'BRIDGE_OK' : 'BRIDGE_MISSING'",
             LANDING_BRIDGE_PROBE_TIMEOUT_MS
         ) { result ->
+            if (probeGeneration != landingLoadGeneration || geckoCurrentUrl != LANDING_URL) return@evaluate
             landingBridgeProbe = when {
                 landingNativeBridgeCallReceived -> "BRIDGE_CALL_OK（首页 checkClipboard 已到达原生端）"
                 result == null -> "BRIDGE_TIMEOUT（5 秒无回音：content script 未在 resource:// 页运行，或 token 注入失败）"
