@@ -16,10 +16,17 @@ on:
         description: 'Resume a 24-hour Oracle upload session for the exact same APK SHA-256'
         required: false
         type: string
+      apk_source_run_id:
+        description: 'Original GitHub Actions run ID containing the APK artifact'
+        required: false
+        type: string
 
 jobs:
   build:
     name: Build debug APK
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -71,6 +78,8 @@ jobs:
           CF_ACCESS_CLIENT_ID: ${{ secrets.APK_TEST_CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.APK_TEST_CF_ACCESS_CLIENT_SECRET }}
           APK_UPLOAD_ID: ${{ github.event.inputs.apk_upload_id }}
+          APK_SOURCE_RUN_ID: ${{ github.event.inputs.apk_source_run_id }}
+          GH_TOKEN: ${{ github.token }}
         run: bash scripts/oracle-apk-smoke.sh
 
       - name: Upload Oracle smoke-test evidence
