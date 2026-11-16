@@ -20,6 +20,7 @@ import com.example.javbrowser.gecko.GeckoCookies
 import com.example.javbrowser.gecko.GeckoEval
 import com.example.javbrowser.gecko.GeckoRuntimeProvider
 import com.example.javbrowser.gecko.JavhdGeckoExtension
+import com.example.javbrowser.gecko.LandingUrlMapper
 import org.mozilla.geckoview.AllowOrDeny
 import org.mozilla.geckoview.GeckoResult
 import org.mozilla.geckoview.GeckoSession
@@ -46,7 +47,7 @@ class MainActivity : LocalizedActivity() {
     private var geckoCurrentUrl: String? = null
     private var geckoPageTitle: String = ""
     private var geckoCanGoBack: Boolean = false
-    private var landingAssetShown: Boolean = false
+    private val landingUrlMapper = LandingUrlMapper(LANDING_ASSET_URL, LANDING_URL)
     private val geckoMainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
     // GeckoView 151 没有 onShowCustomView 容器：改用一个布林追踪全屏状态。
@@ -129,6 +130,7 @@ class MainActivity : LocalizedActivity() {
     private var landingLoadErrorAt: Long? = null
     private var landingLoadErrorCode: Int? = null
     private var landingBridgeProbe = "未测"
+    private var landingNativeBridgeCallReceived = false
     private val landingDiagLog = mutableListOf<String>()
     private var landingProbeSession: GeckoSession? = null
     private var landingProbeRunning = false
@@ -144,7 +146,7 @@ class MainActivity : LocalizedActivity() {
     private val landingLoadFallbackRunnable = Runnable { startInitialLandingLoad() }
     private val landingProbeTimeoutRunnable = Runnable {
         if (landingProbeRunning && !landingProbeStepDone) {
-            finishLandingProbeStep("TIMEOUT（5 秒内无任何回调）")
+            finishLandingProbeStep("TIMEOUT（5 秒内未收到目标 URL 的加载回调；about:blank 不计）")
         }
     }
     private lateinit var favoritesManager: FavoritesManager
@@ -2211,10 +2213,7 @@ class MainActivity : LocalizedActivity() {
      *  对外仍报 https://javbrowser.app/（isOnLandingPage 本来就接受
      *  data:，但剪贴板链接、分享预填等处比的是完整落地页地址）。 */
     private fun mapGeckoUrl(url: String?): String? {
-        if (url == null) return null
-        if (url.startsWith(LANDING_ASSET_URL) && landingAssetShown) return LANDING_URL
-        if (!url.startsWith(LANDING_ASSET_URL)) landingAssetShown = false
-        return url
+        return landingUrlMapper.map(url)
     }
 
     /** 当前页标题（替代 webView.title；空标题返回 null，与旧行为一致）。 */
@@ -2223,7 +2222,7 @@ class MainActivity : LocalizedActivity() {
     /** 主会话导航（替代 webView.loadUrl）：显式激活后发 loadUri。 */
     private fun loadGeckoUrl(url: String) {
         if (!::geckoSession.isInitialized) return
-        landingAssetShown = false
+        landingUrlMapper.clearLandingLoad()
         activateSession()
         geckoSession.loadUri(url)
     }
@@ -3243,7 +3242,15 @@ class MainActivity : LocalizedActivity() {
             },
             "checkClipboard" to handler@{ args ->
 
-                runOnUiThread { refreshHomeClipboard() }
+                runOnUiThread {
+                    if (geckoCurrentUrl == LANDING_URL && landingPageStartAt != null) {
+                        landingNativeBridgeCallReceived = true
+                        landingBridgeProbe = "BRIDGE_CALL_OK（首页 checkClipboard 已到达原生端）"
+                        landingDiagLogLine("首页 JS 桥调用已到达原生端：checkClipboard")
+                        if (landingPageStopSuccess == true) hideLandingDiagOverlay()
+                    }
+                    refreshHomeClipboard()
+                }
             },
             "openClipboardLink" to handler@{ args ->
 
@@ -6963,7 +6970,7 @@ class MainActivity : LocalizedActivity() {
         val encoded = java.net.URLEncoder.encode(data.toString(), "UTF-8").replace("+", "%20")
         val url = "$LANDING_ASSET_URL#data=$encoded"
         geckoCurrentUrl = LANDING_URL
-        landingAssetShown = true
+        landingUrlMapper.beginLandingLoad()
         activateSession()
         geckoSession.loadUri(url)
         // 1.2.14 诊断：记录加载发出时间，亮起加载状态，启动 5 秒看门狗。
@@ -6974,6 +6981,7 @@ class MainActivity : LocalizedActivity() {
         landingLoadErrorAt = null
         landingLoadErrorCode = null
         landingBridgeProbe = "未测"
+        landingNativeBridgeCallReceived = false
         landingLoadActive = true
         landingDiagLog.clear()
         landingDiagLogLine("发出首页加载（$LANDING_ASSET_URL，启动数据约 ${data.toString().length} 字符）")
@@ -7062,13 +7070,17 @@ class MainActivity : LocalizedActivity() {
     }
 
     /**
-     * 桥探针：首页成功加载后，用 GeckoEval 查 window.Android 是否存在。
-     * 三种结果：BRIDGE_OK（桥在 resource:// 页上跑）/ BRIDGE_MISSING
-     * （页面世界里没有 window.Android）/ BRIDGE_TIMEOUT（5 秒无回音：
-     * content script 没在 resource:// 页运行，或 token 注不进去）。
-     * 桥不可用时也进失败页（首页按钮全死，跟白屏一样没法用）。
+     * 桥探针：首页成功加载后，优先确认页面自带的 checkClipboard 调用是否到达原生端，
+     * 再用 GeckoEval 检查 window.Android。eval 超时只表示探针无回音，不足以证明
+     * 页面不可用；保留实际首页可见，并在诊断日志中如实标成未确认。
      */
     private fun runLandingBridgeProbe() {
+        if (landingNativeBridgeCallReceived) {
+            landingBridgeProbe = "BRIDGE_CALL_OK（首页 checkClipboard 已到达原生端）"
+            landingDiagLogLine("桥探针结果：$landingBridgeProbe")
+            hideLandingDiagOverlay()
+            return
+        }
         landingDiagLogLine("桥探针：查 window.Android…")
         GeckoEval.evaluate(
             geckoSession,
@@ -7076,20 +7088,20 @@ class MainActivity : LocalizedActivity() {
             LANDING_BRIDGE_PROBE_TIMEOUT_MS
         ) { result ->
             landingBridgeProbe = when {
+                landingNativeBridgeCallReceived -> "BRIDGE_CALL_OK（首页 checkClipboard 已到达原生端）"
                 result == null -> "BRIDGE_TIMEOUT（5 秒无回音：content script 未在 resource:// 页运行，或 token 注入失败）"
-                result.contains("BRIDGE_OK") -> "BRIDGE_OK（window.Android 存在）"
+                result.contains("BRIDGE_OK") -> "BRIDGE_OK（window.Android 存在；原生调用未确认）"
                 result.contains("BRIDGE_MISSING") -> "BRIDGE_MISSING（window.Android 不存在）"
                 else -> "未知回值：$result"
             }
             landingDiagLogLine("桥探针结果：$landingBridgeProbe")
-            if (landingBridgeProbe.startsWith("BRIDGE_OK")) {
+            if (landingBridgeProbe.startsWith("BRIDGE_CALL_OK") || landingBridgeProbe.startsWith("BRIDGE_OK")) {
+                hideLandingDiagOverlay()
+            } else if (landingBridgeProbe.startsWith("BRIDGE_TIMEOUT")) {
+                landingDiagLogLine("探针无回音；首页已加载，保持页面可见，原生桥调用尚未确认")
                 hideLandingDiagOverlay()
             } else {
-                val reason = if (landingBridgeProbe.startsWith("BRIDGE_TIMEOUT")) {
-                    "首页已加载，但桥没有回音：扩展 content script 可能没在 resource:// 页运行"
-                } else {
-                    "首页已加载，但桥不可用：window.Android 不存在，首页按钮点不了"
-                }
+                val reason = "首页已加载，但桥不可用：window.Android 不存在，首页按钮点不了"
                 showLandingFailure(reason)
             }
         }
@@ -7250,7 +7262,7 @@ class MainActivity : LocalizedActivity() {
     /**
      * 自检（三地址探针，1.2.16-gecko）：用同一 runtime 新开一个探测
      * session，依次加载三个地址，看哪个能触发 onPageStart——
-     *   A resource://android/assets/landing.html（首页本体，不带 hash 数据）
+     *   A resource://android/assets/landing.html#data=%7B%7D（带 hash 的首页本体）
      *   B https://example.com（纯网络加载，测内核+网络通路）
      *   C moz-extension://<gecko-bridge>/probe.html（扩展页，hyper-browser 同款机制）
      * 每个地址 5 秒：onPageStart 来了记 STARTED，onLoadError 记 ERROR，
@@ -7263,7 +7275,7 @@ class MainActivity : LocalizedActivity() {
         if (!::geckoSession.isInitialized) return
         // 组装三个探针目标；C 取不到扩展地址时跳过并记一笔。
         landingProbeTargets.clear()
-        landingProbeTargets += "A resource://" to LANDING_ASSET_URL
+        landingProbeTargets += "A resource:// fragment" to "$LANDING_ASSET_URL#data=%7B%7D"
         landingProbeTargets += "B https" to "https://example.com"
         val bridgeBase = GeckoBridgeExtension.baseUrl
         if (bridgeBase != null) {
@@ -7283,16 +7295,19 @@ class MainActivity : LocalizedActivity() {
         val probe = GeckoSession()
         probe.progressDelegate = object : GeckoSession.ProgressDelegate {
             override fun onPageStart(session: GeckoSession, url: String) {
-                if (landingProbeRunning && !landingProbeStepDone) {
-                    finishLandingProbeStep("STARTED（onPageStart 已触发）")
+                if (!landingProbeRunning || landingProbeStepDone) return
+                val expectedUrl = landingProbeTargets.getOrNull(landingProbeIndex)?.second ?: return
+                if (matchesProbeDocument(url, expectedUrl)) {
+                    finishLandingProbeStep("STARTED（目标 URL onPageStart：$url）")
+                } else {
+                    landingDiagLogLine("自检忽略非目标 onPageStart：$url（等待 $expectedUrl）")
                 }
             }
 
             override fun onPageStop(session: GeckoSession, success: Boolean) {
-                // onPageStart 已记过 STARTED 就不再重复；没来过 onPageStart
-                // 却直接 onPageStop 的，也算有反应，记一笔。
+                // PageStop 没有 URL，不能证明它属于当前目标；启动 about:blank 的 stop 不作结论。
                 if (landingProbeRunning && !landingProbeStepDone) {
-                    finishLandingProbeStep("STOPPED（onPageStop success=$success，未见 onPageStart）")
+                    landingDiagLogLine("自检忽略无法关联 URL 的 onPageStop（success=$success）")
                 }
             }
         }
@@ -7302,7 +7317,10 @@ class MainActivity : LocalizedActivity() {
                 uri: String?,
                 error: WebRequestError
             ): GeckoResult<String>? {
-                if (landingProbeRunning && !landingProbeStepDone) {
+                val expectedUrl = landingProbeTargets.getOrNull(landingProbeIndex)?.second
+                if (landingProbeRunning && !landingProbeStepDone && uri != null &&
+                    expectedUrl != null && matchesProbeDocument(uri, expectedUrl)
+                ) {
                     finishLandingProbeStep("ERROR（onLoadError code=${error.code}）")
                 }
                 return null
@@ -7348,6 +7366,17 @@ class MainActivity : LocalizedActivity() {
             android.util.Log.w("GeckoLanding", "探针 $label 发出失败", it)
             finishLandingProbeStep("ERROR（loadUri 抛错：${it.message}）")
         }
+    }
+
+    /** Compare document URLs without fragments; the fragment is the payload under test. */
+    private fun matchesProbeDocument(actualUrl: String, expectedUrl: String): Boolean {
+        fun documentKey(url: String): String {
+            val withoutFragment = runCatching {
+                Uri.parse(url).buildUpon().fragment(null).build().toString()
+            }.getOrElse { url.substringBefore('#') }
+            return withoutFragment.trimEnd('/')
+        }
+        return documentKey(actualUrl) == documentKey(expectedUrl)
     }
 
     /** 探针某一步有结论（STARTED/ERROR/TIMEOUT）：记结果，进下一步。 */
