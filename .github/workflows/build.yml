@@ -6,6 +6,12 @@ on:
       - feat/ech-h3-applayer
       - feat/geckoview
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish an APK release after building
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
@@ -40,7 +46,7 @@ jobs:
           EOF
 
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
+        run: gradle testDebugUnitTest assembleDebug --no-daemon
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -54,6 +60,7 @@ jobs:
 
   release:
     name: Publish release
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_release
     needs: build
     runs-on: ubuntu-latest
     permissions:
