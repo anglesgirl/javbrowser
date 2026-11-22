@@ -36,6 +36,7 @@ import java.util.Locale
 class MainActivity : LocalizedActivity() {
 
     private lateinit var webView: WebView
+    private lateinit var echWebBridge: EchWebBridge
     // 当前页面地址（原生首页显示时 webView.url 是过期外站地址，故另记一份）。
     private var currentWebUrl: String? = null
     private var pendingFileChooser: android.webkit.ValueCallback<Array<Uri>>? = null
@@ -1929,12 +1930,21 @@ class MainActivity : LocalizedActivity() {
             }
         }, "Android")
 
+        // ECH 表单桥（1.2.29）：ECH host 上的表单 POST 由原生经 ECH 代发
+        echWebBridge = EchWebBridge(webView)
+        webView.addJavascriptInterface(echWebBridge, "EchBridge")
+
         // 在 javhdporn.net 每個 frame V8 建立時立即注入 Streamtape patch（document-start 等級）
         // 這保證 patch 在所有頁面 JS 之前執行，解決 blob iframe + document.write 時序問題
         if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) {
             androidx.webkit.WebViewCompat.addDocumentStartJavaScript(
                 webView, stPatchScript,
                 setOf("*")   // 覆蓋所有 frame，包含 blob: iframe
+            )
+            // ECH 表单桥劫持脚本（1.2.29）：document-start 级别注入，表单提交前就位
+            androidx.webkit.WebViewCompat.addDocumentStartJavaScript(
+                webView, echWebBridge.injectHijackScript(),
+                setOf("*"),
             )
             android.util.Log.d("JAVHD_DEBUG", "addDocumentStartJavaScript registered")
         } else {
@@ -2132,7 +2142,9 @@ class MainActivity : LocalizedActivity() {
                     }
                 }
                 
-                return super.shouldInterceptRequest(view, request)
+                // ECH（1.2.29）：GET 请求走进程内 ECH 引擎；非 ECH 站交回 WebView 原生栈
+                return request?.let { EchWebViewHelper.intercept(it) }
+                    ?: super.shouldInterceptRequest(view, request)
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
@@ -2255,6 +2267,11 @@ class MainActivity : LocalizedActivity() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
+                // ECH 表单桥注入（旧版 WebView 没有 document-start，用 onPageFinished 补）+ 规则中心视频提取
+                if (url != null) {
+                    view?.evaluateJavascript(echWebBridge.injectHijackScript(), null)
+                    maybeExtractVideoByRule(view, url)
+                }
                 if (url != null && AdditionalSiteMedia.isPage(url)) {
                     view?.evaluateJavascript("""
                         (function() {
@@ -5604,6 +5621,62 @@ class MainActivity : LocalizedActivity() {
         btnPlay.visibility = if (
             isStripchatOverlayActive || isOnJavDbVideoPage || isOnJavTrailersVideoPage
         ) View.GONE else View.VISIBLE
+    }
+
+    /**
+     * 规则中心视频提取（1.2.29）：内置浏览器打开视频详情页时，按
+     * rules.json 的规则提正片地址，显示 ▶ 交 NativePlayerActivity。
+     * 只在 rule.detail 匹配的详情页跑；搜索/列表页不跑（否则会把第
+     * 一条结果当成当前页的片）。HTML 取 WebView 已加载的 DOM（免
+     * 得重取），native 类（含网络请求）在 worker 线程跑。
+     */
+    private fun maybeExtractVideoByRule(view: WebView?, pageUrl: String) {
+        val uri = runCatching { Uri.parse(pageUrl) }.getOrNull() ?: return
+        val host = uri.host ?: return
+        val rule = RuleCenter.ruleFor(host) ?: return
+        if (rule.detail.isBlank()) return
+        val detailRegex = runCatching { Regex(rule.detail) }.getOrNull() ?: return
+        if (!detailRegex.containsMatchIn(uri.path.orEmpty())) return
+        // 已有嗅到的地址就不再提，避免覆盖正在用的候选
+        if (currentVideoUrl != null) return
+        val wv = view ?: return
+        wv.evaluateJavascript("document.documentElement.outerHTML") { raw ->
+            val html = runCatching {
+                org.json.JSONTokener(raw).nextValue() as? String
+            }.getOrNull().orEmpty()
+            if (html.isBlank()) return@evaluateJavascript
+            val sourcePage = pageUrl
+            SearchScheduler.workers.execute {
+                val candidates: List<VideoPageSniffer.ScoredCandidate> = try {
+                    when (rule.type) {
+                        "regex-mp4", "regex-m3u8" -> RuleResolver.resolveRegex(html, rule)
+                        "native" -> {
+                            val site = SearchSiteRegistry.sites(this@MainActivity)
+                                .firstOrNull { it.isAllowedHost(host) }
+                            if (site == null) emptyList()
+                            else RuleResolver.resolveNative(html, site, rule)
+                        }
+                        else -> emptyList()
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.d("RuleExtract", "rule extract failed host=$host (${e.javaClass.simpleName})")
+                    emptyList()
+                }
+                val kept = candidates.filter { it.kept }
+                if (kept.isEmpty()) return@execute
+                // regex 类只有一条；native 类取分最高的（resolver 已按 host 优先级 + 时长排好）
+                val best = kept.maxByOrNull { it.score } ?: return@execute
+                runOnUiThread {
+                    if (isDestroyed || isFinishing) return@runOnUiThread
+                    if (currentPageUrl != sourcePage) return@runOnUiThread
+                    if (currentVideoUrl != null) return@runOnUiThread
+                    currentVideoUrl = best.url
+                    currentVideoReferer = rule.referer.ifBlank { null }
+                    android.util.Log.d("RuleExtract", "rule video found host=$host url=${best.url.take(80)}")
+                    showPlayButtonIfAllowed()
+                }
+            }
+        }
     }
 
     private fun toggleStripchatRecordingFromPlayer() {

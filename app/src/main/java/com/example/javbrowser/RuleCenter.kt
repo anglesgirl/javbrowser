@@ -25,6 +25,9 @@ data class SiteRule(
     val patterns: List<String> = emptyList(),
     val referer: String = "",
     val resolver: String? = null,
+    /** 详情页路径正则（1.2.29）：只有路径匹配才在内置浏览器里自动提片；
+     *  为空则不自动提，避免在搜索/列表页把第一条结果当成当前页的片。 */
+    val detail: String = "",
 )
 
 data class RuleSet(val version: Int, val updatedAt: String, val sites: List<SiteRule>)
@@ -146,6 +149,7 @@ object RuleCenter {
                     patterns = patterns,
                     referer = o.optString("referer", ""),
                     resolver = o.optString("resolver", "").ifBlank { null },
+                    detail = o.optString("detail", ""),
                 )
             }
             if (sites.isEmpty()) null else RuleSet(version, updatedAt, sites)
