@@ -16,6 +16,7 @@ class JavBrowserApplication : Application() {
         // Application.onCreate() 都会再跑一遍，必须跳过遥测初始化。
         // 2026-11-14 教训：GeckoMinimalTestActivity 曾跑在 :geckotest
         // 独立进程，点了“最小测试”按钮没反应就是这个原因。
+        // （该 Activity 已随 WebView 回切删除。）
         if (!isMainProcess()) return
         AppTelemetry.initialize(this)
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {

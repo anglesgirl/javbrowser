@@ -18,13 +18,13 @@ data class SearchHttpResponse(val statusCode: Int, val finalUrl: String, val bod
                               val rendered: Boolean = false)
 
 /**
- * 搜索 HTML 抓取（GeckoView 遷移後：純 OkHttp 明文）。
+ * 搜索 HTML 抓取（纯 OkHttp 明文；GeckoView 回切后仍是如此）。
  *
  * 原先的 ECH（Conscrypt）/ Cronet H3 路徑已隨 EchH3Router、EchDoh、
- * ConscryptEch 一起刪除。瀏覽器載入（嵌頁播放器）走 GeckoView 原生
- * ECH/DoH；搜索抓取仍走 OkHttp，但已是明文 SNI——在用戶網絡上
- * 明文 SNI 可能被 RST，搜索受影響時應把抓取也改走 GeckoView
- * （見 docs/geckoview-migration.md）。
+ * ConscryptEch 一起刪除。瀏覽器載入（嵌頁播放器）走 WebView（无 ECH）；
+ * 搜索抓取仍走 OkHttp，但已是明文 SNI——在用戶網絡上
+ * 明文 SNI 可能被 RST，搜索受影響時應把抓取也改走前置代理
+ * （见 MainActivity.applyWebViewProxy 接入点）。
  *
  * 保留：CookieManager 雙向同步、host allowlist、2MB 體 cap、
  * 超時、取消、retryAfter / cf-mitigated 標記。

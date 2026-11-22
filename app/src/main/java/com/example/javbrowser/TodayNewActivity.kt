@@ -1,5 +1,6 @@
 package com.example.javbrowser
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -9,6 +10,8 @@ import android.os.Looper
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.ImageView
 import android.widget.ProgressBar
@@ -17,13 +20,9 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.bumptech.glide.Glide
-import com.example.javbrowser.gecko.GeckoBridgeExtension
-import com.example.javbrowser.gecko.GeckoEval
-import com.example.javbrowser.gecko.GeckoRuntimeProvider
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
-import org.mozilla.geckoview.GeckoSession
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -42,11 +41,6 @@ import java.util.Locale
  *   3. 再等 3 秒讓過濾後的列表載入
  *   4. JS 抓取影片列表，用日期篩選近3天的條目
  *   5. 若末筆仍在3天內且未達4頁上限 → 載下一頁，重複
- *
- * 迁移说明：隐藏 WebView 改隐藏 GeckoSession（无视图；GeckoHeadless.loadSession
- * 的签名尚未发布，先用 GeckoSession + GeckoRuntimeProvider 直接开会话，
- * 与 MainActivity.openHeadlessSession 同款做法）。可见部分本来就是原生
- * RecyclerView，没有 WebView 可迁。
  */
 class TodayNewActivity : LocalizedActivity() {
 
@@ -63,8 +57,7 @@ class TodayNewActivity : LocalizedActivity() {
     private lateinit var tvStatus: TextView
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var favoritesManager: FavoritesManager
-    private var headlessSession: GeckoSession? = null
-    private var currentScrapeUrl: String? = null
+    private var hiddenWebView: WebView? = null
 
     private val allItems = mutableListOf<VideoItem>()
     private var currentPage = 0
@@ -147,60 +140,45 @@ class TodayNewActivity : LocalizedActivity() {
         // 清除舊結果
         allItems.clear()
         recyclerView.adapter = null
-        closeHeadlessSession()
-        initGeckoSession()
+        hiddenWebView?.destroy()
+        initWebView()
         loadPage(1)
     }
 
-    private fun initGeckoSession() {
-        // 隐藏会话：不开视图也要显式 open + 激活，否则加载/定时器不跑
-        // （与 MainActivity.openHeadlessSession 同款做法）。
-        // 桥扩展第一次使用前必须给过一次 Context（幂等；否则 evaluate
-        // 直接回 null）。
-        GeckoBridgeExtension.ensureInstalled(this)
-        val runtime = GeckoRuntimeProvider.get(this)
-        val session = GeckoSession()
-        session.open(runtime)
-        session.setActive(true)
-        session.setFocused(true)
-        session.setPriorityHint(GeckoSession.PRIORITY_HIGH)
-        session.settings.apply {
-            allowJavascript = true
-            useTrackingProtection = false
-            userAgentOverride = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun initWebView() {
+        val wv = WebView(this)
+        hiddenWebView = wv
+        wv.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         }
-        headlessSession = session
+        android.webkit.CookieManager.getInstance().apply {
+            setAcceptCookie(true)
+            setAcceptThirdPartyCookies(wv, true)
+        }
 
-        session.progressDelegate = object : GeckoSession.ProgressDelegate {
-            override fun onPageStop(session: GeckoSession, success: Boolean) {
-                if (currentScrapeUrl?.contains("javtrailers.com/ja/videos") != true) return
+        wv.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                if (url?.contains("javtrailers.com/ja/videos") != true) return
                 tvStatus.text = "第 $currentPage 頁 — 渲染中（5秒）..."
 
                 handler.postDelayed({
                     // 每頁都重新點開關（Vue 換頁後狀態重置）
                     tvStatus.text = "第 $currentPage 頁 — 點擊本日の新着..."
-                    headlessSession?.let {
-                        GeckoEval.runJavascript(it, """
-                            (function() {
-                                var sw = document.getElementById('flexSwitchCheckDefault');
-                                if (sw && !sw.checked) sw.click();
-                            })();
-                        """.trimIndent())
-                    }
+                    view?.evaluateJavascript("""
+                        (function() {
+                            var sw = document.getElementById('flexSwitchCheckDefault');
+                            if (sw && !sw.checked) sw.click();
+                        })();
+                    """.trimIndent(), null)
 
                     // 等 3 秒讓過濾後列表載入
-                    handler.postDelayed({ extractPage() }, 3000)
+                    handler.postDelayed({ extractPage(view) }, 3000)
                 }, 5000)
             }
-        }
-    }
-
-    private fun closeHeadlessSession() {
-        val session = headlessSession
-        headlessSession = null
-        if (session != null) {
-            runCatching { session.close() }
         }
     }
 
@@ -211,14 +189,12 @@ class TodayNewActivity : LocalizedActivity() {
         tvStatus.text = "載入第 $page 頁..."
         val url = if (page == 1) "https://javtrailers.com/ja/videos"
                   else "https://javtrailers.com/ja/videos?page=$page"
-        currentScrapeUrl = url
-        headlessSession?.loadUri(url)
+        hiddenWebView?.loadUrl(url)
     }
 
-    private fun extractPage() {
-        val session = headlessSession ?: return
+    private fun extractPage(view: WebView?) {
         tvStatus.text = "第 $currentPage 頁 — 擷取資料..."
-        GeckoEval.evaluate(session, """
+        view?.evaluateJavascript("""
             (function() {
                 var items = [];
                 var links = document.querySelectorAll('section.videos-list .video-link');
@@ -284,7 +260,8 @@ class TodayNewActivity : LocalizedActivity() {
 
     private fun showFinalResults() {
         progressBar.visibility = View.GONE
-        closeHeadlessSession()
+        hiddenWebView?.destroy()
+        hiddenWebView = null
 
         if (allItems.isEmpty()) {
             tvStatus.text = "⚠ 近3日內無資料（網路較慢可點↺重試）"
@@ -365,7 +342,8 @@ class TodayNewActivity : LocalizedActivity() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
-        closeHeadlessSession()
+        hiddenWebView?.destroy()
+        hiddenWebView = null
         super.onDestroy()
     }
 }

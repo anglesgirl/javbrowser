@@ -8,7 +8,7 @@ import java.util.Locale
  * In-app transport event log: what the user needs to see whether a fetch
  * actually worked, without adb. Search fetch paths (SearchHttpFetcher,
  * plain OkHttp) append one entry per transport attempt. Browser loads
- * (GeckoView, native ECH/DoH) are not logged here.
+ * (WebView page loads) are not logged here.
  *
  * - route "OkHttp" + no error = plain-OkHttp fetch succeeded.
  * - any entry with an error = that attempt failed; the error text is the

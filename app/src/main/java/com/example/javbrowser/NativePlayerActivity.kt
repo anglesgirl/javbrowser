@@ -101,7 +101,7 @@ class NativePlayerActivity : LocalizedActivity() {
 
         // GeckoView 遷移後：ECH 基建已刪，直鏈改走 plain OkHttp。
         // 明文 SNI 在用戶網絡上可能被視頻 CDN 回 403（原先走 ECH 才通），
-        // javhd 主路已是嵌頁播放器（GeckoView），不受影響。
+        // javhd 主路已是嵌頁播放器（WebView），不受影響。
         // 保留無 call timeout：長串流不能因 15 秒到就被掐斷。
         val videoClient = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)

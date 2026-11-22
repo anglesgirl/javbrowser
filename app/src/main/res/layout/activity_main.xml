@@ -106,8 +106,8 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
 
-    <!-- 原生首页（1.2.17-gecko）：与 WebView 同位置，初始隐藏；GeckoView
-         在 setupGeckoSession() 里原位替换 WebView，首页显示时 GeckoView 隐藏。 -->
+    <!-- 原生首页（1.2.17-gecko）：与 WebView 同位置，初始隐藏；
+         首页显示时 WebView 隐藏（GONE），进站时显示 WebView。 -->
     <include
         android:id="@+id/native_home"
         layout="@layout/view_native_home"

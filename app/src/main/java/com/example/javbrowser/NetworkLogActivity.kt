@@ -11,7 +11,7 @@ import android.widget.Toast
  * In-app transport event log: whether the fetch worked and why it failed,
  * visible and copyable here — no adb needed. Events come from
  * [NetworkLogStore], written by SearchHttpFetcher (plain OkHttp now;
- * ECH/H3 基建已隨 GeckoView 遷移刪除，瀏覽器載入走 Gecko 原生 ECH/DoH);
+ * ECH/H3 基建已隨 GeckoView 遷移刪除，瀏覽器載入走 WebView（无 ECH）);
  * the buffer is memory-only and holds no query, URL path,
  * or cookie (host only).
  */

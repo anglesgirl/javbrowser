@@ -14,15 +14,15 @@ import androidx.core.content.ContextCompat
 import java.net.URLEncoder
 
 /**
- * 原生首页（1.2.17-gecko）：替代 landing.html + GeckoSession 加载。
+ * 原生首页（1.2.17）：替代 landing.html + 浏览器加载。
  *
- * 内容与 app/src/main/assets/landing.html 对齐（站点入口、搜索入口、常用
- * 操作），文案按 [isEnglish] 取中英两套。所有点击直接调 [Callbacks] 走
- * MainActivity 现有流程（统一搜索 / 站点浏览 / 外站 GeckoBrowserActivity /
+ * 内容沿用原 landing.html 的文案与结构（文件已随 WebView 回切删除），
+ * 文案按 [isEnglish] 取中英两套。所有点击直接调 [Callbacks] 走
+ * MainActivity 现有流程（统一搜索 / 站点浏览 / 外站 WebView /
  * 今日新片 / 销量排行 / 播放记录 / 帮助 / 存番号 / 剪贴板），不动搜索解析、
- * 播放地址提取、选集、/api/play/ 桌面 UA、VAST 放行、嗅探、Cookie 两仓。
+ * 播放地址提取、选集、/api/play/ 桌面 UA、VAST 放行、嗅探、Cookie。
  *
- * 首页不再经过 GeckoSession 加载，也就不再白屏；GeckoView 只在进入外站时
+ * 首页不再经过浏览器加载，也就不再白屏；WebView 只在进入外站时
  * 才由 MainActivity 显示。
  */
 class NativeHomeView(
@@ -36,7 +36,7 @@ class NativeHomeView(
         fun onUnifiedSearch(query: String)
         fun onSiteBrowse(siteId: String, url: String)
         fun onNavigateToUrl(url: String)
-        fun onLoadGeckoUrl(url: String)
+        fun onLoadWebViewUrl(url: String)
         fun onTodayNew()
         fun onSalesRankings()
         fun onPlaybackHistory()
@@ -200,7 +200,7 @@ class NativeHomeView(
 
     /**
      * 存番号进度（processJavCodeQueue / processFc2CodeQueue 每存完一个调一次，
-     * 替代原来调 landing.html 里 updateBatchProgress 的 GeckoEval）。
+     * 替代原来调 landing.html 里 updateBatchProgress 的 JS 注入）。
      */
     fun updateJavSaveProgress(done: Int, total: Int) {
         if (total <= 0) return
@@ -342,7 +342,7 @@ class NativeHomeView(
             val button = gridButton(label, R.drawable.site_button_bg, 0xFF24152B.toInt()).apply {
                 setOnClickListener {
                     val url = currentSearchUrls.getOrNull(index) ?: return@setOnClickListener
-                    callbacks.onLoadGeckoUrl(url)
+                    callbacks.onLoadWebViewUrl(url)
                 }
             }
             addToGrid(searchGrid, button, index % 2, index / 2)

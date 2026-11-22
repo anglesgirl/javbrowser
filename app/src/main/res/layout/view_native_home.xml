@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 原生首页（1.2.17-gecko）：替代 landing.html + GeckoSession 加载。
-     首页不再经过 GeckoSession，也就不再白屏；GeckoView 只在进入外站时才显示。
-     内容与 app/src/main/assets/landing.html 对齐（站点入口、搜索入口、常用操作）。 -->
+<!-- 原生首页（1.2.17）：替代 landing.html + 浏览器加载。
+     首页不再经过浏览器加载，也就不再白屏；WebView 只在进入外站时才显示。
+     内容沿用原 landing.html 的文案与结构（文件已随 WebView 回切删除）。 -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/native_home_scroll"
     android:layout_width="match_parent"

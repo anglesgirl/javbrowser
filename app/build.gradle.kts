@@ -7,14 +7,14 @@ plugins {
 
 android {
     namespace = "com.example.javbrowser"
-    // GeckoView 151 的传递依赖（media3 1.9.3、androidx.core 1.18.0）
-    // 要求 compileSdk 至少 36（core 1.18.0 要 36，media3 要 35）。
+    // GeckoView 依赖已随 WebView 回切删除；compileSdk 36 保留
+    // （曾因 GeckoView 151 的传递依赖要求 36，现不再是硬性要求）。
     // targetSdk 保持 34（不新开运行时行为）。
     compileSdk = 36
 
     defaultConfig {
         applicationId = "com.example.javbrowser"
-        // GeckoView 151 要求 minSdk 26（manifest merger 强制）。
+        // minSdk 26（原 GeckoView 151 要求；Go 前置代理 .aar 同样要求 26，保留）。
         minSdk = 26
         targetSdk = 34
         versionCode = 165
@@ -23,8 +23,8 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
-    // GeckoView ships one native lib set per ABI; arm64-only keeps the
-    // APK (and the release asset name) small. Produces app-debug-arm64.apk.
+    // arm64-only keeps the APK (and the release asset name) small.
+    // Produces app-debug-arm64.apk.
     splits {
         abi {
             isEnable = true
@@ -97,11 +97,6 @@ dependencies {
     // LocalBroadcastManager for in-app event notification
     implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
 
-    // GeckoView (Firefox engine) is the rendering base now: native DoH +
-    // ECH, so the app-layer ECH/DoH stack (Conscrypt + Cronet) is gone.
-    // Same version as hyper-browser (verified working there).
-    implementation("org.mozilla.geckoview:geckoview:151.0.20260525130955")
-
     // WebKit extras: addDocumentStartJavaScript (inject before page JS)
     implementation("androidx.webkit:webkit:1.10.0")
     implementation("androidx.documentfile:documentfile:1.0.1")
@@ -115,7 +110,7 @@ dependencies {
     // OkHttp DataSource for ExoPlayer: plain OkHttp now (the app-layer
     // ECH client is gone with the GeckoView migration; direct-file
     // playback on ECH-only CDNs may 403 — the javhd main path is the
-    // GeckoView embed player and is unaffected).
+    // WebView embed player and is unaffected).
     implementation("androidx.media3:media3-datasource-okhttp:1.4.1")
 
     implementation("org.mp4parser:muxer:1.9.56")

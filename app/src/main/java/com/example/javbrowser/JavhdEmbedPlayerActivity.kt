@@ -1,30 +1,31 @@
 package com.example.javbrowser
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.WindowManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Toast
-import com.example.javbrowser.gecko.GeckoRuntimeProvider
-import com.example.javbrowser.gecko.JavhdGeckoExtension
 import org.json.JSONObject
-import org.mozilla.geckoview.GeckoSession
-import org.mozilla.geckoview.GeckoView
+import java.io.ByteArrayInputStream
 
 /**
- * javhd 嵌頁直播播放器（GeckoView，2026-11-14 遷移）。
+ * javhd 嵌頁直播播放器（WebView）。
  *
  * 嗅探取直鏈 + 原生播放器走不通，改走網頁本身：把 /api/play/ 拿到的嵌頁
- * （video.javhdporn.net）直接裝進全螢幕 GeckoView，用站方自己的 JWPlayer
- * 原頁播出。Gecko 原生自帶 DoH + ECH，不再 ECH 預載、也不再走
- * shouldInterceptRequest；廣告攔截、VAST 跳過、video 狀態讀取全部改走
- * 內置 WebExtension（assets/javhd-gecko/，見 JavhdGeckoExtension）：
- * 廣告請求由擴展的 webRequest 攔掉，VAST 貼片（tsyndicate.com）放行
- * （攔了它跳過按鈕不出現、正片不播，vc140 教訓），content script
- * 輪詢自動點跳過，並定期把 <video> 狀態回傳給 Activity 記播放數據。
+ * （video.javhdporn.net）直接裝進全螢幕 WebView，用站方自己的 JWPlayer
+ * 原頁播出。廣告攔截走 WebViewClient.shouldInterceptRequest（攔 11 個
+ * 廣告域名，見 [AD_HOSTS]）；VAST 貼片（tsyndicate.com）放行（攔了它
+ * 跳過按鈕不出現、正片不播，vc140 教訓），注入 JS 輪詢自動點跳過；
+ * <video> 狀態每 2 秒 evaluateJavascript 輪詢一次，記播放數據。
  *
- * 廣告域名表現在 assets/javhd-gecko/background.js 裡，
- * 須與 UnifiedSearchActivity.javhdAdHosts 同步；tsyndicate.com
+ * 廣告域名表須與 UnifiedSearchActivity.javhdAdHosts 同步；tsyndicate.com
  * （VAST 貼片）絕不能加進來。
  * 目前只播第一個 Part（Part1）；多 Part 的選集後續再加。
  */
@@ -39,6 +40,13 @@ class JavhdEmbedPlayerActivity : LocalizedActivity() {
         private const val EMBED_UA =
             "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
+        /** 嵌頁廣告域名（shouldInterceptRequest 攔截；須與 UnifiedSearchActivity.javhdAdHosts 同步）。 */
+        private val AD_HOSTS = listOf(
+            "whitetrafsa", "content-sync.xyz", "alaphoid.com", "udzpel.com",
+            "jads.co", "wpadmngr.com", "xlviirdr.com", "xlirdr.com",
+            "javhdporn.live", "javhd-trk.com", "vivodemisrentas.net",
+        )
+
         fun intent(context: Context, embedUrl: String, sessionId: Long, detailUrl: String, title: String): Intent =
             Intent(context, JavhdEmbedPlayerActivity::class.java).apply {
                 putExtra(EXTRA_EMBED_URL, embedUrl)
@@ -46,17 +54,69 @@ class JavhdEmbedPlayerActivity : LocalizedActivity() {
                 putExtra(EXTRA_DETAIL_URL, detailUrl)
                 putExtra(EXTRA_TITLE, title)
             }
+
+        /** VAST 跳過輪詢：JWPlayer 自帶 .jw-skip 鈕，否則點文字為 Skip 的可見元素；每 1 秒試一次。 */
+        private const val SKIP_POLL_JS = """
+            (function() {
+              function trySkip() {
+                try {
+                  var skip = document.querySelector('.jw-skip');
+                  if (skip && skip.offsetParent !== null) { skip.click(); return true; }
+                  var els = document.querySelectorAll('div,button,span,a');
+                  for (var i = 0; i < els.length; i++) {
+                    var el = els[i];
+                    if (el.textContent && el.textContent.trim() === 'Skip' && el.offsetParent !== null) {
+                      el.click(); return true;
+                    }
+                  }
+                } catch (e) {}
+                return false;
+              }
+              trySkip();
+              if (!window.__javSkipTimer) { window.__javSkipTimer = setInterval(trySkip, 1000); }
+            })();
+        """
+
+        /** 讀 <video> 狀態（currentTime / errorCode 等，與原擴展 videoState 同款欄位）。 */
+        private const val VIDEO_STATE_JS = """
+            (function() {
+              var v = document.querySelector('video');
+              if (!v) return null;
+              var s = {
+                currentTime: v.currentTime || 0,
+                duration: v.duration || 0,
+                paused: v.paused,
+                ended: v.ended,
+                readyState: v.readyState,
+                src: v.currentSrc || v.src || '',
+                title: document.title || ''
+              };
+              if (v.error) {
+                s.errorCode = v.error.code;
+                s.errorMessage = v.error.message || '';
+              }
+              return JSON.stringify(s);
+            })();
+        """
     }
 
-    private lateinit var geckoView: GeckoView
-    private lateinit var geckoSession: GeckoSession
+    private lateinit var webView: WebView
     private var sessionId: Long = -1
     private var enteredAtMs: Long = 0
     private var outcomeRecorded: Boolean = false
-    /** 擴展最近一次回傳的 <video> 狀態（content script 每 2 秒報一次）。 */
+    /** 最近一次輪詢到的 <video> 狀態（每 2 秒讀一次）。 */
     @Volatile
     private var latestVideoState: JSONObject? = null
+    private val pollHandler = Handler(Looper.getMainLooper())
+    private var pollStarted = false
+    private val pollRunnable = object : Runnable {
+        override fun run() {
+            pollVideoState()
+            pollHandler.postDelayed(this, 2000L)
+        }
+    }
 
+    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         PlaybackDataStore.init(applicationContext)
@@ -76,22 +136,34 @@ class JavhdEmbedPlayerActivity : LocalizedActivity() {
             WindowManager.LayoutParams.FLAG_FULLSCREEN
         )
 
-        geckoView = GeckoView(this)
-        setContentView(geckoView)
+        webView = WebView(this)
+        setContentView(webView)
+        webView.settings.javaScriptEnabled = true
+        webView.settings.domStorageEnabled = true
+        webView.settings.mediaPlaybackRequiresUserGesture = false
+        webView.settings.userAgentString = EMBED_UA
+        webView.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                val host = request.url.host.orEmpty().lowercase()
+                if (AD_HOSTS.any { host == it || host.endsWith(".$it") }) {
+                    // 廣告請求直接攔掉；tsyndicate.com（VAST）不在表裡，永遠放行。
+                    return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
+                }
+                return super.shouldInterceptRequest(view, request)
+            }
 
-        val runtime = GeckoRuntimeProvider.get(this)
-        geckoSession = GeckoSession()
-        geckoSession.settings.apply {
-            userAgentOverride = EMBED_UA
-            allowJavascript = true
-            // 關掉 Gecko 內建追蹤防護：它用 Disconnect 清單，可能誤攔
-            // VAST（tsyndicate）或視頻 CDN。廣告攔截由擴展精確控制。
-            useTrackingProtection = false
-        }
-        // 頁面載入失敗時記一筆（onPageStop 的 success=false）。
-        geckoSession.progressDelegate = object : GeckoSession.ProgressDelegate {
-            override fun onPageStop(session: GeckoSession, success: Boolean) {
-                if (!success) {
+            override fun onPageFinished(view: WebView, url: String?) {
+                // 注入 VAST 跳過輪詢（JWPlayer 自帶跳過鈕 + 文字為 Skip 的可見元素）。
+                view.evaluateJavascript(SKIP_POLL_JS, null)
+                startVideoStatePoll()
+            }
+
+            override fun onReceivedError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                error: android.webkit.WebResourceError?
+            ) {
+                if (request?.isForMainFrame == true) {
                     PlaybackDataStore.addTrace(
                         sessionId,
                         "嵌頁播放器錯誤：頁面載入失敗"
@@ -99,18 +171,9 @@ class JavhdEmbedPlayerActivity : LocalizedActivity() {
                 }
             }
         }
-        geckoSession.open(runtime)
-        geckoView.setSession(geckoSession)
-
-        // 裝擴展（冪等），掛上本 session 的 videoState 回調。
-        JavhdGeckoExtension.ensureInstalled(this)
-        JavhdGeckoExtension.attachToSession(geckoSession) { state ->
-            latestVideoState = state
-        }
 
         PlaybackDataStore.addTrace(sessionId, "嵌頁播放器：載入 ${embedUrl.take(100)}")
-        // Gecko 原生 ECH/DoH，嵌頁直接載入，不再 ECH 預載。
-        geckoSession.loadUri(embedUrl)
+        webView.loadUrl(embedUrl)
     }
 
     override fun onBackPressed() {
@@ -119,11 +182,31 @@ class JavhdEmbedPlayerActivity : LocalizedActivity() {
 
     override fun onPause() {
         super.onPause()
-        recordGeckoPlayback()
+        recordPlayback()
     }
 
-    /** 用擴展最近回傳的 video 狀態，回填進播放數據（與內建播放器同一寫法）。 */
-    private fun recordGeckoPlayback() {
+    private fun startVideoStatePoll() {
+        if (pollStarted) return
+        pollStarted = true
+        pollHandler.post(pollRunnable)
+    }
+
+    /** 每 2 秒讀一次 <video> 狀態（原擴展回傳的 videoState 同款欄位）。 */
+    private fun pollVideoState() {
+        if (!::webView.isInitialized) return
+        webView.evaluateJavascript(VIDEO_STATE_JS) { raw ->
+            try {
+                if (raw == null || raw == "null") return@evaluateJavascript
+                val inner = org.json.JSONTokener(raw).nextValue() as? String ?: return@evaluateJavascript
+                latestVideoState = JSONObject(inner)
+            } catch (_: Exception) {
+                // 讀狀態失敗不影響播放。
+            }
+        }
+    }
+
+    /** 用最近輪詢到的 video 狀態，回填進播放數據（與內建播放器同一寫法）。 */
+    private fun recordPlayback() {
         if (sessionId < 0 || outcomeRecorded) return
         outcomeRecorded = true
         try {
@@ -151,9 +234,10 @@ class JavhdEmbedPlayerActivity : LocalizedActivity() {
     }
 
     override fun onDestroy() {
-        if (::geckoSession.isInitialized) {
-            JavhdGeckoExtension.detachFromSession(geckoSession)
-            geckoSession.close()
+        pollHandler.removeCallbacksAndMessages(null)
+        if (::webView.isInitialized) {
+            webView.stopLoading()
+            webView.destroy()
         }
         super.onDestroy()
     }

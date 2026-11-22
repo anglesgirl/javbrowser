@@ -14,18 +14,10 @@ import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import com.example.javbrowser.gecko.GeckoBridge
-import com.example.javbrowser.gecko.GeckoBridgeExtension
-import com.example.javbrowser.gecko.GeckoCookies
-import com.example.javbrowser.gecko.GeckoEval
-import com.example.javbrowser.gecko.GeckoRuntimeProvider
-import com.example.javbrowser.gecko.JavhdGeckoExtension
-import com.example.javbrowser.gecko.LandingUrlMapper
-import org.mozilla.geckoview.AllowOrDeny
-import org.mozilla.geckoview.GeckoResult
-import org.mozilla.geckoview.GeckoSession
-import org.mozilla.geckoview.GeckoView
-import org.mozilla.geckoview.WebRequestError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -36,68 +28,44 @@ import android.widget.Toast
 import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.button.MaterialButton
+import java.io.ByteArrayInputStream
 import java.net.URLEncoder
 import androidx.appcompat.app.AppCompatActivity
 import java.util.Locale
 
 class MainActivity : LocalizedActivity() {
 
-    private lateinit var geckoView: GeckoView
-    private lateinit var geckoSession: GeckoSession
-    private var geckoCurrentUrl: String? = null
-    private var geckoPageTitle: String = ""
-    private var geckoCanGoBack: Boolean = false
-    private val landingUrlMapper = LandingUrlMapper(LANDING_ASSET_URL, LANDING_URL)
-    private val geckoMainHandler = android.os.Handler(android.os.Looper.getMainLooper())
-
-    // GeckoView 151 没有 onShowCustomView 容器：改用一个布林追踪全屏状态。
-    private var isGeckoFullscreen: Boolean = false
-
-    private var pendingFilePrompt: GeckoSession.PromptDelegate.FilePrompt? = null
-    private var pendingFileResult: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? = null
+    private lateinit var webView: WebView
+    // 当前页面地址（原生首页显示时 webView.url 是过期外站地址，故另记一份）。
+    private var currentWebUrl: String? = null
+    private var pendingFileChooser: android.webkit.ValueCallback<Array<Uri>>? = null
     private var fileChooserInFlight = false
-
-    // Gecko 版：把选到的 Uri 交给待处理的 FilePrompt（GeckoResult），
-    // 而不是旧 WebChromeClient 的 ValueCallback。只接受 content: scheme，
-    // 与旧 FileChooserParams.parseResult 之后的过滤一致。
     private val chooseWebFiles = registerForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
     ) { result ->
         fileChooserInFlight = false
-        val prompt = pendingFilePrompt
-        val pending = pendingFileResult
-        pendingFilePrompt = null
-        pendingFileResult = null
-        if (prompt != null && pending != null) {
-            val uris = mutableListOf<Uri>()
-            val data = result.data
-            if (result.resultCode == RESULT_OK && data != null) {
-                data.clipData?.let { clip ->
-                    for (i in 0 until clip.itemCount) {
-                        clip.getItemAt(i).uri?.takeIf { it.scheme == "content" }?.let { uris.add(it) }
-                    }
-                } ?: data.data?.takeIf { it.scheme == "content" }?.let { uris.add(it) }
-            }
-            runCatching {
-                if (uris.isEmpty()) pending.complete(prompt.dismiss())
-                else pending.complete(prompt.confirm(this, uris.toTypedArray()))
-            }
-        }
+        val callback = pendingFileChooser
+        pendingFileChooser = null
+        val selected = android.webkit.WebChromeClient.FileChooserParams
+            .parseResult(result.resultCode, result.data)
+            ?.filter { it.scheme == "content" }?.toTypedArray()?.takeIf { it.isNotEmpty() }
+        callback?.onReceiveValue(selected)
     }
 
-    /**
-     * 取消等待中的檔案選擇提示（例如頁面跳轉、onDestroy）。
-     * 与旧 cancelPendingFileChooser() 同义：只是把 PromptDelegate 的
-     * deferred GeckoResult 用 dismiss 补完，避免回调永远不回。
-     */
-    private fun cancelPendingFilePrompt() {
-        val prompt = pendingFilePrompt
-        val result = pendingFileResult
-        pendingFilePrompt = null
-        pendingFileResult = null
-        if (prompt != null && result != null) {
-            runCatching { result.complete(prompt.dismiss()) }
-        }
+    private fun cancelPendingFileChooser() {
+        val callback = pendingFileChooser
+        pendingFileChooser = null
+        callback?.onReceiveValue(null)
+    }
+
+    // 全螢幕播放支援
+    private var customView: android.view.View? = null
+    private var customViewCallback: android.webkit.WebChromeClient.CustomViewCallback? = null
+    private val blockedPopupViews = mutableSetOf<WebView>()
+
+    private fun clearBlockedPopupViews() {
+        blockedPopupViews.toList().forEach { it.destroy() }
+        blockedPopupViews.clear()
     }
 
     private lateinit var adFilterRules: AdFilterRules
@@ -115,13 +83,26 @@ class MainActivity : LocalizedActivity() {
     private lateinit var progressBar: android.widget.ProgressBar
     // 原生首页（1.2.17-gecko）：首页不再经 GeckoSession 加载 landing.html，
     // 1.2.14–1.2.16 的首页加载诊断与三地址探针（看门狗、失败浮层、自检、
-    // 桥接探针）已随旧首页一并删除。GeckoView 只在进入外站时显示。
+    // 桥接探针）已随旧首页一并删除。WebView 只在进入外站时显示。
     private var nativeHomeView: NativeHomeView? = null
     private var nativeHomeShowing = false
     private lateinit var favoritesManager: FavoritesManager
     private lateinit var privacySettings: PrivacySettings
     private lateinit var biometricHelper: BiometricHelper
     private var currentVideoUrl: String? = null
+
+    // ── 7MMTV 嗅探分类（sniff-rules-7mmtv.md，抓包日志 sniff-log-20261122-183619）──
+    // 正片是 HLS（.m3u8，XHR/MSE 拉流，不是 video 标签直链），不用 Referer；
+    // 页面 video 标签全是 10 秒预览（n39s.1024cdn.sx 的 .mp4）和广告
+    // （gif.7mmtv.sx 的 .webm），要排除；多个 .m3u8 时取播放时长最长的那路。
+    // 候选只在本页内有效，换页即清；时长在后台线程拉清单算出后才参与比较。
+    private var sevenMmTvCandidatePage: String? = null
+    private val sevenMmTvCandidates = LinkedHashMap<String, Double?>()
+    private val sevenMmTvDurationExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val sevenMmTvDurationClient = okhttp3.OkHttpClient.Builder()
+        .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
     private val supjavMediaResolver by lazy { SupjavMediaResolver(this) { MAIN_UA } }
     private val supjavPlayerHook by lazy { assets.open("supjav-player-hook.js").bufferedReader(Charsets.UTF_8).use { it.readText() } }
     private val javrateAdLayoutHook by lazy { assets.open("javrate-ad-layout.js").bufferedReader(Charsets.UTF_8).use { it.readText() } }
@@ -139,7 +120,7 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun resolveSupjavSource(embed: String, label: String) {
-        val page = geckoCurrentUrl ?: currentPageUrl
+        val page = currentWebUrl ?: currentPageUrl
         if (!AdditionalSiteMedia.hostMatches(page, "supjav.com")) return
         clearSupjavSource()
         val generation = supjavSelectionGeneration
@@ -165,7 +146,7 @@ class MainActivity : LocalizedActivity() {
     private var lastHomeClipboardText = ""
     private var dismissedHomeClipboardUrl: String? = null
     private val homeClipboardListener = android.content.ClipboardManager.OnPrimaryClipChangedListener {
-        if (::geckoSession.isInitialized) geckoMainHandler.post { refreshHomeClipboard() }
+        if (::webView.isInitialized) webView.post { refreshHomeClipboard() }
     }
     private var currentMissAvThumbnailConfig: MissAvThumbnailConfig? = null
     private var currentJableVttUrl: String? = null
@@ -233,11 +214,8 @@ class MainActivity : LocalizedActivity() {
         const val EXTRA_URL = "url"
         const val EXTRA_CLEAR_HISTORY = "clear_history"
         const val EXTRA_RETURN_TO_SALES = "return_to_sales_ranking"
-        // GeckoView 151：主会话沿用旧 WebView 的 UA；隐藏会话用 Pixel 7 UA。
         const val MAIN_UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-        const val HIDDEN_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         const val LANDING_URL = "https://javbrowser.app/"
-        const val LANDING_ASSET_URL = "resource://android/assets/landing.html"
     }
 
     // 接收書籤頁傳來的 URL
@@ -264,9 +242,9 @@ class MainActivity : LocalizedActivity() {
                 }
                 notifyStripchatWatchState()
             }
-            if (::geckoSession.isInitialized) {
-                GeckoEval.runJavascript(geckoSession, 
-                    "if(window.__javSetStripchatRecordingState) window.__javSetStripchatRecordingState($active);")
+            if (::webView.isInitialized) {
+                webView.evaluateJavascript(
+                    "if(window.__javSetStripchatRecordingState) window.__javSetStripchatRecordingState($active);", null)
             }
             if (message.isNotBlank()) Toast.makeText(this@MainActivity, message, Toast.LENGTH_SHORT).show()
         }
@@ -275,16 +253,16 @@ class MainActivity : LocalizedActivity() {
     private fun loadIncomingUrl(url: String, clearHistory: Boolean, source: String) {
         val updatedUrl = domainConfig.updateUrlIfNeeded(url)
         rememberStripchatModelUrl(updatedUrl)
-        android.util.Log.d("NAV_DEBUG", "loadIncomingUrl source=$source clearHistory=$clearHistory url=$updatedUrl canGoBackBefore=${geckoCanGoBack}")
-        geckoMainHandler.post {
+        android.util.Log.d("NAV_DEBUG", "loadIncomingUrl source=$source clearHistory=$clearHistory url=$updatedUrl canGoBackBefore=${webView.canGoBack()}")
+        webView.post {
             progressBar.visibility = View.VISIBLE
             progressBar.progress = 10
             startLoadTimeout()
             if (clearHistory) {
-                geckoSession.stop()
-                geckoSession.purgeHistory()
+                webView.stopLoading()
+                webView.clearHistory()
             }
-            loadGeckoUrl(updatedUrl)
+            loadWebViewUrl(updatedUrl)
         }
     }
 
@@ -328,14 +306,6 @@ class MainActivity : LocalizedActivity() {
         }
         setContentView(R.layout.activity_main)
 
-        // 预热 Gecko 内核：让 GeckoRuntime 在首页停留期间就开始初始化，
-        // 首页点网站进 GeckoBrowserActivity 时 runtime 已就绪
-        // （PROFILE_READY），避免首个 session 的加载卡在等内核就绪。
-        // 第一帧后再跑，不拖首页启动；失败也不影响首页。
-        window.decorView.post {
-            runCatching { com.example.javbrowser.gecko.GeckoRuntimeProvider.get(this) }
-        }
-
         favoritesManager = FavoritesManager(this)
 
         // Start local proxy for CDN-protected video (e.g. avjoy.me)
@@ -366,7 +336,8 @@ class MainActivity : LocalizedActivity() {
 
         privacySettings = PrivacySettings(this)
         // biometricHelper = BiometricHelper(this) // Moved to LockActivity
-        
+
+        webView = findViewById(R.id.webView)
         btnPlay = findViewById(R.id.btn_play)
         btnHome = findViewById(R.id.btn_home)
         fullscreenContainer = findViewById(R.id.fullscreen_container)
@@ -402,7 +373,7 @@ class MainActivity : LocalizedActivity() {
     
     private fun initializeApp() {
         android.util.Log.d("NAV_DEBUG", "initializeApp start intentUrl=${intent?.getStringExtra("url")}")
-        setupGeckoSession()
+        setupWebView()
         setupNativeHome()
         FooterHelper.setup(this)
         setupPlayButton()
@@ -420,7 +391,7 @@ class MainActivity : LocalizedActivity() {
             navPrefs.edit().remove("pending_fav_url").apply()
             val updatedUrl = domainConfig.updateUrlIfNeeded(pendingNavUrl)
             android.util.Log.d("NAV_DEBUG", "initializeApp pendingNavUrl -> loadUrl=$updatedUrl")
-            loadGeckoUrl(updatedUrl)
+            loadWebViewUrl(updatedUrl)
             return
         }
 
@@ -430,8 +401,8 @@ class MainActivity : LocalizedActivity() {
         }
 
         android.util.Log.d("NAV_DEBUG", "initializeApp fallback -> showNativeHome")
-        // 原生首页（1.2.17-gecko）：直接显示原生首页，不再经 GeckoSession
-        // 加载 landing.html，也就没有白屏；GeckoView 只在进入外站时才显示。
+        // 原生首页（1.2.17-gecko）：直接显示原生首页，不再经 WebView
+        // 加载 landing.html，也就没有白屏；WebView 只在进入外站时才显示。
         showNativeHome()
     }
 
@@ -474,7 +445,7 @@ class MainActivity : LocalizedActivity() {
                         pendingJavCodesFromShare = javCodes
                         // 確保首頁已載入（若目前在外站頁面則跳回首頁）
                         android.util.Log.d("NAV_DEBUG", "handleIncomingIntent share codes -> loadLandingPage")
-                        geckoMainHandler.post { loadLandingPage() }
+                        webView.post { loadLandingPage() }
                         return true
                     } else {
                         runOnUiThread {
@@ -489,8 +460,8 @@ class MainActivity : LocalizedActivity() {
             val updatedUrl = domainConfig.updateUrlIfNeeded(urlToLoad)
             // Use post to ensure webview is fully initialized
             android.util.Log.d("NAV_DEBUG", "handleIncomingIntent parsed url -> loadUrl=$updatedUrl")
-            geckoMainHandler.post {
-                loadGeckoUrl(updatedUrl)
+            webView.post {
+                loadWebViewUrl(updatedUrl)
             }
             return true
         }
@@ -514,7 +485,7 @@ class MainActivity : LocalizedActivity() {
         (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager)
             .addPrimaryClipChangedListener(homeClipboardListener)
         android.util.Log.d("MAIN", "onResume: isUnlocked=$isUnlocked, isFreshStart=$isFreshStart")
-        android.util.Log.d("NAV_DEBUG", "onResume currentUrl=${geckoCurrentUrl} intentUrl=${intent?.getStringExtra("url")}")
+        android.util.Log.d("NAV_DEBUG", "onResume currentUrl=${currentWebUrl} intentUrl=${intent?.getStringExtra("url")}")
 
         // 最高優先：從書籤頁傳來的 URL（用 SharedPreferences，跨進程有效）
         val prefs = getSharedPreferences("nav_state", android.content.Context.MODE_PRIVATE)
@@ -523,7 +494,7 @@ class MainActivity : LocalizedActivity() {
             prefs.edit().remove("pending_fav_url").apply()
             android.util.Log.d("MAIN", "onResume: SharedPrefs 載入書籤 URL = $favUrl")
             val updatedUrl = domainConfig.updateUrlIfNeeded(favUrl)
-            geckoMainHandler.post { loadGeckoUrl(updatedUrl) }
+            webView.post { loadWebViewUrl(updatedUrl) }
             userLeftApp = false
             isFreshStart = false
             return
@@ -541,23 +512,19 @@ class MainActivity : LocalizedActivity() {
         }
         isFreshStart = false
 
-        geckoMainHandler.post { refreshHomeClipboard() }
-        // Gecko 会话在 setup 时已激活；每次回到前台再确认一次
-        // （旧 WebView 从不暂停，这里也不在 onPause 里停会话，
-        //  否则页内 Stripchat 录制会在后台断掉）。
-        if (::geckoSession.isInitialized && geckoSession.isOpen) activateSession()
+        webView.post { refreshHomeClipboard() }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus && ::geckoSession.isInitialized) geckoMainHandler.post { refreshHomeClipboard() }
+        if (hasFocus && ::webView.isInitialized) webView.post { refreshHomeClipboard() }
     }
 
     private fun refreshHomeClipboard() {
-        if (!::geckoSession.isInitialized || !::privacySettings.isInitialized || !::domainConfig.isInitialized) return
-        android.util.Log.d("HOME_CLIPBOARD", "homeUrl=${geckoCurrentUrl} focused=${hasWindowFocus()} locked=${privacySettings.isLockEnabled && !isUnlocked}")
+        if (!::webView.isInitialized || !::privacySettings.isInitialized || !::domainConfig.isInitialized) return
+        android.util.Log.d("HOME_CLIPBOARD", "homeUrl=${currentWebUrl} focused=${hasWindowFocus()} locked=${privacySettings.isLockEnabled && !isUnlocked}")
         if (!hasWindowFocus() || (privacySettings.isLockEnabled && !isUnlocked) ||
-            geckoCurrentUrl != "https://javbrowser.app/"
+            currentWebUrl != "https://javbrowser.app/"
         ) return
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
         val clip = clipboard.primaryClip
@@ -611,7 +578,7 @@ class MainActivity : LocalizedActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQUEST_CODE_STRIPCHAT_RECORDING) {
             if (resultCode == RESULT_OK && data != null) {
-                val sourceUrl = geckoCurrentUrl ?: currentPageUrl
+                val sourceUrl = currentWebUrl ?: currentPageUrl
                 val serviceIntent = Intent(this, StripchatRecordingService::class.java).apply {
                     action = StripchatRecordingService.ACTION_START
                     putExtra(StripchatRecordingService.EXTRA_RESULT_CODE, resultCode)
@@ -628,7 +595,7 @@ class MainActivity : LocalizedActivity() {
             val url = data?.getStringExtra("url")
             if (url != null) {
                 val updatedUrl = domainConfig.updateUrlIfNeeded(url)
-                loadGeckoUrl(updatedUrl)
+                loadWebViewUrl(updatedUrl)
             }
         } else if (requestCode == REQUEST_CODE_LOCK) {
             if (resultCode == RESULT_OK) {
@@ -744,7 +711,7 @@ class MainActivity : LocalizedActivity() {
                 } catch (e) {}
             })($payload);
         """.trimIndent()
-        GeckoEval.runJavascript(geckoSession, js)
+        webView.evaluateJavascript(js, null)
     }
 
     private fun isRouVideoUrl(url: String): Boolean {
@@ -981,7 +948,7 @@ class MainActivity : LocalizedActivity() {
                 window.__javCrossSiteSearchTimer = setInterval(render, 1500);
             })($sites, $panelTitle, $searchPrefix, $searchSuffix);
         """.trimIndent()
-        GeckoEval.runJavascript(geckoSession, js)
+        webView.evaluateJavascript(js, null)
     }
 
     /**
@@ -1096,7 +1063,7 @@ class MainActivity : LocalizedActivity() {
                 scan();
             })();
         """.trimIndent()
-        GeckoEval.runJavascript(geckoSession, js)
+        webView.evaluateJavascript(js, null)
     }
 
     /** 攔截清單 = 雲端/內建通用規則 + 使用者長按屏蔽（後者獨立存放，雲端更新不覆蓋）。 */
@@ -1111,7 +1078,7 @@ class MainActivity : LocalizedActivity() {
      * 攔截列表並重載頁面，讓屏蔽馬上生效。
      */
     private fun showBlockSourceDialog(targetUrl: String, host: String) {
-        val pageHost = runCatching { android.net.Uri.parse(geckoCurrentUrl ?: currentPageUrl).host }.getOrNull()?.lowercase().orEmpty()
+        val pageHost = runCatching { android.net.Uri.parse(currentWebUrl ?: currentPageUrl).host }.getOrNull()?.lowercase().orEmpty()
         val baseDomain = host.split(".").takeLast(2).joinToString(".")
         // 頁面本身就在該域名下（本站或其子域）時，整個域名不能屏蔽，
         // 否則連主框架導航都會被攔截（攔截不分主框架）。
@@ -1141,7 +1108,7 @@ class MainActivity : LocalizedActivity() {
             if (added) "已屏蔽 $host，正在刷新頁面" else "$host 已在屏蔽列表中，正在刷新頁面",
             Toast.LENGTH_SHORT
         ).show()
-        geckoSession.reload()
+        webView.reload()
     }
 
     /**
@@ -1154,7 +1121,7 @@ class MainActivity : LocalizedActivity() {
     private fun enterDomBlockPicker() {
         if (domBlockPickerActive) return
         domBlockPickerActive = true
-        GeckoEval.runJavascript(geckoSession, 
+        webView.evaluateJavascript(
             """
             (function() {
                 if (window.__javDomPicker) return;
@@ -1221,20 +1188,20 @@ class MainActivity : LocalizedActivity() {
                 document.addEventListener('mouseover', onOver, true);
                 document.addEventListener('click', onClick, true);
             })();
-            """.trimIndent())
+            """.trimIndent(), null)
         Toast.makeText(this, "點選模式：點一下要屏蔽的元素，按返回鍵取消", Toast.LENGTH_SHORT).show()
     }
 
     private fun exitDomBlockPicker() {
         if (!domBlockPickerActive) return
         domBlockPickerActive = false
-        GeckoEval.runJavascript(geckoSession, 
-            "(function() { try { if (window.__javDomPickerExit) window.__javDomPickerExit(); } catch (e) {} })();")
+        webView.evaluateJavascript(
+            "(function() { try { if (window.__javDomPickerExit) window.__javDomPickerExit(); } catch (e) {} })();", null)
     }
 
     private fun showDomBlockConfirmDialog(selector: String, tag: String) {
         domBlockPickerActive = false
-        val pageHost = runCatching { android.net.Uri.parse(geckoCurrentUrl ?: currentPageUrl).host }.getOrNull()?.lowercase().orEmpty()
+        val pageHost = runCatching { android.net.Uri.parse(currentWebUrl ?: currentPageUrl).host }.getOrNull()?.lowercase().orEmpty()
         if (pageHost.isEmpty() || selector.isEmpty()) {
             Toast.makeText(this, "這個元素拿不到可用的選擇器", Toast.LENGTH_SHORT).show()
             return
@@ -1250,17 +1217,15 @@ class MainActivity : LocalizedActivity() {
                     Toast.LENGTH_SHORT
                 ).show()
                 // 走同一套移除 + MutationObserver，立即清掉現有與動態後插的框。
-                applySiteDomRules(geckoCurrentUrl ?: currentPageUrl)
+                applySiteDomRules(currentWebUrl ?: currentPageUrl)
             }
             .setNegativeButton("取消", null)
             .show()
     }
 
-    // Gecko 没有 document-start 注入：javhdporn 的 streamtape patch
-    // 从 setupWebView() 里的局部变量提到类级，在 onPageStop 注一次
-    // （onPageStart 时新文档还没就绪，GeckoEval 注了也会超时；脚本
-    // 自带 _javhd_patched 守卫）。
-    // 注意：时序弱于旧版 DOCUMENT_START_SCRIPT，页面脚本可能先跑。
+    // javhdporn 的 streamtape patch：类级 val，setupWebView() 里以
+    // document-start 注册（WebViewCompat.addDocumentStartJavaScript）；
+    // 脚本自带 _javhd_patched 守卫，重复注入无害。
     private val stPatchScript = """
 (function(){
   if(window._javhd_patched) return;
@@ -1417,841 +1382,15 @@ class MainActivity : LocalizedActivity() {
 })();
 """.trimIndent()
 
-    private fun onGeckoPageStart(url: String?) {
 
-        // 換頁後點選模式的 JS 已隨舊文檔消失，只需復位旗標。
-        domBlockPickerActive = false
-        cancelPendingFilePrompt()
-        supjavSelectionGeneration++
-        supjavMediaResolver.close()
-        android.util.Log.d("NAV_DEBUG", "onPageStarted url=$url")
-        currentPageUrl = url ?: ""   // 在 main thread 更新，供 onGeckoMediaCandidate 安全读取
-        if (url != null && isRouVideoUrl(url)) adFilterRules.rememberRouVideoDomain(url)
-        rememberStripchatModelUrl(url)
-        btnPlay.visibility = View.GONE
-        btnPlay.text = "▶"
-        clearCrossSiteCode()
-        isOnJavDbVideoPage = false
-        isOnJavTrailersVideoPage = false
-        currentVideoUrl = null
-        currentVideoReferer = null
-        currentRouEpisodes = emptyList()
-        currentJavdayEpisodes = emptyList()
-        currentMissAvThumbnailConfig = null
-        currentJableVttUrl = null
-        videoFoundToastShown = false
-
-        // DMM Cookie bypass: inject region-unlock cookie for all DMM domains
-        if (url != null && (url.contains("dmm.co.jp") || url.contains("dmm.com"))) {
-            // DMM 地区检测 cookie：走 GeckoCookies.setCookie 写进 Gecko 仓
-            // （background 侧写，不需要文档就绪；旧版用
-            // android.webkit.CookieManager 写，那是另一个仓）。
-            val cookie = "ckcy_remedied_check=ec_mrnhbtk; path=/"
-            GeckoCookies.setCookie("https://dmm.co.jp", cookie)
-            GeckoCookies.setCookie("https://special.dmm.co.jp", cookie)
-            GeckoCookies.setCookie("https://video.dmm.co.jp", cookie)
-            GeckoCookies.setCookie("https://www.dmm.co.jp", cookie)
-        }
-
-        // javhdporn.net：patch Document.prototype.write 攔截 Streamtape URL
-        // 頁面用空 blob iframe + contentDocument.write() 注入播放器，
-        // 只需攔截 write() 的內容即可取得 Streamtape embed URL
-        // javhdporn.net 的 stPatchScript 不在这里注：GeckoEval 需要已加载好的
-            // 文档（token 靠 javascript: URL 注入，onPageStart 时新文档还没就绪，
-            // 注了也会超时，还会占住全局串行 eval 队列 10 秒）；
-            // 只在 onPageStop 注一次（见 onGeckoPageStop）。
-
-        // Show progress bar and start timeout
-        if (!isOnLandingPage()) {
-            progressBar.visibility = View.VISIBLE
-            progressBar.progress = 0
-            startLoadTimeout()
-        }
+    /** 主 WebView 导航：收起原生首页，显示 WebView 再加载。 */
+    private fun loadWebViewUrl(url: String) {
+        // 进站：收起原生首页，显示 WebView 再加载。
+        showWebView()
+        webView.loadUrl(url)
     }
 
-    private fun onGeckoPageStop(url: String?) {
-        // Gecko 没有 document-start 注入：patch 在页面停止时注
-        // （onPageStart 时新文档还没就绪，GeckoEval 注了也会超时；
-        //  脚本自带 _javhd_patched 守卫，重复无害）。
-        if (url?.contains("javhdporn.net") == true) {
-            GeckoEval.runJavascript(geckoSession, stPatchScript)
-        }
-
-        if (url != null && AdditionalSiteMedia.isPage(url)) {
-            GeckoEval.runJavascript(geckoSession, """
-                (function() {
-                    var poster = document.getElementById('player-wrap');
-                    if (poster) {
-                        var match = getComputedStyle(poster).backgroundImage.match(/url\(["']?(.*?)["']?\)/);
-                        if (match) window.__javMainPoster = match[1];
-                    }
-                    if (/(^|\.)javrate\.com${'$'}/i.test(location.hostname)) {
-                        var frame = document.querySelector('#v2-player');
-                        if (frame && frame.src) Android.onAdditionalPlayerFrame(frame.src);
-                        return;
-                    }
-                    if (/(^|\.)supjav\.com${'$'}/i.test(location.hostname)) {
-                        $supjavPlayerHook
-                        return;
-                    }
-                    if (!/(^|\.)javday\.app${'$'}/i.test(location.hostname) || window.__javdayEpisodeHook) return;
-                    window.__javdayEpisodeHook = true;
-                    var episodePanel = document.getElementById('episodePanel');
-                    if (episodePanel) Android.onAdditionalEpisodes(episodePanel.outerHTML, location.href);
-                    document.addEventListener('click', function(event) {
-                        var episode = event.target.closest('.episode-btn[data-url]');
-                        if (episode) Android.onAdditionalEpisode(episode.getAttribute('data-url'));
-                    }, true);
-                    var first = document.querySelector('.episode-btn[data-url]');
-                    var source = document.querySelector('video source[src], source[type="application/x-mpegURL"]');
-                    var candidate = first ? first.getAttribute('data-url') : (source ? source.getAttribute('src') : '');
-                    if (candidate && candidate.indexOf('${'$'}') < 0) Android.onAdditionalEpisode(candidate);
-                })();
-            """.trimIndent())
-        }
-        android.util.Log.d("NAV_DEBUG", "onPageFinished url=$url")
-        updateCopyPageUrlVisibility()
-
-        // Hide progress bar and cancel timeout
-        progressBar.visibility = View.GONE
-        cancelLoadTimeout()
-
-        // The bundled extension landing page uses its own typed bridge, not
-        // the generic content-script eval path intended for external sites.
-        if (url == LANDING_URL || url == "about:blank") {
-            updateFavoriteIcon()
-            return
-        }
-
-        // 利用網頁自身的 sessionStorage，以「自己的 URL」作為 key 恢復滾動位置
-        // shouldOverrideUrlLoading 離開時已儲存；onBackPressed 返回時同樣儲存
-        val restoreScript = """
-            (function() {
-                var key = 'scrollPos__' + window.location.href;
-                var savedY = sessionStorage.getItem(key);
-                if (savedY) {
-                    var sy = parseInt(savedY, 10);
-                    if (sy > 0) {
-                        setTimeout(function() {
-                            window.scrollTo(0, sy);
-                            document.documentElement.scrollTop = sy;
-                            document.body.scrollTop = sy;
-                            sessionStorage.removeItem(key);
-                        }, 300);
-                    } else {
-                        sessionStorage.removeItem(key);
-                    }
-                }
-            })();
-        """.trimIndent()
-        GeckoEval.runJavascript(geckoSession, restoreScript)
-        applySiteDomRules(url)
-        injectCrossSiteSearchButtons(url)
-        // JavHDPorn 的固定彈窗與頁面內嵌廣告位會在載入後動態重建。
-        // 只針對 JavHDPorn 移除已確認的廣告容器，避免影響其他網站的播放器 iframe。
-        if (url?.contains("javhdporn.net", ignoreCase = true) == true) {
-            val javHdpornPopupCleanupJs = """
-                (function() {
-                    if (window.__javHdpornPopupCleanup) return;
-                    window.__javHdpornPopupCleanup = true;
-
-                    var popupSelector = [
-                        'iframe[title="bfh"]',
-                        'iframe[src*="go.whitetrafsa.com"]',
-                        'iframe[src*="creative.whitetrafsa.com/widgets"]',
-                        'iframe[src*="cdn.pornfhd.com/files/banner_300x100.html"]',
-                        'iframe[style*="2147483647"]',
-                        '.header-ad-mobile',
-                        '.under-player-ad-mobile',
-                        'a[href*="go.javhdporn.live"]',
-                        'a[href*="javhd-trk.com"]'
-                    ].join(', ');
-
-                    function removePopupFrames() {
-                        try {
-                            document.querySelectorAll(popupSelector).forEach(function(frame) {
-                                frame.remove();
-                            });
-                        } catch (e) {}
-                    }
-
-                    try {
-                        var style = document.createElement('style');
-                        style.id = '__javHdpornPopupCleanupStyle';
-                        style.textContent = popupSelector + ' { display: none !important; visibility: hidden !important; }';
-                        (document.head || document.documentElement).appendChild(style);
-                    } catch (e) {}
-
-                    removePopupFrames();
-                    try {
-                        var observer = new MutationObserver(removePopupFrames);
-                        observer.observe(document.documentElement, { childList: true, subtree: true });
-                        window.__javHdpornPopupObserver = observer;
-                    } catch (e) {}
-                })();
-            """.trimIndent()
-            GeckoEval.runJavascript(geckoSession, javHdpornPopupCleanupJs)
-        }
-
-        // Do NOT reset btnPlay or currentVideoUrl here, as video might have been found during load
-
-        // Inject JS to remove specific ad elements
-        val removeAdsJs = """
-            (function() {
-                function removeAds() {
-                    // Remove iframes with ID starting with 'container-'
-                    var iframes = document.querySelectorAll('iframe[id^="container-"]');
-                    iframes.forEach(function(iframe) {
-                        iframe.remove();
-                    });
-
-                    // Remove elements with high z-index and fixed position (common for overlays)
-                    var allElements = document.getElementsByTagName('*');
-                    for (var i = 0; i < allElements.length; i++) {
-                        var el = allElements[i];
-                        var style = window.getComputedStyle(el);
-                        if (style.position === 'fixed' && style.zIndex > 2000000000) {
-                            el.style.display = 'none';
-                            el.remove();
-                        }
-                    }
-
-                    // Rou.Video specific ad removal - Enhanced
-                    var rmpAds = document.querySelectorAll('.rmp-ad-container, .rootContent--OjJEv');
-                    rmpAds.forEach(function(ad) { ad.remove(); });
-
-                    // PRIORITY: Remove ALL tscprts.com related elements (all sites)
-                    var tscprtsElements = document.querySelectorAll('a[href*="tscprts.com"], a[href*="go.tscprts.com"]');
-                    tscprtsElements.forEach(function(link) {
-                        // Remove up to 3 levels of parent divs to ensure complete removal
-                        var parent = link.parentElement;
-                        for (var i = 0; i < 3 && parent; i++) {
-                            var nextParent = parent.parentElement;
-                            parent.remove();
-                            parent = nextParent;
-                        }
-                    });
-
-                    // Remove bottom-right floating ads by class patterns
-                    var bottomRightAds = document.querySelectorAll('[class*="bottomRight"], [class*="slideAnimation"], [class*="root--"]');
-                    bottomRightAds.forEach(function(ad) {
-                        // Additional check: if it contains tscprts or doppiocdn links
-                        if (ad.innerHTML && (ad.innerHTML.includes('tscprts.com') || ad.innerHTML.includes('doppiocdn.com'))) {
-                            ad.remove();
-                        }
-                    });
-
-                    // ENHANCED: Remove close-button ads and their parent containers (up to 2 levels)
-                    // BUT exclude video player controls (vjs-*)
-                    var closeButtons = document.querySelectorAll('[class*="close-button"]');
-                    closeButtons.forEach(function(btn) {
-                        // Skip if it's a video player control button
-                        if (btn.className.includes('vjs-') || btn.className.includes('video-js')) {
-                            return; // Skip video player buttons
-                        }
-
-                        // First, try to auto-click the button
-                        try { btn.click(); } catch(e) {}
-
-                        // Remove up to 2 levels of parent to get the entire ad container
-                        var parent = btn.parentElement;
-                        if (parent) {
-                            var grandParent = parent.parentElement;
-                            if (grandParent) {
-                                grandParent.remove();
-                            } else {
-                                parent.remove();
-                            }
-                        } else {
-                            btn.remove();
-                        }
-                    });
-
-                    // Remove dialog overlays by ID pattern or role
-                    var dialogs = document.querySelectorAll('div[role="dialog"], div[id^="radix-"]');
-                    dialogs.forEach(function(dialog) { dialog.remove(); });
-
-                    // Remove specific ad links/images - Enhanced with Safeguard
-                    function isSafeToRemove(element) {
-                        if (!element) return false;
-                        if (element.id === 'player') return false;
-                        if (element.classList.contains('video-js')) return false;
-                        if (element.classList.contains('vjs-tech')) return false;
-                        if (element.querySelector && (element.querySelector('#player') || element.querySelector('.video-js'))) return false;
-                        return true;
-                    }
-
-                    var adLinks = document.querySelectorAll('a[href*="ra12.xyz"], a[href*="tscprts.com"], a[href*="doppiocdn.com"], img[src*="doppiocdn.com"]');
-                    adLinks.forEach(function(link) { 
-                        var parent = link.closest('div');
-                        if (parent && isSafeToRemove(parent)) {
-                            parent.remove();
-                        } else {
-                            link.remove(); 
-                        }
-                    });
-
-                    // Generic removal for bottom floating ads (all sites now, not just rou.video)
-                    var allDivs = document.getElementsByTagName('div');
-                    for (var i = 0; i < allDivs.length; i++) {
-                        var el = allDivs[i];
-                        var style = window.getComputedStyle(el);
-                        // Check for fixed position at bottom or bottom-right
-                        if (style.position === 'fixed' && (style.bottom === '0px' || parseInt(style.bottom) < 100)) {
-                            // Check if contains ad indicators
-                            if (el.innerText.includes('Close') || el.innerHTML.includes('ra12.xyz') || 
-                                el.innerHTML.includes('tscprts') || el.innerHTML.includes('go.tscprts') ||
-                                el.innerHTML.includes('blob:') || style.zIndex > 100) {
-                                el.style.display = 'none';
-                                el.remove();
-                            }
-                        }
-                    }
-
-
-                    // Auto-click "Close ad" buttons (but skip video player controls)
-                    var buttons = document.querySelectorAll('button, div[role="button"], a');
-                    buttons.forEach(function(btn) {
-                        // Skip video player controls
-                        if (btn.className.includes('vjs-') || btn.className.includes('video-js')) {
-                            return;
-                        }
-
-                        var text = btn.innerText || "";
-                        if (text.toLowerCase().includes("close ad") || (text.toLowerCase() === "close" && !btn.closest('.video-js')) || text.includes("×")) {
-                            // Check if it looks like an ad close button (heuristic)
-                            if (btn.className.includes("close") || btn.className.includes("dismiss") || 
-                                (btn.style.position === 'absolute' && btn.style.top)) {
-                                try { btn.click(); } catch(e) {}
-                                btn.remove(); // Remove it after clicking just in case
-                            }
-                        }
-                    });
-                }
-
-                // Run immediately and periodically
-                removeAds();
-                setInterval(removeAds, 1000);
-            })();
-        """.trimIndent()
-        // GeckoEval.runJavascript(geckoSession, removeAdsJs) // DISABLED FOR TESTING
-
-        // New MISSAV Ad Blocking Logic
-        if (url?.contains("missav") == true || url?.contains("jable") == true || url?.let(::isRouVideoUrl) == true || url?.contains("avjoy.me") == true || url?.contains("javhdporn.net") == true || url?.contains("7mmtv", ignoreCase = true) == true || url?.contains("7tv", ignoreCase = true) == true || url?.contains("avple.tv", ignoreCase = true) == true || url?.contains("whos.tv", ignoreCase = true) == true) {
-            val missavAdBlockJs = """
-                (function() {
-                    'use strict';
-
-                    // Avple 的播放器與 Whos 的登入/註冊對話框都屬於頁面內容，
-                    // 不套用這段舊的通用 DOM 清理器；網路層的精確廣告規則仍會生效。
-                    if (/((^|\.)avple\.tv|(^|\.)whos\.tv)$/i.test(window.location.hostname || '')) {
-                        return;
-                    }
-
-                    // 1. 攔截彈窗與惡意跳轉邏輯
-                    var websites = ["missav.com/pop", "tsyndicate.com/api", "${domainConfig.getMissAvDomain()}/pop"];
-                    var url = window.location.href;
-                    for (var i = 0; i < websites.length; i++) {
-                        // 簡單的正則匹配
-                        if (url.indexOf(websites[i]) !== -1) {
-                            // 在WebView中，window.close() 可能無效，通常需要透過 about:blank 停止加載
-                            window.location.href = "about:blank";
-                            return; // 停止後續執行
-                        }
-                    }
-
-                    // 2. 移除廣告 DOM 元素的函數
-                    function cleanAds() {
-                        // 移除特定的廣告區塊 (class 僅為 mx-auto 的元素)
-                        try {
-                            const mxauto = document.querySelectorAll('.mx-auto:not([class*=" "])');
-                            mxauto.forEach(node => node.remove());
-                        } catch (e) {}
-
-                        // 移除特定的 root + bottomRight 廣告區塊 (動態識別)
-                        try {
-                            // 1. 注入 CSS 強制隱藏
-                            var style = document.createElement('style');
-                            style.innerHTML = `
-                                div[class*="root"][class*="bottomRight"],
-                                div[role="dialog"]:not([data-slot="sheet-content"]),
-                                div[id^="radix-"]:not([data-slot="sheet-content"]),
-                                div[id^="__clb-spot_"],
-                                div[id^="ts_ad_"],
-                                div[id^="exo-native-widget"],
-                                .exo-native-widget,
-                                div[data-banner-id],
-                                .rmp-ad-container,
-                                script[src*="magsrv.com"],
-                                ins[data-zoneid],
-                                ins {
-                                    display: none !important;
-                                }
-                            `;
-                            document.head.appendChild(style);
-
-                            // 2. 使用 MutationObserver 監聽並移除
-                            var observer = new MutationObserver(function(mutations) {
-                                // Safeguard function
-                                function isSafeToRemove(element) {
-                                    if (!element || !element.tagName) return false;
-                                    var tag = element.tagName.toLowerCase();
-                                    if (tag === 'html' || tag === 'body' || tag === 'video' || tag === 'iframe') return false;
-                                    if (element.id === 'player') return false;
-                                    if (element.classList && (element.classList.contains('video-js') || element.classList.contains('vjs-tech'))) return false;
-                                    if (element.querySelector && (element.querySelector('video') || element.querySelector('iframe') || element.querySelector('#player') || element.querySelector('.video-js'))) return false;
-                                    return true;
-                                }
-
-                                mutations.forEach(function(mutation) {
-                                    mutation.addedNodes.forEach(function(node) {
-                                        if (node.nodeType === 1) { // Element
-                                            // Check if node matches generic ad selectors
-                                            if (node.matches && (
-                                                node.matches('div[class*="root"][class*="bottomRight"]') ||
-                                                (node.matches('div[role="dialog"]') && node.getAttribute('data-slot') !== 'sheet-content') ||
-                                                (node.matches('div[id^="radix-"]') && node.getAttribute('data-slot') !== 'sheet-content') ||
-                                                node.matches('div[id^="__clb-spot_"]') ||
-                                                node.matches('div[id^="ts_ad_"]') ||
-                                                node.matches('div[data-banner-id]') ||
-                                                node.matches('.rmp-ad-container') ||
-                                                node.matches('ins')
-                                            )) {
-                                                if (isSafeToRemove(node)) {
-                                                    node.remove();
-                                                }
-                                            }
-
-                                            // Check for Rou.Video specific cards (已停用以避免誤刪播放器)
-                                            // if (node.matches && node.matches('div[data-slot="card"]')) {
-                                            //     if (isSafeToRemove(node) && (node.innerText.includes('通告') || node.innerHTML.includes('ra12.xyz'))) {
-                                            //         node.remove();
-                                            //     }
-                                            // }
-
-                                            // Check for dynamic ad links
-                                            if (node.matches && (node.matches('a[href*="ra12.xyz"]') || node.matches('a[href*="rdz1.xyz"]'))) {
-                                                // 安全容器查找：最多往上 3 層，且確保容器不含影片內容連結
-                                                var safeContainer = null;
-                                                var cur = node.parentElement;
-                                                for (var _i = 0; _i < 3 && cur; _i++) {
-                                                    // 若容器含有影片內容連結，停止往上找（避免誤刪影片列表）
-                                                    if (cur.querySelector && cur.querySelector('a[href^="/v/"]')) break;
-                                                    safeContainer = cur;
-                                                    cur = cur.parentElement;
-                                                }
-                                                if (safeContainer && isSafeToRemove(safeContainer)) {
-                                                    safeContainer.remove();
-                                                } else {
-                                                    node.remove();
-                                                }
-                                            }
-
-                                            // Check children of added node for ad links
-                                            var dynamicAdLinks = node.querySelectorAll('a[href*="ra12.xyz"], a[href*="rdz1.xyz"]');
-                                            dynamicAdLinks.forEach(link => {
-                                                // 安全容器查找：最多往上 3 層，且確保容器不含影片內容連結
-                                                var safeContainer = null;
-                                                var cur = link.parentElement;
-                                                for (var _j = 0; _j < 3 && cur; _j++) {
-                                                    if (cur.querySelector && cur.querySelector('a[href^="/v/"]')) break;
-                                                    safeContainer = cur;
-                                                    cur = cur.parentElement;
-                                                }
-                                                if (safeContainer && isSafeToRemove(safeContainer)) {
-                                                    safeContainer.remove();
-                                                } else {
-                                                    link.remove();
-                                                }
-                                            });
-
-                                            // Also check children
-                                            var ads = node.querySelectorAll('div[class*="root"][class*="bottomRight"], div[role="dialog"]:not([data-slot="sheet-content"]), div[id^="radix-"]:not([data-slot="sheet-content"]), div[id^="__clb-spot_"], div[id^="ts_ad_"], div[data-banner-id], .rmp-ad-container, ins');
-                                            ads.forEach(ad => {
-                                                if (isSafeToRemove(ad)) {
-                                                    ad.remove();
-                                                }
-                                            });
-                                        }
-                                    });
-                                });
-                            });
-                            observer.observe(document.body, { childList: true, subtree: true });
-
-                            // 3. 初始移除 (播放器可能還沒載入，避免誤刪)
-                            function cleanAdsInitial() {
-                                // Safeguard
-                                function isSafeToRemove(element) {
-                                    if (!element) return false;
-                                    if (element.id === 'player') return false;
-                                    if (element.classList.contains('video-js')) return false;
-                                    if (element.classList.contains('vjs-tech')) return false;
-                                    if (element.querySelector && (element.querySelector('#player') || element.querySelector('.video-js'))) return false;
-                                    return true;
-                                }
-
-                                // Generic selectors (不包括 card，因為播放器可能還沒載入)
-                                const selectors = [
-                                    'div[class*="root"][class*="bottomRight"]',
-                                    'div[role="dialog"]:not([data-slot="sheet-content"])',
-                                    'div[id^="radix-"]:not([data-slot="sheet-content"])',
-                                    'div[id^="__clb-spot_"]',
-                                    'div[id^="ts_ad_"]',
-                                    'div[id^="exo-native-widget"]',
-                                    '.exo-native-widget',
-                                    'div[data-banner-id]',
-                                    '.rmp-ad-container',
-                                    'ins[data-zoneid]',
-                                    'ins'
-                                ];
-
-                                selectors.forEach(selector => {
-                                    document.querySelectorAll(selector).forEach(node => {
-                                        if (isSafeToRemove(node)) {
-                                            node.style.display = 'none';
-                                            node.remove();
-                                        }
-                                    });
-                                });
-
-                                // Remove magsrv.com ad scripts (jable.tv)
-                                document.querySelectorAll('script[src*="magsrv.com"]').forEach(script => {
-                                    script.remove();
-                                });
-
-                                // Generic ad links and their containers
-                                // 注意：不可使用 closest('.grid')，會誤刪整個影片列表！
-                                // 改為最多往上 3 層找容器，且確保容器不含影片內容連結
-                                document.querySelectorAll('a[href*="ra12.xyz"], a[href*="rdz1.xyz"]').forEach(link => {
-                                    var safeContainer = null;
-                                    var cur = link.parentElement;
-                                    for (var _k = 0; _k < 3 && cur; _k++) {
-                                        if (cur.querySelector && cur.querySelector('a[href^="/v/"]')) break;
-                                        safeContainer = cur;
-                                        cur = cur.parentElement;
-                                    }
-                                    if (safeContainer && isSafeToRemove(safeContainer)) {
-                                        safeContainer.remove();
-                                    } else {
-                                        link.remove();
-                                    }
-                                });
-                            }
-
-
-                            cleanAdsInitial();
-                        } catch (e) {}
-
-                        // 嘗試點擊各種類型的關閉按鈕
-                        // 註：這些 Class 名稱可能是混淆過的，網站更新後可能失效
-                        const closeSelectors = [
-                            ".close-button--wsOv0",
-                            ".absolute.top-1.right-1.p-0.5.bg-black.rounded-lg.opacity-70"
-                        ];
-
-                        closeSelectors.forEach(selector => {
-                            const btns = document.querySelectorAll(selector);
-                            btns.forEach(btn => btn.click());
-                        });
-                    }
-
-                    // 執行邏輯
-                    cleanAds();
-
-                    // 延遲執行 (應對動態加載的廣告)
-                    setTimeout(cleanAds, 1000);
-                    setTimeout(cleanAds, 2500);
-                    setTimeout(cleanAds, 5000);
-
-                })();
-            """.trimIndent()
-            GeckoEval.runJavascript(geckoSession, missavAdBlockJs)
-        }
-
-        checkForVideo()
-        updateFavoriteIcon()
-
-        if (url?.contains("stripchat.com", ignoreCase = true) == true) {
-            injectStripchatWatchButton(url)
-            GeckoEval.runJavascript(geckoSession, 
-                """
-                (function() {
-                    if (window.__javStripchatBookmarkWatcher) return;
-                    window.__javStripchatBookmarkWatcher = true;
-                    var lastUrl = '';
-                    function notifyLocation() {
-                        var current = location.href;
-                        if (current === lastUrl) return;
-                        lastUrl = current;
-                        try { Android.onStripchatLocationChanged(current); } catch (e) {}
-                    }
-                    ['pushState', 'replaceState'].forEach(function(name) {
-                        var original = history[name];
-                        history[name] = function() {
-                            var result = original.apply(this, arguments);
-                            setTimeout(notifyLocation, 0);
-                            return result;
-                        };
-                    });
-                    window.addEventListener('popstate', notifyLocation);
-                    setInterval(notifyLocation, 500);
-                    notifyLocation();
-                })();
-                """.trimIndent())
-        }
-
-        // JavDB 影片詳情頁：收藏統一使用左側愛心，避免顯示重複的書籤按鈕。
-        if (url?.matches(Regex("https://javdb\\.com/v/[A-Za-z0-9]+.*")) == true) {
-            isOnJavDbVideoPage = true
-            btnPlay.visibility = View.GONE
-        }
-
-        // JavTrailers 影片詳情頁也統一使用左側愛心收藏。
-        if (url?.contains("javtrailers.com/ja/video/") == true) {
-            isOnJavTrailersVideoPage = true
-            btnPlay.visibility = View.GONE
-        }
-
-        // javtrailers.com/ja/videos：頁面載入後等 5 秒再點「本日の新着」開關
-        if (url?.contains("javtrailers.com/ja/videos") == true) {
-            val autoClickNewArrivalJs = """
-                setTimeout(function() {
-                    var sw = document.getElementById('flexSwitchCheckDefault');
-                    if (sw && !sw.checked) {
-                        sw.click();
-                    }
-                }, 5000);
-            """.trimIndent()
-            GeckoEval.runJavascript(geckoSession, autoClickNewArrivalJs)
-        }
-
-    }
-
-    private fun onGeckoLocationChange(url: String?) {
-
-        // 頁面歷史更新時（包含 goBack），重設恢復目標 URL
-        // pendingScrollRestoreUrl 在 onBackPressed 中已設定好，這裡不需要額外處理
-        if (url?.contains("stripchat.com", ignoreCase = true) == true && stripchatModelKey(url) != null) {
-            currentPageUrl = url
-            rememberStripchatModelUrl(url)
-            btnAddFavorite.text = "♡"
-            updateFavoriteIcon(url)
-            injectStripchatWatchButton(url)
-        }
-        if (url != null && isRouVideoUrl(url) && url != currentPageUrl) {
-            currentPageUrl = url
-            currentRouEpisodes = emptyList()
-            currentVideoUrl = null
-            currentVideoReferer = originForUrl(url)
-            if (Uri.parse(url).path.orEmpty().startsWith("/v/")) checkForVideo()
-        }
-    }
-
-    private fun onGeckoLoadRequest(url: String, isMainFrame: Boolean): Boolean {
-
-        val lowerUrl = url.lowercase()
-
-        // 非 http(s) 地址（data:/about:/blob:/javascript: 等）不走拦截规则。
-        // Gecko 的 load() 会把初始 data: 加载也送进 onLoadRequest（旧
-        // WebView 的 loadDataWithBaseURL 不会）；首页 HTML 里嵌的广告链接
-        // 含 down_ra，子串匹配会误判成 APK 下载、调 downloadAndInstallApk
-        // 发 ACTION_VIEW，没有应用能接 data:text/html，直接闪退
-        // （1.2.11 启动闪退根因，2026-11-14）。
-        if (!lowerUrl.startsWith("http://") && !lowerUrl.startsWith("https://")) {
-            return false
-        }
-
-        if (SupjavNavigation.blocks(currentPageUrl, url, isMainFrame)) {
-            android.util.Log.d("AdBlock", "SUPJAV main-frame advertisement blocked")
-            return true
-        }
-
-        if (isRouVideoUrl(currentPageUrl) &&
-            Uri.parse(url).path.orEmpty().startsWith("/api/hop/", ignoreCase = true)
-        ) {
-            android.util.Log.d("AdBlock", "ROU ad navigation blocked target=$url")
-            return true
-        }
-
-        val navigationRules = siteRulesForPage(currentPageUrl)?.navigationBlock.orEmpty()
-        if (navigationRules.any { it.matches(url, isMainFrame) }) {
-            android.util.Log.d("AdBlock", "site navigation blocked page=$currentPageUrl target=$url")
-            return true
-        }
-
-        // Block Shopee and Lazada redirects
-        if (lowerUrl.contains("shopee") || lowerUrl.contains("shp.ee") || lowerUrl.contains("lazada")) {
-            return true
-        }
-
-        // DMM region bypass: redirect "not-available-in-your-region" page
-        if (lowerUrl.contains("dmm.co.jp/not-available-in-your-region") ||
-            lowerUrl.contains("dmm.com/not-available-in-your-region")) {
-            loadGeckoUrl("https://video.dmm.co.jp/av/")
-            return true
-        }
-
-        // Handle APK download
-        if (url.contains(".apk") || url.contains("down_ra")) {
-            downloadAndInstallApk(url)
-            return true
-        }
-
-        // 離開當前頁面前，先把目前的滾動位置存入 sessionStorage（以當前頁 URL 為 key）
-        // 這樣按返回鍵回來時，onPageFinished 才能正確恢復位置
-        GeckoEval.runJavascript(geckoSession, """
-            (function() {
-                var sy = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
-                if (sy > 0) {
-                    var key = 'scrollPos__' + window.location.href;
-                    sessionStorage.setItem(key, sy);
-                }
-            })();
-        """.trimIndent())
-
-        // Allow navigation to target URLs
-        return false
-    }
-
-    private fun enterGeckoFullscreen() {
-        if (isGeckoFullscreen) {
-            exitGeckoFullscreen()
-        }
-        isGeckoFullscreen = true
-        // Gecko 渲染全屏视频不需要另外的 custom view 容器；
-        // 只做沉浸模式 + 方向锁定（旧 onShowCustomView 的其余部分原样保留）。
-
-        btnCrossSiteSearch.visibility = View.GONE
-        btnCopyPageUrl.visibility = View.GONE
-        val isStripchatFullscreen = geckoCurrentUrl
-            ?.contains("stripchat.com", ignoreCase = true) == true
-        if (isStripchatFullscreen) {
-            // Stripchat 同時有直式與橫式直播；依實際影片比例選擇方向。
-            // 先保留手機目前方向，取得 metadata 後再鎖定對應感應方向。
-            requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            GeckoEval.evaluate(geckoSession, 
-                "(function(){var v=document.querySelector('video.video-element,video');" +
-                    "return !!(v&&v.videoWidth>0&&v.videoHeight>0&&v.videoHeight>v.videoWidth);})()"
-            ) { result ->
-                requestedOrientation = if (result == "true") {
-                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-                } else {
-                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                }
-            }
-        } else {
-            // 其他網站維持原有的全螢幕橫向行為。
-            requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        }
-        // 沉浸模式
-        window.decorView.systemUiVisibility =
-            android.view.View.SYSTEM_UI_FLAG_FULLSCREEN or
-            android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-            android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-    }
-
-    private fun exitGeckoFullscreen() {
-        if (!isGeckoFullscreen) return
-        isGeckoFullscreen = false
-
-        // 恢復直向 + 系統 UI
-        requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        window.decorView.systemUiVisibility = android.view.View.SYSTEM_UI_FLAG_VISIBLE
-        if (isStripchatOverlayActive) {
-            setStripchatPlayerChromeHidden(false)
-        } else {
-            updateCrossSiteSearchButtonVisibility()
-        }
-
-        runCatching { if (::geckoSession.isInitialized) geckoSession.exitFullScreen() }
-    }
-
-    // ── Gecko 主会话小帮手 ─────────────────────────────────────────────
-
-    /** 显式激活主会话（1.2.6 教训：不依赖 Surface 路径；hyper-browser 同款）。 */
-    private fun activateSession() {
-        if (!::geckoSession.isInitialized) return
-        runCatching {
-            geckoSession.setActive(true)
-            geckoSession.setFocused(true)
-            geckoSession.setPriorityHint(GeckoSession.PRIORITY_HIGH)
-        }
-    }
-
-    /** 把 Gecko 侧 URL 映射回 app 用的地址：落地页是 data: URI 载入的，
-     *  对外仍报 https://javbrowser.app/（isOnLandingPage 本来就接受
-     *  data:，但剪贴板链接、分享预填等处比的是完整落地页地址）。 */
-    private fun mapGeckoUrl(url: String?): String? {
-        return landingUrlMapper.map(url)
-    }
-
-    /** 当前页标题（替代 webView.title；空标题返回 null，与旧行为一致）。 */
-    private fun currentPageTitle(): String? = geckoPageTitle.takeIf { it.isNotEmpty() }
-
-    /** 主会话导航（替代 webView.loadUrl）：显式激活后发 loadUri。 */
-    private fun loadGeckoUrl(url: String) {
-        if (!::geckoSession.isInitialized) return
-        // 进站：收起原生首页，显示 GeckoView 再加载。
-        showGeckoView()
-        landingUrlMapper.clearLandingLoad()
-        activateSession()
-        geckoSession.loadUri(url)
-    }
-
-    /** 无界面的 GeckoSession（隐藏抓取用）：open + 显式激活，不挂 GeckoView。
-     *  注意：1.2.6 的教训是 setActive(true) 是加载开始的关键；若真机上
-     *  隐藏会话始终不触发 onPageStart，改成挂一个 1x1 的 GeckoView 再试。
-     *  届时用 infra 的 GeckoHeadless.loadSession 替换这里。 */
-    private fun openHeadlessSession(): GeckoSession {
-        val session = GeckoSession()
-        session.settings.apply {
-            userAgentOverride = HIDDEN_UA
-            allowJavascript = true
-            useTrackingProtection = false
-        }
-        session.open(GeckoRuntimeProvider.get(this))
-        // 桥扩展第一次使用前必须给过一次 Context（幂等；主会话 setup 时
-        // 已给过，这里再给一次是防御，隐藏会话单独跑时也不至于没装上）。
-        GeckoBridgeExtension.ensureInstalled(this)
-        session.setActive(true)
-        session.setFocused(true)
-        session.setPriorityHint(GeckoSession.PRIORITY_HIGH)
-        return session
-    }
-
-    private fun closeHiddenSession(session: GeckoSession?) {
-        if (session == null) return
-        JavhdGeckoExtension.detachMediaSniffer(session)
-        runCatching { session.close() }
-    }
-
-    /** 从 Gecko cookie 仓读一批 URL 的 cookie（GeckoCookies.getCookie）。
-     *  与 document.cookie 不同：能读到 HttpOnly；与
-     *  android.webkit.CookieManager.getCookie 同格式（"a=b; c=d"）。
-     *  任一 URL 失败/超时只贡献 ""，不影响其它；结果按名去重（排前
-     *  的 URL 优先）。不走 eval 串行队列。 */
-    private fun readGeckoCookies(urls: List<String>, onResult: (String) -> Unit) {
-        val targets = urls.filter { it.isNotBlank() }.distinct()
-        if (targets.isEmpty()) {
-            onResult("")
-            return
-        }
-        val results = arrayOfNulls<String>(targets.size)
-        var remaining = targets.size
-        targets.forEachIndexed { index, url ->
-            GeckoCookies.getCookie(url) { value ->
-                results[index] = value
-                remaining -= 1
-                if (remaining == 0) {
-                    val merged = results.filterNotNull().filter { it.isNotBlank() }
-                        .fold("") { acc, next -> mergeCookieStrings(acc, next) }
-                    onResult(merged)
-                }
-            }
-        }
-    }
-
-    /** 合并两份 "a=b; c=d" cookie 串，同名取第一份（Gecko 侧优先）。 */
+    /** 合并两份 "a=b; c=d" cookie 串，同名取第一份（先传入的优先）。 */
     private fun mergeCookieStrings(first: String, second: String): String {
         val seen = linkedSetOf<String>()
         val out = mutableListOf<String>()
@@ -2264,161 +1403,8 @@ class MainActivity : LocalizedActivity() {
         return out.joinToString("; ")
     }
 
-    // ── 媒体嗅探（原 shouldInterceptRequest 的捕获部分） ──────────────────
-    //
-    // Gecko 没有按请求拦截/阻断的 delegate：扩展的 webRequest 观察者只
-    // 观察、不阻断（background.js），且只上报路径以 .m3u8/.mp4 结尾的
-    // 请求（与 VideoPageSniffer 同款规则）。所以：
-    // ① 动态广告拦截（commonBlock / site requestBlock / ROU /api/hop/）
-    //    全部丢掉——只剩扩展静态拦的 11 个广告域（ensureInstalled 后
-    //    runtime 级生效，VAST tsyndicate.com 永远放行）；
-    // ② 捕获逻辑原样搬过来，但拿不到请求 Referer：AdditionalSiteMedia
-    //    的 referer 参数改用页面 origin 代替（supjav 本来就排除在外，
-    //    javrate 的 referer 就是页面本身，javday 不看 referer）；
-    // ③ 原来“返回空响应阻断 WebView 继续加载影片（省流量）”没了——
-    //    影片会在页内继续加载/播放，用户按 ▶ 再由外部播放器接管；
-    // ④ streamtape get_video（无副档名）、.ts/.m4s 分段扩展不上报，
-    //    只剩 .mp4/.m3u8；get_video 靠隐藏会话的 DOM 轮询补（见
-    //    extractStreamtapeUrl）。
-    // 另注意：扩展的 mediaCandidate 会广播给全部已挂嗅探回调（见
-    // JavhdGeckoExtension 注释），主会话与隐藏会话同时挂着时，回调
-    // 按 URL 形状各自过滤——隐藏会话的候选只可能是它正在抓的那个视频。
-
-    /** 实时嗅探回调：扩展上报一个 .m3u8/.mp4 请求，按原拦截规则判定。 */
-    private fun onGeckoMediaCandidate(url: String) {
-        val lowerUrl = url.lowercase()
-        val pageUrl = currentPageUrl
-
-        // Video Sniffing: javhdporn.net / Streamtape CDN
-        if (pageUrl.contains("javhdporn.net") &&
-            (url.contains("streamtape") || url.contains("tapecontent"))) {
-            android.util.Log.d("JAVHD_INTERCEPT", "intercepted: $url")
-        }
-        val isStreamtapeUrl = url.contains("streamtape") && (url.contains("get_video") || url.contains("/e/") || url.contains(".mp4"))
-        val isTapecontentUrl = url.contains("tapecontent") && (url.contains(".mp4") || url.contains(".ts") || url.contains("m3u8"))
-        if ((isStreamtapeUrl || isTapecontentUrl) && !AdditionalSiteMedia.isPage(pageUrl)) {
-            val sniffedUrl = url
-            if (currentVideoUrl != sniffedUrl) {
-                currentVideoUrl = sniffedUrl
-                showPlayButtonIfAllowed()
-            }
-        }
-
-        // 网站专属规则优先：Avple 主 HLS 精确判定（与原来一致）。
-        val isAvplePage = pageUrl.contains("avple.tv", ignoreCase = true)
-        val requestUri = runCatching { Uri.parse(url) }.getOrNull()
-        val isAvpleMainHls = isAvplePage &&
-            (requestUri?.host.orEmpty().equals("cdnedge.live", ignoreCase = true) ||
-                requestUri?.host.orEmpty().endsWith(".cdnedge.live", ignoreCase = true)) &&
-            requestUri?.path.orEmpty().startsWith("/file/avple-asserts/hls/", ignoreCase = true) &&
-            lowerUrl.contains(".m3u8")
-        val isAvpleGrowMedia = isAvplePage &&
-            (requestUri?.host.orEmpty().equals("growcdnssedge.com", ignoreCase = true) ||
-                requestUri?.host.orEmpty().endsWith(".growcdnssedge.com", ignoreCase = true)) &&
-            (lowerUrl.contains(".m3u8") || lowerUrl.contains(".mp4") ||
-                lowerUrl.contains(".m4s") || lowerUrl.contains(".ts"))
-        val isAvpleMediaRequest = isAvpleMainHls || isAvpleGrowMedia
-
-        // AdditionalSiteMedia：referer 拿不到，用页面 origin 代替（见上）。
-        val additionalSite = AdditionalSiteMedia.isPage(pageUrl)
-        val mediaReferer = originForUrl(pageUrl).orEmpty()
-        if (additionalSite && !AdditionalSiteMedia.hostMatches(pageUrl, "supjav.com") &&
-            AdditionalSiteMedia.accepts(pageUrl, url, mediaReferer)) {
-            val sourcePage = pageUrl
-            if (currentPageUrl == sourcePage) {
-                currentVideoUrl = url
-                currentVideoReferer = mediaReferer.ifBlank { originForUrl(sourcePage).orEmpty() }
-                showPlayButtonIfAllowed()
-            }
-        }
-
-        // Video Sniffing：m3u8 播放列表（与原来同款排除条件）。
-        if ((isAvpleMainHls || isAvpleGrowMedia || (url.contains(".m3u8") && !url.contains("minisite") &&
-            !pageUrl.contains("javhdporn.net") && !AvTodayMedia.isPage(pageUrl) &&
-            RouVideoStreams.playlistForPage(pageUrl) == null && !isAvplePage && !additionalSite))) {
-            val normalizedUrl = normalizeMissavM3u8Url(url)
-            if (currentVideoUrl != normalizedUrl) {
-                currentVideoUrl = normalizedUrl
-                showPlayButtonIfAllowed()
-                val pUrl = geckoCurrentUrl.orEmpty()
-                if (currentVideoReferer == null) {
-                    when {
-                        pUrl.contains("missav") ->
-                            currentVideoReferer = originForUrl(pUrl) ?: domainConfig.getMissAvBaseUrl()
-                        pUrl.contains("pigav.ws") ->
-                            currentVideoReferer = originForUrl(pUrl) ?: "https://pigav.ws/"
-                        pUrl.contains("avtoday.io") ->
-                            currentVideoReferer = originForUrl(pUrl) ?: "https://avtoday.io/"
-                        pUrl.contains("avjoy.me") ->
-                            currentVideoReferer = "https://avjoy.me/"
-                        pUrl.contains("avple.tv", ignoreCase = true) ->
-                            currentVideoReferer = originForUrl(pUrl) ?: domainConfig.getAvpleBaseUrl()
-                        pUrl.contains("whos.tv", ignoreCase = true) ->
-                            currentVideoReferer = originForUrl(pUrl) ?: domainConfig.getWhosBaseUrl()
-                    }
-                }
-            }
-        }
-    }
-
-    // ── 文件选择（原 WebChromeClient.onShowFileChooser） ─────────────────
-    //
-    // Gecko PromptDelegate.onFilePrompt 返回一个待完成的 GeckoResult；
-    // 用户在系统选择器里选完（或取消）后才 complete。capture 属性
-    // （<input capture=camera>）本次不单独处理——统一走系统选择器，
-    // 用户可在选择器里选相机；旧版 FileChooserParams.createIntent()
-    // 会直接拉起相机，这一级行为差记在这里。
-
-    private fun onGeckoFilePrompt(
-        prompt: GeckoSession.PromptDelegate.FilePrompt
-    ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
-        val result = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
-        if (fileChooserInFlight) {
-            result.complete(prompt.dismiss())
-            return result
-        }
-        pendingFilePrompt = prompt
-        pendingFileResult = result
-        try {
-            val mimeTypes = (prompt.mimeTypes?.toList().orEmpty()).filter { it.isNotBlank() }
-            val pickerIntent = Intent(Intent.ACTION_GET_CONTENT).apply {
-                addCategory(Intent.CATEGORY_OPENABLE)
-                type = mimeTypes.firstOrNull() ?: "*/*"
-                if (mimeTypes.size > 1) putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes.toTypedArray())
-                if (prompt.type == GeckoSession.PromptDelegate.FilePrompt.Type.MULTIPLE) {
-                    putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
-                }
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            fileChooserInFlight = true
-            chooseWebFiles.launch(pickerIntent)
-        } catch (_: Exception) {
-            fileChooserInFlight = false
-            cancelPendingFilePrompt()
-            Toast.makeText(this,
-                LanguageManager.text(this, "無法開啟檔案選擇器", "Unable to open the file picker"),
-                Toast.LENGTH_SHORT).show()
-        }
-        return result
-    }
-
-    // ── Stripchat 桥返回值 shim ──────────────────────────────────────────
-    //
-    // GeckoBridge 的 handler 是 (JSONArray) -> Unit，没有返回值；页面 JS
-    // 里同步取返回值的 Android.* 调用（监录按钮与页内录制器，见
-    // stripchat-watch-controls.js 与 playInsideCurrentWebView 注入的
-    // 录制 JS）会拿到 undefined：按钮文案变 "undefined"、录制
-    // begin/append 被当成失败。补救（不动 bridge API、不动 asset 文件）：
-    // Kotlin 把状态推到 window.__javBridgeState，注入的 shim 在页面里
-    // 整体换掉 window.Android（原桥是 Proxy：get 永远返回新的
-    // dispatcher，逐个赋值包装无效），用推来的状态同步回答 getter；
-    // begin/append 类调用先调原生桥（fire-and-forget，Kotlin 侧照常
-    // 执行），再按 Kotlin 侧同一判定逻辑乐观返回。shim 在每次注入
-    // 页面 JS 前先注入（与注入体拼在同一次 evaluate 里保证顺序），
-    // 状态变化时由 notifyStripchatWatchState() 重新推送。
-
-    /** 与原 @JavascriptInterface getStripchatWatchStateLabel 同一套判定，
-     *  抽出来供 bridge handler 与状态推送共用。 */
+    /** 与桥内 @JavascriptInterface getStripchatWatchStateLabel 同一套判定
+     *  （Gecko 时代的状态推送已随桥移除，此函数现为备用判定）。 */
     private fun stripchatWatchStateLabelFor(sourceUrl: String): String {
         val active = stripchatWatchSessionActive &&
             stripchatModelKey(sourceUrl) == stripchatWatchSessionModelKey
@@ -2436,359 +1422,28 @@ class MainActivity : LocalizedActivity() {
         }
     }
 
-    /** 把 Stripchat 监录/录制状态推到页面（window.__javBridgeState）。 */
-    private fun pushStripchatBridgeState() {
-        if (!::geckoSession.isInitialized) return
-        val stateJson = org.json.JSONObject().apply {
-            put("active", stripchatWatchSessionActive)
-            put("modelKey", stripchatWatchSessionModelKey)
-            put("recording", stripchatWatchSessionRecording ||
-                stripchatStreamRecordingStore.isActive() ||
-                StripchatRecordingService.isRecording)
-            put("streamRecording", stripchatStreamRecordingStore.isActive())
-            put("privacyMode", stripchatPrivacyDialog?.isShowing == true)
-            put("label", stripchatWatchStateLabelFor(stripchatWatchSessionUrl))
-        }.toString()
-        GeckoEval.runJavascript(geckoSession, "window.__javBridgeState = $stateJson;")
-    }
+    private fun setupWebView() {
+        val settings = webView.settings
+        settings.javaScriptEnabled = true
+        settings.domStorageEnabled = true
+        settings.mediaPlaybackRequiresUserGesture = false
+        settings.setSupportMultipleWindows(true)   // 讓 onCreateWindow 能攔截 popup
+        settings.userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 
-    /** 页面里的 Android.* 返回值 shim（见上）。幂等：window 级旗标
-     *  __javShimInstalled（不能挂在 Android 对象上——原桥 Proxy 的
-     *  get 对任意字符串键都返回 dispatcher，读到的永远是真值），
-     *  重复注入直接返回；window.Android 不存在时静默跳过。 */
-    private fun stripchatBridgeShimJs(): String = """
-(function(){
-  try {
-    if (window.__javShimInstalled) return;
-    if (!window.Android) return;
-    window.__javBridgeState = window.__javBridgeState || {active:false, modelKey:'', recording:false, streamRecording:false, privacyMode:false, label:'◎ 監錄'};
-    var S = window.__javBridgeState;
-    var orig = window.Android;
-    function modelKeyOf(url) {
-      try {
-        var u = new URL(url || location.href, location.href);
-        if (!/(^|\.)stripchat\.com$/i.test(u.hostname)) return null;
-        var p = (u.pathname || '').replace(/^\/+|\/+$/g, '');
-        if (!p || p.indexOf('/') !== -1) return null;
-        var low = p.toLowerCase();
-        if (['login','signup','favorites','models','search','category','tags','live'].indexOf(low) !== -1) return null;
-        return 'stripchat:' + low;
-      } catch (e) { return null; }
-    }
-    var shimmed = {
-      isStripchatWatchSessionActive: function(url) {
-        var k = modelKeyOf(url);
-        return !!S.active && !!k && S.modelKey === k;
-      },
-      isStripchatRecording: function() { return !!S.recording; },
-      isStripchatStreamRecording: function() { return !!S.streamRecording; },
-      isStripchatPrivacyMode: function() { return !!S.privacyMode; },
-      getStripchatWatchStateLabel: function(url) {
-        var k = modelKeyOf(url);
-        if (!!S.active && !!k && S.modelKey === k) return S.label || '◌ 正在確認直播狀態';
-        return '◎ 監錄';
-      },
-      beginStripchatWatchSession: function(url) {
-        try { orig.beginStripchatWatchSession(url); } catch (e) {}
-        var k = modelKeyOf(url);
-        if (!k) return false;
-        if (S.active && S.modelKey !== k) return false;
-        return true;
-      },
-      beginStripchatStreamRecording: function(mimeType, sourceUrl, width, height) {
-        try { orig.beginStripchatStreamRecording(mimeType, sourceUrl, width, height); } catch (e) {}
-        return true;
-      },
-      appendStripchatStreamRecordingChunk: function(base64) {
-        try { orig.appendStripchatStreamRecordingChunk(base64); } catch (e) {}
-        return true;
-      }
-    };
-    // 原桥是 Proxy：get 永远返回新的 dispatcher，逐个赋值包装无效；
-    // 必须整体换掉 window.Android，未 shim 的方法透传回原 Proxy。
-    // （shim 与录制 JS 拼在同一次 evaluate 里，整体包 try/catch，
-    //  换不掉时静默退化为原桥，绝不能把后面的录制 JS 一起拖垮。）
-    window.Android = new Proxy({}, {
-      get: function(target, method) {
-        if (method === '__jbBridge') return true;
-        if (method === '__javShim') return true;
-        if (method === 'then') return undefined;
-        if (typeof method !== 'string') return undefined;
-        if (Object.prototype.hasOwnProperty.call(shimmed, method)) return shimmed[method];
-        try { return orig[method]; } catch (e) { return undefined; }
-      },
-      set: function(target, method, value) {
-        try { target[method] = value; } catch (e) {}
-        return true;
-      }
-    });
-    window.__javShimInstalled = true;
-  } catch (e) {}
-})();
-""".trimIndent()
-
-    /**
-     * GeckoView 版主浏览器设置（2026-11-14 全量迁移，主页簇）。
-     *
-     * 映射关系（旧 WebView → 新 Gecko）：
-     * ① 首页本地 HTML：loadDataWithBaseURL → resource://android/assets/
-     *    landing.html（1.2.15：1.2.14 诊断证实 data: 加载在启动时被静默
-     *    丢弃；改走 assets 本地文件，hyper-browser 同款，动态内容经 URL
-     *    hash 传 JSON；对外地址由 mapGeckoUrl 映射回 https://javbrowser.app/）；
-     * ② addJavascriptInterface 桥 → GeckoBridge.attachBridge（方法名不变，
-     *    参数变 JSONArray；无返回值的方法见 stripchatBridgeShimJs）；
-     * ③ shouldOverrideUrlLoading → NavigationDelegate.onLoadRequest /
-     *    onSubframeLoadRequest（DENY = 拦截）；
-     * ④ shouldInterceptRequest → JavhdGeckoExtension.attachMediaSniffer
-     *    （只观察、不阻断；动态广告拦截丢掉，见 onGeckoMediaCandidate）；
-     * ⑤ onShowFileChooser → PromptDelegate.onFilePrompt；
-     * ⑥ onShowCustomView/onHideCustomView → ContentDelegate.onFullScreen
-     *    （Gecko 渲染全屏视频不需要另外的 custom view 容器）；
-     * ⑦ document-start 脚本（WebViewCompat.addDocumentStartJavaScript）
-     *    Gecko 没有等价物：只在 onPageStop 注入一次 stPatchScript
-     *    （脚本自带 _javhd_patched 守卫；时序晚一级。onPageStart 时
-     *    新文档还没就绪，GeckoEval 注了也会超时，还占住串行队列）；
-     * ⑧ onCreateWindow 黑洞 popup → onNewSession 返回 null；
-     * ⑨ 长按屏蔽 hitTestResult → ContentDelegate.onContextMenu；
-     * ⑩ onPageCommitVisible 没有等价物：它的三处注入本来在 onPageFinished
-     *    也会跑一遍，现在只在 onPageStop 跑一次（注入函数本身幂等）。
-     * 其余一律不动：搜索解析、播放地址提取、选集、/api/play/ 桌面 UA、
-     * VAST 放行（tsyndicate.com 不拦）均未动。
-     */
-    private fun setupGeckoSession() {
-        // 把布局里的 WebView 原位换成 GeckoView（布局 XML 不动，沿用同一
-        // 位置、约束与 id；旧 WebView 从未加载过，直接销毁）。
-        val oldWebView = findViewById<android.webkit.WebView>(R.id.webView)
-        val parent = oldWebView.parent as ViewGroup
-        val index = parent.indexOfChild(oldWebView)
-        val params = oldWebView.layoutParams
-        parent.removeView(oldWebView)
-        runCatching { oldWebView.destroy() }
-        geckoView = GeckoView(this).apply {
-            id = R.id.webView
-            layoutParams = params
-        }
-        parent.addView(geckoView, index)
-
-        val runtime = GeckoRuntimeProvider.get(this)
-        // 桥扩展第一次使用前必须给过一次 Context（幂等；否则 evaluate /
-        // getCookie 直接回 null/""）。attachBridge 内部的 ensureInstalled()
-        // 用的是存下来的 applicationContext，这里先给一次最稳妥。
-        GeckoBridgeExtension.ensureInstalled(this)
-        geckoSession = GeckoSession()
-        geckoSession.settings.apply {
-            userAgentOverride = MAIN_UA
-            allowJavascript = true
-            // 与嵌頁播放器/嗅探一致：关掉 Gecko 内建追踪防护，页面能打开优先。
-            useTrackingProtection = false
-        }
-        geckoSession.contentDelegate = object : GeckoSession.ContentDelegate {
-            override fun onTitleChange(session: GeckoSession, title: String?) {
-                geckoPageTitle = title.orEmpty()
-            }
-
-            override fun onFullScreen(session: GeckoSession, fullScreen: Boolean) {
-                if (fullScreen) enterGeckoFullscreen() else exitGeckoFullscreen()
-            }
-
-            override fun onContextMenu(
-                session: GeckoSession,
-                screenX: Int,
-                screenY: Int,
-                element: GeckoSession.ContentDelegate.ContextElement
-            ) {
-                val targetUrl = when (element.type) {
-                    GeckoSession.ContentDelegate.ContextElement.TYPE_IMAGE,
-                    GeckoSession.ContentDelegate.ContextElement.TYPE_VIDEO,
-                    GeckoSession.ContentDelegate.ContextElement.TYPE_AUDIO -> element.srcUri
-                    else -> element.linkUri ?: element.srcUri
-                } ?: return
-                val host = runCatching { android.net.Uri.parse(targetUrl).host }.getOrNull()
-                    ?.lowercase()?.trim().orEmpty()
-                if (host.isEmpty()) return
-                showBlockSourceDialog(targetUrl, host)
-            }
-
-            override fun onCrash(session: GeckoSession) {
-                android.util.Log.w("GeckoMain", "内容进程崩溃：$geckoCurrentUrl")
-                cancelLoadTimeout()
-                progressBar.visibility = View.GONE
-            }
-
-            override fun onKill(session: GeckoSession) {
-                android.util.Log.w("GeckoMain", "内容进程被系统结束：$geckoCurrentUrl")
-                cancelLoadTimeout()
-                progressBar.visibility = View.GONE
-            }
-        }
-        geckoSession.progressDelegate = object : GeckoSession.ProgressDelegate {
-            override fun onPageStart(session: GeckoSession, url: String) {
-                // onPageStart 在 onLocationChange 之前到：先更新地址，
-                // onGeckoPageStart 里的 isOnLandingPage() 才能读到新页。
-                mapGeckoUrl(url)?.let { geckoCurrentUrl = it }
-                onGeckoPageStart(geckoCurrentUrl)
-            }
-
-            override fun onProgressChange(session: GeckoSession, progress: Int) {
-                progressBar.progress = progress
-            }
-
-            override fun onPageStop(session: GeckoSession, success: Boolean) {
-                if (success) {
-                    onGeckoPageStop(geckoCurrentUrl)
-                } else {
-                    android.util.Log.i("GeckoMain", "页面载入失败：$geckoCurrentUrl")
-                    progressBar.visibility = View.GONE
-                    cancelLoadTimeout()
-                }
-            }
-        }
-        geckoSession.navigationDelegate = object : GeckoSession.NavigationDelegate {
-            override fun onLoadRequest(
-                session: GeckoSession,
-                request: GeckoSession.NavigationDelegate.LoadRequest
-            ): GeckoResult<AllowOrDeny>? {
-                val url = request.uri ?: return null
-                // TARGET_WINDOW_NEW 的请求先过同一套拦截，允许的再交给
-                // onNewSession（返回 null，window.open() 拿不到窗口）。
-                if (onGeckoLoadRequest(url, isMainFrame = true)) {
-                    return GeckoResult.fromValue(AllowOrDeny.DENY)
-                }
-                return null
-            }
-
-            override fun onSubframeLoadRequest(
-                session: GeckoSession,
-                request: GeckoSession.NavigationDelegate.LoadRequest
-            ): GeckoResult<AllowOrDeny>? {
-                val url = request.uri ?: return null
-                if (onGeckoLoadRequest(url, isMainFrame = false)) {
-                    return GeckoResult.fromValue(AllowOrDeny.DENY)
-                }
-                return null
-            }
-
-            override fun onLocationChange(
-                session: GeckoSession,
-                url: String?,
-                perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>,
-                hasUserGesture: Boolean
-            ) {
-                val mapped = mapGeckoUrl(url)
-                if (mapped != null) {
-                    geckoCurrentUrl = mapped
-                    onGeckoLocationChange(mapped)
-                }
-            }
-
-            override fun onCanGoBack(session: GeckoSession, canGoBack: Boolean) {
-                geckoCanGoBack = canGoBack
-            }
-
-            override fun onLoadError(
-                session: GeckoSession,
-                uri: String?,
-                error: WebRequestError
-            ): GeckoResult<String>? {
-                android.util.Log.i(
-                    "GeckoMain",
-                    "载入失败：${uri ?: geckoCurrentUrl} code=${error.code} category=${error.category}"
-                )
-                progressBar.visibility = View.GONE
-                cancelLoadTimeout()
-                // 返回 null：不显示 Gecko 默认错误页（旧 WebView 会显示
-                // 系统错误页；这里先保持空白，真机验证时再决定要不要
-                // 做一个本地错误页）。
-                return null
-            }
-
-            override fun onNewSession(
-                session: GeckoSession,
-                uri: String
-            ): GeckoResult<GeckoSession>? {
-                // 封杀所有 popup：旧版 onCreateWindow 只在 supjav/javrate
-                // 接一个黑洞 popup 丢弃导航，其余直接拒绝；Gecko 里
-                // 返回 null 让 window.open() 失败，站方同标签 fallback
-                // 能走的照走（与黑洞等效，用户可见行为一致）。
-                android.util.Log.d("GeckoMain", "拦截新窗口：$uri")
-                return null
-            }
-        }
-        geckoSession.promptDelegate = object : GeckoSession.PromptDelegate {
-            override fun onFilePrompt(
-                session: GeckoSession,
-                prompt: GeckoSession.PromptDelegate.FilePrompt
-            ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> =
-                onGeckoFilePrompt(prompt)
-
-            override fun onAlertPrompt(
-                session: GeckoSession,
-                prompt: GeckoSession.PromptDelegate.AlertPrompt
-            ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
-                val result = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
-                androidx.appcompat.app.AlertDialog.Builder(this@MainActivity)
-                    .setMessage(prompt.message)
-                    .setPositiveButton(android.R.string.ok) { _, _ ->
-                        result.complete(prompt.dismiss())
-                    }
-                    .setOnCancelListener { result.complete(prompt.dismiss()) }
-                    .show()
-                return result
-            }
-
-            override fun onButtonPrompt(
-                session: GeckoSession,
-                prompt: GeckoSession.PromptDelegate.ButtonPrompt
-            ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
-                val result = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
-                androidx.appcompat.app.AlertDialog.Builder(this@MainActivity)
-                    .setMessage(prompt.message)
-                    .setPositiveButton(android.R.string.ok) { _, _ ->
-                        result.complete(prompt.confirm(GeckoSession.PromptDelegate.ButtonPrompt.Type.POSITIVE))
-                    }
-                    .setNegativeButton(android.R.string.cancel) { _, _ ->
-                        result.complete(prompt.dismiss())
-                    }
-                    .setOnCancelListener { result.complete(prompt.dismiss()) }
-                    .show()
-                return result
-            }
-
-            override fun onTextPrompt(
-                session: GeckoSession,
-                prompt: GeckoSession.PromptDelegate.TextPrompt
-            ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
-                val result = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
-                val input = android.widget.EditText(this@MainActivity).apply {
-                    setText(prompt.defaultValue.orEmpty())
-                }
-                androidx.appcompat.app.AlertDialog.Builder(this@MainActivity)
-                    .setMessage(prompt.message)
-                    .setView(input)
-                    .setPositiveButton(android.R.string.ok) { _, _ ->
-                        result.complete(prompt.confirm(input.text.toString()))
-                    }
-                    .setNegativeButton(android.R.string.cancel) { _, _ ->
-                        result.complete(prompt.dismiss())
-                    }
-                    .setOnCancelListener { result.complete(prompt.dismiss()) }
-                    .show()
-                return result
-            }
-        }
-
-        // JS 桥：方法名与原 @JavascriptInterface 完全一致，参数改走
-        // JSONArray（见 GeckoBridge）；无返回值的方法由页面里的
-        // stripchatBridgeShimJs 补（见 helpers）。
-        GeckoBridge.attachBridge(geckoSession, mapOf(
-            "onVideoFound" to handler@{ args ->
-                val videoUrl = args.optString(0)
-
+        // Add JS interface globally
+        webView.addJavascriptInterface(object {
+            @android.webkit.JavascriptInterface
+            fun onVideoFound(videoUrl: String) {
                 runOnUiThread {
+                    // 7mmtv 预览/广告绝不进候选（sniff-rules-7mmtv.md 规则 3）。
+                    if (isSevenMmTvPreviewOrAd(videoUrl)) {
+                        android.util.Log.d("JAVHD_INTERCEPT", "7mmtv preview/ad ignored: $videoUrl")
+                        return@runOnUiThread
+                    }
                     // The new sites use episode lists / nested players. Only their validated
                     // network request may replace the selected stream.
-                    if (AdditionalSiteMedia.isPage(geckoCurrentUrl ?: currentPageUrl) || AvTodayMedia.isPage(geckoCurrentUrl ?: currentPageUrl)) return@runOnUiThread
-                    val pageUrl = geckoCurrentUrl ?: currentPageUrl
+                    if (AdditionalSiteMedia.isPage(webView.url ?: currentPageUrl) || AvTodayMedia.isPage(webView.url ?: currentPageUrl)) return@runOnUiThread
+                    val pageUrl = webView.url ?: currentPageUrl
                     if (RouVideoStreams.playlistForPage(pageUrl) != null && !RouVideoStreams.accepts(pageUrl, videoUrl)) {
                         android.util.Log.d("ROU_PLAYER", "ignored non-video or other-episode request=$videoUrl")
                         return@runOnUiThread
@@ -2812,33 +1467,31 @@ class MainActivity : LocalizedActivity() {
                     showPlayButtonIfAllowed()
                     maybeStartStripchatWatchRecording(videoUrl)
                 }
-            },
-            "onAvTodayMedia" to handler@{ args ->
-                val media = args.optString(0)
-                val player = args.optString(1)
-                val sourcePage = args.optString(2)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun onAvTodayMedia(media: String, player: String, sourcePage: String) {
                 runOnUiThread {
-                    val page = geckoCurrentUrl ?: currentPageUrl
+                    val page = webView.url ?: currentPageUrl
                     if (sourcePage == page && AvTodayMedia.accepts(page, player, media)) {
                         currentVideoUrl = media
                         currentVideoReferer = player
                         showPlayButtonIfAllowed()
                     }
                 }
-            },
-            "onCrossSiteCodeDetected" to handler@{ args ->
-                val code = args.optString(0)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun onCrossSiteCodeDetected(code: String) {
                 runOnUiThread {
                     updateCrossSiteCode(code)
                 }
-            },
-            "onAdditionalEpisode" to handler@{ args ->
-                val videoUrl = args.optString(0)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun onAdditionalEpisode(videoUrl: String) {
                 runOnUiThread {
-                    val page = geckoCurrentUrl ?: currentPageUrl
+                    val page = webView.url ?: currentPageUrl
                     if ((AdditionalSiteMedia.hostMatches(page, "javday.app") ||
                             AdditionalSiteMedia.hostMatches(page, "javrate.com")) &&
                         AdditionalSiteMedia.accepts(page, videoUrl, page)) {
@@ -2847,14 +1500,13 @@ class MainActivity : LocalizedActivity() {
                         showPlayButtonIfAllowed()
                     }
                 }
-            },
-            "onAdditionalEpisodes" to handler@{ args ->
-                val html = args.optString(0)
-                val sourcePage = args.optString(1)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun onAdditionalEpisodes(html: String, sourcePage: String) {
                 val episodes = VideoExtractor.extractJavdayEpisodes(html, sourcePage)
                 runOnUiThread {
-                    val page = geckoCurrentUrl ?: currentPageUrl
+                    val page = webView.url ?: currentPageUrl
                     if (page == sourcePage && episodes.isNotEmpty()) {
                         currentJavdayEpisodes = episodes
                         if (currentVideoUrl !in episodes.map { it.url }) {
@@ -2864,12 +1516,12 @@ class MainActivity : LocalizedActivity() {
                         showPlayButtonIfAllowed()
                     }
                 }
-            },
-            "onAdditionalPlayerFrame" to handler@{ args ->
-                val embedUrl = args.optString(0)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun onAdditionalPlayerFrame(embedUrl: String) {
                 runOnUiThread {
-                    val sourcePage = geckoCurrentUrl ?: currentPageUrl
+                    val sourcePage = webView.url ?: currentPageUrl
                     if (AdditionalSiteMedia.hostMatches(sourcePage, "javrate.com")) {
                         if (JavrateStreams.isPlayer(embedUrl)) {
                             currentVideoUrl = embedUrl
@@ -2881,37 +1533,39 @@ class MainActivity : LocalizedActivity() {
                     if (!AdditionalSiteMedia.hostMatches(sourcePage, "supjav.com")) return@runOnUiThread
                     resolveSupjavSource(embedUrl, "")
                 }
-            },
-            "onSupjavServerChanging" to handler@{ args ->
+            }
 
+            @android.webkit.JavascriptInterface
+            fun onSupjavServerChanging() {
                 runOnUiThread {
-                    if (AdditionalSiteMedia.hostMatches(geckoCurrentUrl ?: currentPageUrl, "supjav.com")) clearSupjavSource()
+                    if (AdditionalSiteMedia.hostMatches(webView.url ?: currentPageUrl, "supjav.com")) clearSupjavSource()
                 }
-            },
-            "onSupjavPlayerFrame" to handler@{ args ->
-                val embedUrl = args.optString(0)
-                val label = args.optString(1)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun onSupjavPlayerFrame(embedUrl: String, label: String) {
                 runOnUiThread { resolveSupjavSource(embedUrl, label.take(80)) }
-            },
-            "onStripchatDebug" to handler@{ args ->
-                val message = args.optString(0)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun onStripchatDebug(message: String) {
                 android.util.Log.d("STRIPCHAT_HLS", message.take(1000))
-            },
-            "setStripchatPlayerOverlayVisible" to handler@{ args ->
-                val visible = args.optBoolean(0)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun setStripchatPlayerOverlayVisible(visible: Boolean) {
                 runOnUiThread {
                     setStripchatPlayerChromeHidden(visible)
                 }
-            },
-            "toggleStripchatRecording" to handler@{ args ->
+            }
 
+            @android.webkit.JavascriptInterface
+            fun toggleStripchatRecording() {
                 runOnUiThread { toggleStripchatRecordingFromPlayer() }
-            },
-            "stopStripchatRecording" to handler@{ args ->
+            }
 
+            @android.webkit.JavascriptInterface
+            fun stopStripchatRecording() {
                 runOnUiThread {
                     if (StripchatRecordingService.isRecording) {
                         startService(
@@ -2920,16 +1574,18 @@ class MainActivity : LocalizedActivity() {
                         )
                     }
                 }
-            },
-            "isStripchatRecording" to handler@{ args ->
-                // 无返回值：页面里的 stripchatBridgeShimJs 用推来的状态同步回答。
-            },
-            "beginStripchatStreamRecording" to handler@{ args ->
-                val mimeType = args.optString(0)
-                val sourceUrl = args.optString(1)
-                val width = args.optInt(2)
-                val height = args.optInt(3)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun isStripchatRecording(): Boolean = StripchatRecordingService.isRecording
+
+            @android.webkit.JavascriptInterface
+            fun beginStripchatStreamRecording(
+                mimeType: String,
+                sourceUrl: String,
+                width: Int,
+                height: Int
+            ): Boolean {
                 val accepted = stripchatStreamRecordingStore.begin(mimeType, sourceUrl, width, height)
                 if (accepted) runOnUiThread {
                     stripchatWatchSessionRecording = true
@@ -2941,15 +1597,15 @@ class MainActivity : LocalizedActivity() {
                     )
                     notifyStripchatWatchState()
                 }
-            },
-            "appendStripchatStreamRecordingChunk" to handler@{ args ->
-                val base64 = args.optString(0)
-                stripchatStreamRecordingStore.appendBase64(base64)
-            },
-            "finishStripchatStreamRecording" to handler@{ args ->
-                val success = args.optBoolean(0)
-                val detail = args.optString(1)
+                return accepted
+            }
 
+            @android.webkit.JavascriptInterface
+            fun appendStripchatStreamRecordingChunk(base64: String): Boolean =
+                stripchatStreamRecordingStore.appendBase64(base64)
+
+            @android.webkit.JavascriptInterface
+            fun finishStripchatStreamRecording(success: Boolean, detail: String) {
                 val result = stripchatStreamRecordingStore.finish(success, detail)
                 runOnUiThread {
                     stripchatWatchSessionRecording = false
@@ -2960,20 +1616,22 @@ class MainActivity : LocalizedActivity() {
                     } else {
                         stopStripchatRecordingStatusMonitor()
                     }
-                    GeckoEval.runJavascript(geckoSession, 
-                        "if(window.__javSetStripchatRecordingState) window.__javSetStripchatRecordingState(false);")
+                    webView.evaluateJavascript(
+                        "if(window.__javSetStripchatRecordingState) window.__javSetStripchatRecordingState(false);",
+                        null
+                    )
                     notifyStripchatWatchState()
                     if (detail.contains("下播")) handleStripchatAutoStopPrivacyState()
                     Toast.makeText(this@MainActivity, result.message, Toast.LENGTH_LONG).show()
                 }
-            },
-            "isStripchatStreamRecording" to handler@{ args ->
-                // 无返回值：页面里的 stripchatBridgeShimJs 用推来的状态同步回答。
-            },
-            "beginStripchatWatchSession" to handler@{ args ->
-                val sourceUrl = args.optString(0)
+            }
 
-                val modelKey = stripchatModelKey(sourceUrl) ?: return@handler
+            @android.webkit.JavascriptInterface
+            fun isStripchatStreamRecording(): Boolean = stripchatStreamRecordingStore.isActive()
+
+            @android.webkit.JavascriptInterface
+            fun beginStripchatWatchSession(sourceUrl: String): Boolean {
+                val modelKey = stripchatModelKey(sourceUrl) ?: return false
                 if (stripchatWatchSessionActive && stripchatWatchSessionModelKey != modelKey) {
                     runOnUiThread {
                         Toast.makeText(
@@ -2982,7 +1640,7 @@ class MainActivity : LocalizedActivity() {
                             Toast.LENGTH_SHORT,
                         ).show()
                     }
-                    return@handler
+                    return false
                 }
                 stripchatWatchSessionActive = true
                 stripchatWatchSessionRecording = stripchatStreamRecordingStore.isActive() ||
@@ -3007,20 +1665,40 @@ class MainActivity : LocalizedActivity() {
                         Toast.LENGTH_SHORT,
                     ).show()
                 }
-            },
-            "stopStripchatWatchSession" to handler@{ args ->
+                return true
+            }
 
+            @android.webkit.JavascriptInterface
+            fun stopStripchatWatchSession() {
                 runOnUiThread { stopStripchatWatchSession(manual = true) }
-            },
-            "isStripchatWatchSessionActive" to handler@{ args ->
-                // 无返回值：页面里的 stripchatBridgeShimJs 用推来的状态同步回答。
-            },
-            "getStripchatWatchStateLabel" to handler@{ args ->
-                val sourceUrl = args.optString(0)
-                stripchatWatchStateLabelFor(sourceUrl)
-            },
-            "onStripchatWatchAutoStartFailed" to handler@{ args ->
+            }
 
+            @android.webkit.JavascriptInterface
+            fun isStripchatWatchSessionActive(sourceUrl: String): Boolean {
+                val modelKey = stripchatModelKey(sourceUrl) ?: return false
+                return stripchatWatchSessionActive && stripchatWatchSessionModelKey == modelKey
+            }
+
+            @android.webkit.JavascriptInterface
+            fun getStripchatWatchStateLabel(sourceUrl: String): String {
+                val active = stripchatWatchSessionActive &&
+                    stripchatModelKey(sourceUrl) == stripchatWatchSessionModelKey
+                return when (StripchatWatchState.resolve(active,
+                    stripchatWatchSessionRecording || stripchatStreamRecordingStore.isActive() ||
+                        StripchatRecordingService.isRecording,
+                    stripchatWatchSessionStarting, stripchatWatchLiveState, stripchatWatchStatusChecked)) {
+                    StripchatWatchState.INACTIVE -> LanguageManager.text(this@MainActivity, "◎ 監錄", "Watch and record")
+                    StripchatWatchState.RECORDING -> LanguageManager.text(this@MainActivity, "■ 停止監錄", "Stop recording")
+                    StripchatWatchState.STARTING -> LanguageManager.text(this@MainActivity, "◌ 正在啟動監錄", "Starting recording")
+                    StripchatWatchState.LIVE_RETRY -> LanguageManager.text(this@MainActivity, "◌ 直播中，重試錄製", "Live; retrying recording")
+                    StripchatWatchState.WAITING -> LanguageManager.text(this@MainActivity, "◌ 等待公開直播", "Waiting for public broadcast")
+                    StripchatWatchState.CHECKING -> LanguageManager.text(this@MainActivity, "◌ 正在確認直播狀態", "Checking live status")
+                    StripchatWatchState.UNKNOWN -> LanguageManager.text(this@MainActivity, "◌ 狀態無法確認，重試中", "Status unavailable; retrying")
+                }
+            }
+
+            @android.webkit.JavascriptInterface
+            fun onStripchatWatchAutoStartFailed() {
                 runOnUiThread {
                     if (!stripchatWatchSessionActive) return@runOnUiThread
                     stripchatWatchSessionStarting = false
@@ -3028,28 +1706,29 @@ class MainActivity : LocalizedActivity() {
                     notifyStripchatWatchState()
                     scheduleStripchatRecordingStatusCheck(20_000L)
                 }
-            },
-            "enterStripchatPrivacyMode" to handler@{ args ->
+            }
 
+            @android.webkit.JavascriptInterface
+            fun enterStripchatPrivacyMode() {
                 runOnUiThread { requestStripchatPrivacyMode() }
-            },
-            "isStripchatPrivacyMode" to handler@{ args ->
-                // 无返回值：页面里的 stripchatBridgeShimJs 用推来的状态同步回答。
-            },
-            "onStripchatRecordingHealth" to handler@{ args ->
-                val message = args.optString(0)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun isStripchatPrivacyMode(): Boolean =
+                stripchatPrivacyDialog?.isShowing == true
+
+            @android.webkit.JavascriptInterface
+            fun onStripchatRecordingHealth(message: String) {
                 android.util.Log.w("STRIPCHAT_RECORD_HEALTH", message.take(1000))
                 if (message.contains("no source progress", ignoreCase = true) ||
                     message.contains("source video ended", ignoreCase = true)
                 ) {
                     runOnUiThread { scheduleStripchatRecordingStatusCheck(0L) }
                 }
-            },
-            "onStripchatRecordingError" to handler@{ args ->
-                val stage = args.optString(0)
-                val detail = args.optString(1)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun onStripchatRecordingError(stage: String, detail: String) {
                 val safeStage = stage.takeIf { it in setOf("capability", "source", "canvas", "storage", "recorder", "start", "write", "overlay") }
                     ?: "recording"
                 val safeDetail = detail.replace(Regex("https?://[^\\s\"<>]+"), "[URL]").take(240)
@@ -3062,10 +1741,10 @@ class MainActivity : LocalizedActivity() {
                             "錄製失敗：$safeDetail", "Recording failed: $safeDetail"), Toast.LENGTH_LONG).show()
                     }
                 }
-            },
-            "onStripchatLocationChanged" to handler@{ args ->
-                val url = args.optString(0)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun onStripchatLocationChanged(url: String) {
                 runOnUiThread {
                     if (stripchatModelKey(url) == null) return@runOnUiThread
                     currentPageUrl = url
@@ -3075,66 +1754,47 @@ class MainActivity : LocalizedActivity() {
                     updateFavoriteIcon(url)
                     injectStripchatWatchButton(url)
                 }
-            },
-            "openUnifiedSearch" to handler@{ args ->
-                val query = args.optString(0)
-
+            }
+            
+            @android.webkit.JavascriptInterface
+            fun openUnifiedSearch(query: String) {
                 runOnUiThread {
                     // Only the app-owned landing page may invoke this entry point.
-                    if (geckoCurrentUrl?.startsWith("https://javbrowser.app/") == true || isOnLandingPage()) {
+                    if (webView.url?.startsWith("https://javbrowser.app/") == true || isOnLandingPage()) {
                         startActivity(Intent(this@MainActivity, UnifiedSearchActivity::class.java).apply {
                             putExtra(UnifiedSearchActivity.EXTRA_QUERY, query.trim().take(500))
                         })
                     }
                 }
-            },
-            "openSiteBrowse" to handler@{ args ->
-                val siteId = args.optString(0)
-                val browseUrl = args.optString(1)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun navigateToUrl(url: String) {
                 runOnUiThread {
-                    // Only the app-owned landing page may invoke this entry point.
-                    // Opens the site as a native list (standard-app style)
-                    // instead of loading its homepage in the browser.
-                    if (geckoCurrentUrl?.startsWith("https://javbrowser.app/") == true || isOnLandingPage()) {
-                        startActivity(Intent(this@MainActivity, UnifiedSearchActivity::class.java).apply {
-                            putExtra(UnifiedSearchActivity.EXTRA_BROWSE_SITE, siteId)
-                            putExtra(UnifiedSearchActivity.EXTRA_BROWSE_URL, browseUrl)
-                        })
-                    }
+                    Toast.makeText(this@MainActivity, "Connecting...", Toast.LENGTH_SHORT).show()
+                    progressBar.visibility = View.VISIBLE
+                    progressBar.progress = 10
+                    webView.loadUrl(domainConfig.updateUrlIfNeeded(url))
+                    startLoadTimeout()
                 }
-            },
-            "navigateToUrl" to handler@{ args ->
-                val url = args.optString(0)
-
-                runOnUiThread {
-                    // 首页“直接前往”的站（无原生解析器）：走 GeckoView 打开。
-                    // 原 WebView 方案在迁移时把 ECH 拦截改成放行（明文
-                    // SNI），在用户网络上直接被 RST、断网。Gecko 原生
-                    // DoH + ECH，不明文 SNI，不会被 RST。
-                    startActivity(
-                        GeckoBrowserActivity.intent(
-                            this@MainActivity,
-                            domainConfig.updateUrlIfNeeded(url)
-                        )
-                    )
-                }
-            },
-            "showHelpDialog" to handler@{ args ->
-
+            }
+            
+            @android.webkit.JavascriptInterface
+            fun showHelpDialog() {
                 runOnUiThread {
                     this@MainActivity.showHelpDialog()
                 }
-            },
-            "loadLandingPage" to handler@{ args ->
-
+            }
+            
+            @android.webkit.JavascriptInterface
+            fun loadLandingPage() {
                 runOnUiThread {
                     this@MainActivity.loadLandingPage()
                 }
-            },
-            "onPatchLoaded" to handler@{ args ->
-                val frameUrl = args.optString(0)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun onPatchLoaded(frameUrl: String) {
                 android.util.Log.d("JAVHD_DEBUG", "patch loaded in frame: $frameUrl")
                 // video1.javhdporn.net/p/... 播放器頁面：設為 currentVideoUrl，點 ▶ 後在 WebView 內開啟
                 if (frameUrl.contains("video1.javhdporn.net/p/")) {
@@ -3145,10 +1805,10 @@ class MainActivity : LocalizedActivity() {
                         }
                     }
                 }
-            },
-            "onStreamtapeEmbedFound" to handler@{ args ->
-                val payload = args.optString(0)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun onStreamtapeEmbedFound(payload: String) {
                 // payload 格式：frameUrl|||interceptedUrl
                 val parts = payload.split("|||", limit = 2)
                 val frameUrl = if (parts.size == 2) parts[0] else ""
@@ -3161,7 +1821,7 @@ class MainActivity : LocalizedActivity() {
                 val isJavhdFrame = frameUrl.contains("javhdporn.net") || frameUrl.contains("video1.javhdporn")
                 if (!isJavhdFrame) {
                     android.util.Log.d("JAVHD_DEBUG", "skipped (ad frame): $frameUrl")
-                    return@handler
+                    return
                 }
 
                 runOnUiThread {
@@ -3193,83 +1853,1108 @@ class MainActivity : LocalizedActivity() {
                         }
                     }
                 }
-            },
-            "saveJavCodes" to handler@{ args ->
-                val codesJson = args.optString(0)
+            }
 
+            @android.webkit.JavascriptInterface
+            fun saveJavCodes(codesJson: String) {
                 try {
                     val arr = org.json.JSONArray(codesJson)
                     val codes = (0 until arr.length()).map { arr.getString(it) }
-                    if (codes.isEmpty()) return@handler
+                    if (codes.isEmpty()) return
                     runOnUiThread { processJavCodeQueue(codes, 0) }
                 } catch (e: Exception) {
                     android.util.Log.e("MainActivity", "saveJavCodes: ${e.message}")
                 }
-            },
-            "checkClipboard" to handler@{ args ->
+            }
 
-                runOnUiThread {
-                    refreshHomeClipboard()
-                }
-            },
-            "openClipboardLink" to handler@{ args ->
+            @android.webkit.JavascriptInterface
+            fun checkClipboard() {
+                runOnUiThread { refreshHomeClipboard() }
+            }
 
+            @android.webkit.JavascriptInterface
+            fun openClipboardLink() {
                 runOnUiThread {
                     val link = pendingHomeClipboardLink ?: return@runOnUiThread
-                    if (geckoCurrentUrl == "https://javbrowser.app/" && (!privacySettings.isLockEnabled || isUnlocked)) {
-                        loadGeckoUrl(link.url)
+                    if (currentWebUrl == "https://javbrowser.app/" && (!privacySettings.isLockEnabled || isUnlocked)) {
+                        loadWebViewUrl(link.url)
                     }
                 }
-            },
-            "dismissClipboardLink" to handler@{ args ->
+            }
 
+            @android.webkit.JavascriptInterface
+            fun dismissClipboardLink() {
                 runOnUiThread {
-                    if (geckoCurrentUrl == "https://javbrowser.app/") {
+                    if (currentWebUrl == "https://javbrowser.app/") {
                         dismissedHomeClipboardUrl = pendingHomeClipboardLink?.url
                         pendingHomeClipboardLink = null
                     }
                 }
-            },
-            "openTodayNew" to handler@{ args ->
-
+            }
+            @android.webkit.JavascriptInterface
+            fun openTodayNew() {
                 runOnUiThread {
                     startActivity(Intent(this@MainActivity, TodayNewActivity::class.java))
                 }
-            },
-            "openPlaybackHistory" to handler@{ args ->
+            }
 
+            @android.webkit.JavascriptInterface
+            fun openPlaybackHistory() {
                 runOnUiThread { startActivity(Intent(this@MainActivity, PlaybackHistoryActivity::class.java)) }
-            },
-            "openSalesRankings" to handler@{ args ->
-
+            }
+            @android.webkit.JavascriptInterface
+            fun openSalesRankings() {
                 runOnUiThread {
                     startActivity(Intent(this@MainActivity, SalesRankingActivity::class.java))
                 }
-            },
-            "onDomBlockPicked" to handler@{ args ->
-                val selector = args.optString(0)
-                val tag = args.optString(1)
+            }
+            @android.webkit.JavascriptInterface
+            fun onDomBlockPicked(sel: String, tag: String) {
+                runOnUiThread { showDomBlockConfirmDialog(sel, tag) }
+            }
 
-                runOnUiThread { showDomBlockConfirmDialog(selector, tag) }
-            },
-        ))
+            @android.webkit.JavascriptInterface
+            fun openSiteBrowse(siteId: String, browseUrl: String) {
+                runOnUiThread {
+                    // Only the app-owned landing page may invoke this entry point.
+                    // Opens the site as a native list (standard-app style)
+                    // instead of loading its homepage in the browser.
+                    if (currentWebUrl?.startsWith("https://javbrowser.app/") == true || isOnLandingPage()) {
+                        startActivity(Intent(this@MainActivity, UnifiedSearchActivity::class.java).apply {
+                            putExtra(UnifiedSearchActivity.EXTRA_BROWSE_SITE, siteId)
+                            putExtra(UnifiedSearchActivity.EXTRA_BROWSE_URL, browseUrl)
+                        })
+                    }
+                }
+            }
+        }, "Android")
 
-        // 装扩展：① 11 个广告域的 webRequest 拦截是 runtime 级的，装上后
-        // 主会话同样生效（VAST tsyndicate.com 永远放行）；② 嗅探器的
-        // native 端口要靠它建立，早装早收到候选（装晚到的候选会丢）。
-        JavhdGeckoExtension.ensureInstalled(this)
-        JavhdGeckoExtension.attachMediaSniffer(geckoSession) { url ->
-            onGeckoMediaCandidate(url)
+        // 在 javhdporn.net 每個 frame V8 建立時立即注入 Streamtape patch（document-start 等級）
+        // 這保證 patch 在所有頁面 JS 之前執行，解決 blob iframe + document.write 時序問題
+        if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            androidx.webkit.WebViewCompat.addDocumentStartJavaScript(
+                webView, stPatchScript,
+                setOf("*")   // 覆蓋所有 frame，包含 blob: iframe
+            )
+            android.util.Log.d("JAVHD_DEBUG", "addDocumentStartJavaScript registered")
+        } else {
+            android.util.Log.w("JAVHD_DEBUG", "DOCUMENT_START_SCRIPT not supported on this WebView version")
         }
 
-        geckoSession.open(runtime)
-        geckoView.setSession(geckoSession)
-        // 显式激活会话：不依赖 Surface 路径（1.2.6 教训；hyper-browser 同款）。
-        activateSession()
-        // 布局完成后再断言一次激活（GeckoBrowserActivity 同款做法）。
-        geckoView.post { activateSession() }
+        webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val url = request?.url?.toString() ?: return false
+                val lowerUrl = url.lowercase()
+
+                if (SupjavNavigation.blocks(currentPageUrl, url, request.isForMainFrame)) {
+                    android.util.Log.d("AdBlock", "SUPJAV main-frame advertisement blocked")
+                    return true
+                }
+
+                if (isRouVideoUrl(currentPageUrl) &&
+                    request.url.path.orEmpty().startsWith("/api/hop/", ignoreCase = true)
+                ) {
+                    android.util.Log.d("AdBlock", "ROU ad navigation blocked target=$url")
+                    return true
+                }
+
+                val navigationRules = siteRulesForPage(currentPageUrl)?.navigationBlock.orEmpty()
+                if (navigationRules.any { it.matches(url, request.isForMainFrame) }) {
+                    android.util.Log.d("AdBlock", "site navigation blocked page=$currentPageUrl target=$url")
+                    return true
+                }
+
+                // Block Shopee and Lazada redirects
+                if (lowerUrl.contains("shopee") || lowerUrl.contains("shp.ee") || lowerUrl.contains("lazada")) {
+                    return true
+                }
+
+                // DMM region bypass: redirect "not-available-in-your-region" page
+                if (lowerUrl.contains("dmm.co.jp/not-available-in-your-region") ||
+                    lowerUrl.contains("dmm.com/not-available-in-your-region")) {
+                    view?.loadUrl("https://video.dmm.co.jp/av/")
+                    return true
+                }
+                
+                // Handle APK download
+                if (url.contains(".apk") || url.contains("down_ra")) {
+                    downloadAndInstallApk(url)
+                    return true
+                }
+                
+                // 離開當前頁面前，先把目前的滾動位置存入 sessionStorage（以當前頁 URL 為 key）
+                // 這樣按返回鍵回來時，onPageFinished 才能正確恢復位置
+                view?.evaluateJavascript("""
+                    (function() {
+                        var sy = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+                        if (sy > 0) {
+                            var key = 'scrollPos__' + window.location.href;
+                            sessionStorage.setItem(key, sy);
+                        }
+                    })();
+                """.trimIndent(), null)
+                
+                // Allow navigation to target URLs
+                return false
+            }
+
+            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                val url = request?.url.toString()
+                val lowerUrl = url.lowercase()
+                val isMainFrame = request?.isForMainFrame ?: false
+
+                if (isRouVideoUrl(currentPageUrl) &&
+                    request?.url?.path.orEmpty().startsWith("/api/hop/", ignoreCase = true)
+                ) {
+                    return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                }
+
+                /* AD BLOCKING DISABLED
+                if (isAd(lowerUrl)) {
+                    // Block ad
+                    return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream("".toByteArray()))
+                }
+                */
+
+                // Video Sniffing: javhdporn.net / Streamtape CDN（必須在廣告封鎖之前，否則被提前 return 擋掉）
+                // 全程 log：記錄所有含 streamtape/tapecontent 的請求，不限格式
+                if (currentPageUrl.contains("javhdporn.net") &&
+                    (url.contains("streamtape") || url.contains("tapecontent"))) {
+                    android.util.Log.d("JAVHD_INTERCEPT", "intercepted: $url")
+                }
+                val isStreamtapeUrl = url.contains("streamtape") && (url.contains("get_video") || url.contains("/e/") || url.contains(".mp4"))
+                val isTapecontentUrl = url.contains("tapecontent") && (url.contains(".mp4") || url.contains(".ts") || url.contains("m3u8"))
+                if ((isStreamtapeUrl || isTapecontentUrl) && !AdditionalSiteMedia.isPage(currentPageUrl)) {
+                    val sniffedUrl = url
+                    view?.post {
+                        if (currentVideoUrl != sniffedUrl) {
+                            currentVideoUrl = sniffedUrl
+                            showPlayButtonIfAllowed()
+                        }
+                    }
+                    // 阻斷 WebView 繼續載入影片（節省流量）；使用者按 ▶ 才由外部播放器接管
+                    return WebResourceResponse("text/plain", "utf-8", null)
+                }
+
+                // 網站專屬規則優先：allowRequests 可保護同網域封面、播放器與串流。
+                val isAvplePage = currentPageUrl.contains("avple.tv", ignoreCase = true)
+                val requestUri = runCatching { Uri.parse(url) }.getOrNull()
+                val isAvpleMainHls = isAvplePage &&
+                    (requestUri?.host.orEmpty().equals("cdnedge.live", ignoreCase = true) ||
+                        requestUri?.host.orEmpty().endsWith(".cdnedge.live", ignoreCase = true)) &&
+                    requestUri?.path.orEmpty().startsWith("/file/avple-asserts/hls/", ignoreCase = true) &&
+                    lowerUrl.contains(".m3u8")
+                // 部分 Avple 影片會改用 growcdnssedge.com 提供主 HLS；
+                // 這類媒體不能被舊版 commonBlock / requestBlock 誤判為廣告。
+                val isAvpleGrowMedia = isAvplePage &&
+                    (requestUri?.host.orEmpty().equals("growcdnssedge.com", ignoreCase = true) ||
+                        requestUri?.host.orEmpty().endsWith(".growcdnssedge.com", ignoreCase = true)) &&
+                    (lowerUrl.contains(".m3u8") || lowerUrl.contains(".mp4") ||
+                        lowerUrl.contains(".m4s") || lowerUrl.contains(".ts"))
+                val isAvpleMediaRequest = isAvpleMainHls || isAvpleGrowMedia
+
+                val siteRules = siteRulesForPage(currentPageUrl)
+                val explicitlyAllowed = siteRules?.allowRequests?.any { it.matches(url, isMainFrame) } == true
+                val siteBlocked = siteRules?.requestBlock?.any { it.matches(url, isMainFrame) } == true
+                if (!explicitlyAllowed && siteBlocked && !isAvpleMediaRequest) {
+                    android.util.Log.d("AdBlock", "site request blocked page=$currentPageUrl target=$url")
+                    return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream("".toByteArray()))
+                }
+
+                // Block ads dynamically from JSON rules (commonBlock)
+                if (!explicitlyAllowed && !isAvpleMediaRequest && cachedBlockList.any { lowerUrl.contains(it) }) {
+                    return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream("".toByteArray()))
+                }
+
+                // Avple 頁面也會載入廣告 HLS；只有主影片的 cdnedge.live 路徑可以成為播放來源。
+                if (isAvplePage && lowerUrl.contains(".m3u8") && !isAvpleMainHls) {
+                    if (!isAvpleGrowMedia) return super.shouldInterceptRequest(view, request)
+                }
+
+                val additionalSite = AdditionalSiteMedia.isPage(currentPageUrl)
+                val mediaReferer = request?.requestHeaders.orEmpty().entries
+                    .firstOrNull { it.key.equals("Referer", ignoreCase = true) }?.value.orEmpty()
+                if (additionalSite && !AdditionalSiteMedia.hostMatches(currentPageUrl, "supjav.com") &&
+                    AdditionalSiteMedia.accepts(currentPageUrl, url, mediaReferer)) {
+                    val sourcePage = currentPageUrl
+                    view?.post {
+                        if (currentPageUrl == sourcePage) {
+                            currentVideoUrl = url
+                            currentVideoReferer = mediaReferer.ifBlank { originForUrl(sourcePage).orEmpty() }
+                            showPlayButtonIfAllowed()
+                        }
+                    }
+                }
+                // 7MMTV：正片 .m3u8 走“host 优先级 + 最长时长”分类
+                // （sniff-rules-7mmtv.md）；预览 .mp4 / 广告 .webm 不进候选，
+                // 不补 Referer。本分支只分类，不阻断请求。
+                if (isSevenMmTvPage(currentPageUrl)) {
+                    if (isSevenMmTvPreviewOrAd(url)) {
+                        android.util.Log.d("JAVHD_INTERCEPT", "7mmtv preview/ad skipped: $url")
+                    } else if (isSevenMmTvM3u8(url)) {
+                        val sourcePage = currentPageUrl
+                        view?.post {
+                            if (currentPageUrl == sourcePage) noteSevenMmTvM3u8(url)
+                        }
+                    }
+                }
+                // Video Sniffing: Check if request is for an m3u8 playlist
+                // javhdporn.net 的廣告 CDN（如 streamhls.click）也會出 m3u8，跳過避免誤判
+                if ((isAvpleMainHls || isAvpleGrowMedia || (url.contains(".m3u8") && !url.contains("minisite") &&
+                    !currentPageUrl.contains("javhdporn.net") && !AvTodayMedia.isPage(currentPageUrl) &&
+                    RouVideoStreams.playlistForPage(currentPageUrl) == null && !isAvplePage && !additionalSite &&
+                    !isSevenMmTvPage(currentPageUrl)))) {
+                    // If URL is a resolution-specific variant (e.g. /640x360/video.m3u8),
+                    // reconstruct the master playlist URL instead so we can select best quality later.
+                    val normalizedUrl = normalizeMissavM3u8Url(url)
+                    view?.post {
+                         if (currentVideoUrl != normalizedUrl) {
+                             currentVideoUrl = normalizedUrl
+                             showPlayButtonIfAllowed()
+                             val pageUrl = view?.url ?: ""
+                             if (currentVideoReferer == null) {
+                                 when {
+                                     pageUrl.contains("missav") ->
+                                         currentVideoReferer = originForUrl(pageUrl) ?: domainConfig.getMissAvBaseUrl()
+                                     pageUrl.contains("pigav.ws") ->
+                                         currentVideoReferer = originForUrl(pageUrl) ?: "https://pigav.ws/"
+                                     pageUrl.contains("avtoday.io") ->
+                                         currentVideoReferer = originForUrl(pageUrl) ?: "https://avtoday.io/"
+                                     pageUrl.contains("avjoy.me") ->
+                                         currentVideoReferer = "https://avjoy.me/"
+                                     pageUrl.contains("avple.tv", ignoreCase = true) ->
+                                         currentVideoReferer = originForUrl(pageUrl) ?: domainConfig.getAvpleBaseUrl()
+                                     pageUrl.contains("whos.tv", ignoreCase = true) ->
+                                         currentVideoReferer = originForUrl(pageUrl) ?: domainConfig.getWhosBaseUrl()
+                                 }
+                             }
+                         }
+                    }
+                }
+                
+                return super.shouldInterceptRequest(view, request)
+            }
+
+            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                domBlockPickerActive = false
+                cancelPendingFileChooser()
+                supjavSelectionGeneration++
+                supjavMediaResolver.close()
+                clearBlockedPopupViews()
+                android.util.Log.d("NAV_DEBUG", "onPageStarted url=$url")
+                currentPageUrl = url ?: ""   // 在 main thread 更新，供 shouldInterceptRequest 安全讀取
+                if (url != null && isRouVideoUrl(url)) adFilterRules.rememberRouVideoDomain(url)
+                rememberStripchatModelUrl(url)
+                btnPlay.visibility = View.GONE
+                btnPlay.text = "▶"
+                clearCrossSiteCode()
+                isOnJavDbVideoPage = false
+                isOnJavTrailersVideoPage = false
+                currentVideoUrl = null
+                currentVideoReferer = null
+                currentRouEpisodes = emptyList()
+                currentJavdayEpisodes = emptyList()
+                currentMissAvThumbnailConfig = null
+                currentJableVttUrl = null
+                videoFoundToastShown = false
+
+                // DMM Cookie bypass: inject region-unlock cookie for all DMM domains
+                if (url != null && (url.contains("dmm.co.jp") || url.contains("dmm.com"))) {
+                    val cm = android.webkit.CookieManager.getInstance()
+                    val cookie = "ckcy_remedied_check=ec_mrnhbtk; path=/"
+                    cm.setCookie("https://dmm.co.jp", cookie)
+                    cm.setCookie("https://special.dmm.co.jp", cookie)
+                    cm.setCookie("https://video.dmm.co.jp", cookie)
+                    cm.setCookie("https://www.dmm.co.jp", cookie)
+                    cm.flush()
+                }
+
+                // javhdporn.net：patch Document.prototype.write 攔截 Streamtape URL
+                // 頁面用空 blob iframe + contentDocument.write() 注入播放器，
+                // 只需攔截 write() 的內容即可取得 Streamtape embed URL
+                if (url?.contains("javhdporn.net") == true) {
+                    view?.evaluateJavascript("""
+                        (function(){
+                            if(window._javhd_patched) return;
+                            window._javhd_patched = true;
+                            function extractST(text) {
+                                var m = text.match(/((?:https?:)?\/\/streamtape\.[a-z]+\/e\/[A-Za-z0-9_-]+)/);
+                                if(m) {
+                                    var u = m[1];
+                                    Android.onStreamtapeEmbedFound(u.indexOf('http') === 0 ? u : 'https:' + u);
+                                }
+                            }
+                            // Patch document.write（父頁面寫入 blob iframe 用此方法）
+                            var _write = Document.prototype.write;
+                            Document.prototype.write = function() {
+                                var content = Array.prototype.join.call(arguments, '');
+                                if(content.indexOf('streamtape') !== -1) extractST(content);
+                                return _write.apply(this, arguments);
+                            };
+                            // Patch document.writeln 以防萬一
+                            var _writeln = Document.prototype.writeln;
+                            Document.prototype.writeln = function() {
+                                var content = Array.prototype.join.call(arguments, '');
+                                if(content.indexOf('streamtape') !== -1) extractST(content);
+                                return _writeln.apply(this, arguments);
+                            };
+                            // Patch innerHTML setter（有些頁面用 body.innerHTML 注入）
+                            var _innerDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+                            if(_innerDesc && _innerDesc.set) {
+                                Object.defineProperty(Element.prototype, 'innerHTML', {
+                                    set: function(v) {
+                                        if(typeof v === 'string' && v.indexOf('streamtape') !== -1) extractST(v);
+                                        return _innerDesc.set.call(this, v);
+                                    },
+                                    get: _innerDesc.get,
+                                    configurable: true
+                                });
+                            }
+                        })();
+                    """.trimIndent(), null)
+                }
+
+                // Show progress bar and start timeout
+                if (!isOnLandingPage()) {
+                    progressBar.visibility = View.VISIBLE
+                    progressBar.progress = 0
+                    startLoadTimeout()
+                }
+            }
+
+            override fun onPageCommitVisible(view: WebView?, url: String?) {
+                super.onPageCommitVisible(view, url)
+                applySiteDomRules(url)
+                if (url != null && AdditionalSiteMedia.hostMatches(url, "javrate.com")) {
+                    view?.evaluateJavascript(javrateAdLayoutHook, null)
+                }
+                injectCrossSiteSearchButtons(url)
+                injectStripchatWatchButton(url)
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                // 頁面歷史更新時（包含 goBack），重設恢復目標 URL
+                // pendingScrollRestoreUrl 在 onBackPressed 中已設定好，這裡不需要額外處理
+                if (url?.contains("stripchat.com", ignoreCase = true) == true && stripchatModelKey(url) != null) {
+                    currentPageUrl = url
+                    rememberStripchatModelUrl(url)
+                    btnAddFavorite.text = "♡"
+                    updateFavoriteIcon(url)
+                    injectStripchatWatchButton(url)
+                }
+                if (url != null && isRouVideoUrl(url) && url != currentPageUrl) {
+                    currentPageUrl = url
+                    currentRouEpisodes = emptyList()
+                    currentVideoUrl = null
+                    currentVideoReferer = originForUrl(url)
+                    if (Uri.parse(url).path.orEmpty().startsWith("/v/")) checkForVideo()
+                }
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                if (url != null && AdditionalSiteMedia.isPage(url)) {
+                    view?.evaluateJavascript("""
+                        (function() {
+                            var poster = document.getElementById('player-wrap');
+                            if (poster) {
+                                var match = getComputedStyle(poster).backgroundImage.match(/url\(["']?(.*?)["']?\)/);
+                                if (match) window.__javMainPoster = match[1];
+                            }
+                            if (/(^|\.)javrate\.com${'$'}/i.test(location.hostname)) {
+                                var frame = document.querySelector('#v2-player');
+                                if (frame && frame.src) Android.onAdditionalPlayerFrame(frame.src);
+                                return;
+                            }
+                            if (/(^|\.)supjav\.com${'$'}/i.test(location.hostname)) {
+                                $supjavPlayerHook
+                                return;
+                            }
+                            if (!/(^|\.)javday\.app${'$'}/i.test(location.hostname) || window.__javdayEpisodeHook) return;
+                            window.__javdayEpisodeHook = true;
+                            var episodePanel = document.getElementById('episodePanel');
+                            if (episodePanel) Android.onAdditionalEpisodes(episodePanel.outerHTML, location.href);
+                            document.addEventListener('click', function(event) {
+                                var episode = event.target.closest('.episode-btn[data-url]');
+                                if (episode) Android.onAdditionalEpisode(episode.getAttribute('data-url'));
+                            }, true);
+                            var first = document.querySelector('.episode-btn[data-url]');
+                            var source = document.querySelector('video source[src], source[type="application/x-mpegURL"]');
+                            var candidate = first ? first.getAttribute('data-url') : (source ? source.getAttribute('src') : '');
+                            if (candidate && candidate.indexOf('${'$'}') < 0) Android.onAdditionalEpisode(candidate);
+                        })();
+                    """.trimIndent(), null)
+                }
+                android.util.Log.d("NAV_DEBUG", "onPageFinished url=$url")
+                updateCopyPageUrlVisibility()
+                
+                // Hide progress bar and cancel timeout
+                progressBar.visibility = View.GONE
+                cancelLoadTimeout()
+
+                // 利用網頁自身的 sessionStorage，以「自己的 URL」作為 key 恢復滾動位置
+                // shouldOverrideUrlLoading 離開時已儲存；onBackPressed 返回時同樣儲存
+                val restoreScript = """
+                    (function() {
+                        var key = 'scrollPos__' + window.location.href;
+                        var savedY = sessionStorage.getItem(key);
+                        if (savedY) {
+                            var sy = parseInt(savedY, 10);
+                            if (sy > 0) {
+                                setTimeout(function() {
+                                    window.scrollTo(0, sy);
+                                    document.documentElement.scrollTop = sy;
+                                    document.body.scrollTop = sy;
+                                    sessionStorage.removeItem(key);
+                                }, 300);
+                            } else {
+                                sessionStorage.removeItem(key);
+                            }
+                        }
+                    })();
+                """.trimIndent()
+                view?.evaluateJavascript(restoreScript, null)
+                applySiteDomRules(url)
+                injectCrossSiteSearchButtons(url)
+                // JavHDPorn 的固定彈窗與頁面內嵌廣告位會在載入後動態重建。
+                // 只針對 JavHDPorn 移除已確認的廣告容器，避免影響其他網站的播放器 iframe。
+                if (url?.contains("javhdporn.net", ignoreCase = true) == true) {
+                    val javHdpornPopupCleanupJs = """
+                        (function() {
+                            if (window.__javHdpornPopupCleanup) return;
+                            window.__javHdpornPopupCleanup = true;
+
+                            var popupSelector = [
+                                'iframe[title="bfh"]',
+                                'iframe[src*="go.whitetrafsa.com"]',
+                                'iframe[src*="creative.whitetrafsa.com/widgets"]',
+                                'iframe[src*="cdn.pornfhd.com/files/banner_300x100.html"]',
+                                'iframe[style*="2147483647"]',
+                                '.header-ad-mobile',
+                                '.under-player-ad-mobile',
+                                'a[href*="go.javhdporn.live"]',
+                                'a[href*="javhd-trk.com"]'
+                            ].join(', ');
+
+                            function removePopupFrames() {
+                                try {
+                                    document.querySelectorAll(popupSelector).forEach(function(frame) {
+                                        frame.remove();
+                                    });
+                                } catch (e) {}
+                            }
+
+                            try {
+                                var style = document.createElement('style');
+                                style.id = '__javHdpornPopupCleanupStyle';
+                                style.textContent = popupSelector + ' { display: none !important; visibility: hidden !important; }';
+                                (document.head || document.documentElement).appendChild(style);
+                            } catch (e) {}
+
+                            removePopupFrames();
+                            try {
+                                var observer = new MutationObserver(removePopupFrames);
+                                observer.observe(document.documentElement, { childList: true, subtree: true });
+                                window.__javHdpornPopupObserver = observer;
+                            } catch (e) {}
+                        })();
+                    """.trimIndent()
+                    view?.evaluateJavascript(javHdpornPopupCleanupJs, null)
+                }
+                
+                // Do NOT reset btnPlay or currentVideoUrl here, as video might have been found during load
+                
+                // Inject JS to remove specific ad elements
+                val removeAdsJs = """
+                    (function() {
+                        function removeAds() {
+                            // Remove iframes with ID starting with 'container-'
+                            var iframes = document.querySelectorAll('iframe[id^="container-"]');
+                            iframes.forEach(function(iframe) {
+                                iframe.remove();
+                            });
+                            
+                            // Remove elements with high z-index and fixed position (common for overlays)
+                            var allElements = document.getElementsByTagName('*');
+                            for (var i = 0; i < allElements.length; i++) {
+                                var el = allElements[i];
+                                var style = window.getComputedStyle(el);
+                                if (style.position === 'fixed' && style.zIndex > 2000000000) {
+                                    el.style.display = 'none';
+                                    el.remove();
+                                }
+                            }
+
+                            // Rou.Video specific ad removal - Enhanced
+                            var rmpAds = document.querySelectorAll('.rmp-ad-container, .rootContent--OjJEv');
+                            rmpAds.forEach(function(ad) { ad.remove(); });
+                            
+                            // PRIORITY: Remove ALL tscprts.com related elements (all sites)
+                            var tscprtsElements = document.querySelectorAll('a[href*="tscprts.com"], a[href*="go.tscprts.com"]');
+                            tscprtsElements.forEach(function(link) {
+                                // Remove up to 3 levels of parent divs to ensure complete removal
+                                var parent = link.parentElement;
+                                for (var i = 0; i < 3 && parent; i++) {
+                                    var nextParent = parent.parentElement;
+                                    parent.remove();
+                                    parent = nextParent;
+                                }
+                            });
+                            
+                            // Remove bottom-right floating ads by class patterns
+                            var bottomRightAds = document.querySelectorAll('[class*="bottomRight"], [class*="slideAnimation"], [class*="root--"]');
+                            bottomRightAds.forEach(function(ad) {
+                                // Additional check: if it contains tscprts or doppiocdn links
+                                if (ad.innerHTML && (ad.innerHTML.includes('tscprts.com') || ad.innerHTML.includes('doppiocdn.com'))) {
+                                    ad.remove();
+                                }
+                            });
+                            
+                            // ENHANCED: Remove close-button ads and their parent containers (up to 2 levels)
+                            // BUT exclude video player controls (vjs-*)
+                            var closeButtons = document.querySelectorAll('[class*="close-button"]');
+                            closeButtons.forEach(function(btn) {
+                                // Skip if it's a video player control button
+                                if (btn.className.includes('vjs-') || btn.className.includes('video-js')) {
+                                    return; // Skip video player buttons
+                                }
+                                
+                                // First, try to auto-click the button
+                                try { btn.click(); } catch(e) {}
+                                
+                                // Remove up to 2 levels of parent to get the entire ad container
+                                var parent = btn.parentElement;
+                                if (parent) {
+                                    var grandParent = parent.parentElement;
+                                    if (grandParent) {
+                                        grandParent.remove();
+                                    } else {
+                                        parent.remove();
+                                    }
+                                } else {
+                                    btn.remove();
+                                }
+                            });
+                            
+                            // Remove dialog overlays by ID pattern or role
+                            var dialogs = document.querySelectorAll('div[role="dialog"], div[id^="radix-"]');
+                            dialogs.forEach(function(dialog) { dialog.remove(); });
+                            
+                            // Remove specific ad links/images - Enhanced with Safeguard
+                            function isSafeToRemove(element) {
+                                if (!element) return false;
+                                if (element.id === 'player') return false;
+                                if (element.classList.contains('video-js')) return false;
+                                if (element.classList.contains('vjs-tech')) return false;
+                                if (element.querySelector && (element.querySelector('#player') || element.querySelector('.video-js'))) return false;
+                                return true;
+                            }
+
+                            var adLinks = document.querySelectorAll('a[href*="ra12.xyz"], a[href*="tscprts.com"], a[href*="doppiocdn.com"], img[src*="doppiocdn.com"]');
+                            adLinks.forEach(function(link) { 
+                                var parent = link.closest('div');
+                                if (parent && isSafeToRemove(parent)) {
+                                    parent.remove();
+                                } else {
+                                    link.remove(); 
+                                }
+                            });
+
+                            // Generic removal for bottom floating ads (all sites now, not just rou.video)
+                            var allDivs = document.getElementsByTagName('div');
+                            for (var i = 0; i < allDivs.length; i++) {
+                                var el = allDivs[i];
+                                var style = window.getComputedStyle(el);
+                                // Check for fixed position at bottom or bottom-right
+                                if (style.position === 'fixed' && (style.bottom === '0px' || parseInt(style.bottom) < 100)) {
+                                    // Check if contains ad indicators
+                                    if (el.innerText.includes('Close') || el.innerHTML.includes('ra12.xyz') || 
+                                        el.innerHTML.includes('tscprts') || el.innerHTML.includes('go.tscprts') ||
+                                        el.innerHTML.includes('blob:') || style.zIndex > 100) {
+                                        el.style.display = 'none';
+                                        el.remove();
+                                    }
+                                }
+                            }
+
+
+                            // Auto-click "Close ad" buttons (but skip video player controls)
+                            var buttons = document.querySelectorAll('button, div[role="button"], a');
+                            buttons.forEach(function(btn) {
+                                // Skip video player controls
+                                if (btn.className.includes('vjs-') || btn.className.includes('video-js')) {
+                                    return;
+                                }
+                                
+                                var text = btn.innerText || "";
+                                if (text.toLowerCase().includes("close ad") || (text.toLowerCase() === "close" && !btn.closest('.video-js')) || text.includes("×")) {
+                                    // Check if it looks like an ad close button (heuristic)
+                                    if (btn.className.includes("close") || btn.className.includes("dismiss") || 
+                                        (btn.style.position === 'absolute' && btn.style.top)) {
+                                        try { btn.click(); } catch(e) {}
+                                        btn.remove(); // Remove it after clicking just in case
+                                    }
+                                }
+                            });
+                        }
+                        
+                        // Run immediately and periodically
+                        removeAds();
+                        setInterval(removeAds, 1000);
+                    })();
+                """.trimIndent()
+                // view?.evaluateJavascript(removeAdsJs, null) // DISABLED FOR TESTING
+
+                // New MISSAV Ad Blocking Logic
+                if (url?.contains("missav") == true || url?.contains("jable") == true || url?.let(::isRouVideoUrl) == true || url?.contains("avjoy.me") == true || url?.contains("javhdporn.net") == true || url?.contains("7mmtv", ignoreCase = true) == true || url?.contains("7tv", ignoreCase = true) == true || url?.contains("avple.tv", ignoreCase = true) == true || url?.contains("whos.tv", ignoreCase = true) == true) {
+                    val missavAdBlockJs = """
+                        (function() {
+                            'use strict';
+
+                            // Avple 的播放器與 Whos 的登入/註冊對話框都屬於頁面內容，
+                            // 不套用這段舊的通用 DOM 清理器；網路層的精確廣告規則仍會生效。
+                            if (/((^|\.)avple\.tv|(^|\.)whos\.tv)$/i.test(window.location.hostname || '')) {
+                                return;
+                            }
+
+                            // 1. 攔截彈窗與惡意跳轉邏輯
+                            var websites = ["missav.com/pop", "tsyndicate.com/api", "${domainConfig.getMissAvDomain()}/pop"];
+                            var url = window.location.href;
+                            for (var i = 0; i < websites.length; i++) {
+                                // 簡單的正則匹配
+                                if (url.indexOf(websites[i]) !== -1) {
+                                    // 在WebView中，window.close() 可能無效，通常需要透過 about:blank 停止加載
+                                    window.location.href = "about:blank";
+                                    return; // 停止後續執行
+                                }
+                            }
+
+                            // 2. 移除廣告 DOM 元素的函數
+                            function cleanAds() {
+                                // 移除特定的廣告區塊 (class 僅為 mx-auto 的元素)
+                                try {
+                                    const mxauto = document.querySelectorAll('.mx-auto:not([class*=" "])');
+                                    mxauto.forEach(node => node.remove());
+                                } catch (e) {}
+
+                                // 移除特定的 root + bottomRight 廣告區塊 (動態識別)
+                                try {
+                                    // 1. 注入 CSS 強制隱藏
+                                    var style = document.createElement('style');
+                                    style.innerHTML = `
+                                        div[class*="root"][class*="bottomRight"],
+                                        div[role="dialog"]:not([data-slot="sheet-content"]),
+                                        div[id^="radix-"]:not([data-slot="sheet-content"]),
+                                        div[id^="__clb-spot_"],
+                                        div[id^="ts_ad_"],
+                                        div[id^="exo-native-widget"],
+                                        .exo-native-widget,
+                                        div[data-banner-id],
+                                        .rmp-ad-container,
+                                        script[src*="magsrv.com"],
+                                        ins[data-zoneid],
+                                        ins {
+                                            display: none !important;
+                                        }
+                                    `;
+                                    document.head.appendChild(style);
+
+                                    // 2. 使用 MutationObserver 監聽並移除
+                                    var observer = new MutationObserver(function(mutations) {
+                                        // Safeguard function
+                                        function isSafeToRemove(element) {
+                                            if (!element || !element.tagName) return false;
+                                            var tag = element.tagName.toLowerCase();
+                                            if (tag === 'html' || tag === 'body' || tag === 'video' || tag === 'iframe') return false;
+                                            if (element.id === 'player') return false;
+                                            if (element.classList && (element.classList.contains('video-js') || element.classList.contains('vjs-tech'))) return false;
+                                            if (element.querySelector && (element.querySelector('video') || element.querySelector('iframe') || element.querySelector('#player') || element.querySelector('.video-js'))) return false;
+                                            return true;
+                                        }
+
+                                        mutations.forEach(function(mutation) {
+                                            mutation.addedNodes.forEach(function(node) {
+                                                if (node.nodeType === 1) { // Element
+                                                    // Check if node matches generic ad selectors
+                                                    if (node.matches && (
+                                                        node.matches('div[class*="root"][class*="bottomRight"]') ||
+                                                        (node.matches('div[role="dialog"]') && node.getAttribute('data-slot') !== 'sheet-content') ||
+                                                        (node.matches('div[id^="radix-"]') && node.getAttribute('data-slot') !== 'sheet-content') ||
+                                                        node.matches('div[id^="__clb-spot_"]') ||
+                                                        node.matches('div[id^="ts_ad_"]') ||
+                                                        node.matches('div[data-banner-id]') ||
+                                                        node.matches('.rmp-ad-container') ||
+                                                        node.matches('ins')
+                                                    )) {
+                                                        if (isSafeToRemove(node)) {
+                                                            node.remove();
+                                                        }
+                                                    }
+                                                    
+                                                    // Check for Rou.Video specific cards (已停用以避免誤刪播放器)
+                                                    // if (node.matches && node.matches('div[data-slot="card"]')) {
+                                                    //     if (isSafeToRemove(node) && (node.innerText.includes('通告') || node.innerHTML.includes('ra12.xyz'))) {
+                                                    //         node.remove();
+                                                    //     }
+                                                    // }
+
+                                                    // Check for dynamic ad links
+                                                    if (node.matches && (node.matches('a[href*="ra12.xyz"]') || node.matches('a[href*="rdz1.xyz"]'))) {
+                                                        // 安全容器查找：最多往上 3 層，且確保容器不含影片內容連結
+                                                        var safeContainer = null;
+                                                        var cur = node.parentElement;
+                                                        for (var _i = 0; _i < 3 && cur; _i++) {
+                                                            // 若容器含有影片內容連結，停止往上找（避免誤刪影片列表）
+                                                            if (cur.querySelector && cur.querySelector('a[href^="/v/"]')) break;
+                                                            safeContainer = cur;
+                                                            cur = cur.parentElement;
+                                                        }
+                                                        if (safeContainer && isSafeToRemove(safeContainer)) {
+                                                            safeContainer.remove();
+                                                        } else {
+                                                            node.remove();
+                                                        }
+                                                    }
+
+                                                    // Check children of added node for ad links
+                                                    var dynamicAdLinks = node.querySelectorAll('a[href*="ra12.xyz"], a[href*="rdz1.xyz"]');
+                                                    dynamicAdLinks.forEach(link => {
+                                                        // 安全容器查找：最多往上 3 層，且確保容器不含影片內容連結
+                                                        var safeContainer = null;
+                                                        var cur = link.parentElement;
+                                                        for (var _j = 0; _j < 3 && cur; _j++) {
+                                                            if (cur.querySelector && cur.querySelector('a[href^="/v/"]')) break;
+                                                            safeContainer = cur;
+                                                            cur = cur.parentElement;
+                                                        }
+                                                        if (safeContainer && isSafeToRemove(safeContainer)) {
+                                                            safeContainer.remove();
+                                                        } else {
+                                                            link.remove();
+                                                        }
+                                                    });
+                                                    
+                                                    // Also check children
+                                                    var ads = node.querySelectorAll('div[class*="root"][class*="bottomRight"], div[role="dialog"]:not([data-slot="sheet-content"]), div[id^="radix-"]:not([data-slot="sheet-content"]), div[id^="__clb-spot_"], div[id^="ts_ad_"], div[data-banner-id], .rmp-ad-container, ins');
+                                                    ads.forEach(ad => {
+                                                        if (isSafeToRemove(ad)) {
+                                                            ad.remove();
+                                                        }
+                                                    });
+                                                }
+                                            });
+                                        });
+                                    });
+                                    observer.observe(document.body, { childList: true, subtree: true });
+
+                                    // 3. 初始移除 (播放器可能還沒載入，避免誤刪)
+                                    function cleanAdsInitial() {
+                                        // Safeguard
+                                        function isSafeToRemove(element) {
+                                            if (!element) return false;
+                                            if (element.id === 'player') return false;
+                                            if (element.classList.contains('video-js')) return false;
+                                            if (element.classList.contains('vjs-tech')) return false;
+                                            if (element.querySelector && (element.querySelector('#player') || element.querySelector('.video-js'))) return false;
+                                            return true;
+                                        }
+
+                                        // Generic selectors (不包括 card，因為播放器可能還沒載入)
+                                        const selectors = [
+                                            'div[class*="root"][class*="bottomRight"]',
+                                            'div[role="dialog"]:not([data-slot="sheet-content"])',
+                                            'div[id^="radix-"]:not([data-slot="sheet-content"])',
+                                            'div[id^="__clb-spot_"]',
+                                            'div[id^="ts_ad_"]',
+                                            'div[id^="exo-native-widget"]',
+                                            '.exo-native-widget',
+                                            'div[data-banner-id]',
+                                            '.rmp-ad-container',
+                                            'ins[data-zoneid]',
+                                            'ins'
+                                        ];
+                                        
+                                        selectors.forEach(selector => {
+                                            document.querySelectorAll(selector).forEach(node => {
+                                                if (isSafeToRemove(node)) {
+                                                    node.style.display = 'none';
+                                                    node.remove();
+                                                }
+                                            });
+                                        });
+                                        
+                                        // Remove magsrv.com ad scripts (jable.tv)
+                                        document.querySelectorAll('script[src*="magsrv.com"]').forEach(script => {
+                                            script.remove();
+                                        });
+                                        
+                                        // Generic ad links and their containers
+                                        // 注意：不可使用 closest('.grid')，會誤刪整個影片列表！
+                                        // 改為最多往上 3 層找容器，且確保容器不含影片內容連結
+                                        document.querySelectorAll('a[href*="ra12.xyz"], a[href*="rdz1.xyz"]').forEach(link => {
+                                            var safeContainer = null;
+                                            var cur = link.parentElement;
+                                            for (var _k = 0; _k < 3 && cur; _k++) {
+                                                if (cur.querySelector && cur.querySelector('a[href^="/v/"]')) break;
+                                                safeContainer = cur;
+                                                cur = cur.parentElement;
+                                            }
+                                            if (safeContainer && isSafeToRemove(safeContainer)) {
+                                                safeContainer.remove();
+                                            } else {
+                                                link.remove();
+                                            }
+                                        });
+                                    }
+                                    
+                                    
+                                    cleanAdsInitial();
+                                } catch (e) {}
+
+                                // 嘗試點擊各種類型的關閉按鈕
+                                // 註：這些 Class 名稱可能是混淆過的，網站更新後可能失效
+                                const closeSelectors = [
+                                    ".close-button--wsOv0",
+                                    ".absolute.top-1.right-1.p-0.5.bg-black.rounded-lg.opacity-70"
+                                ];
+
+                                closeSelectors.forEach(selector => {
+                                    const btns = document.querySelectorAll(selector);
+                                    btns.forEach(btn => btn.click());
+                                });
+                            }
+
+                            // 執行邏輯
+                            cleanAds();
+
+                            // 延遲執行 (應對動態加載的廣告)
+                            setTimeout(cleanAds, 1000);
+                            setTimeout(cleanAds, 2500);
+                            setTimeout(cleanAds, 5000);
+
+                        })();
+                    """.trimIndent()
+                    view?.evaluateJavascript(missavAdBlockJs, null)
+                }
+                
+                checkForVideo()
+                updateFavoriteIcon()
+
+                if (url?.contains("stripchat.com", ignoreCase = true) == true) {
+                    injectStripchatWatchButton(url)
+                    view?.evaluateJavascript(
+                        """
+                        (function() {
+                            if (window.__javStripchatBookmarkWatcher) return;
+                            window.__javStripchatBookmarkWatcher = true;
+                            var lastUrl = '';
+                            function notifyLocation() {
+                                var current = location.href;
+                                if (current === lastUrl) return;
+                                lastUrl = current;
+                                try { Android.onStripchatLocationChanged(current); } catch (e) {}
+                            }
+                            ['pushState', 'replaceState'].forEach(function(name) {
+                                var original = history[name];
+                                history[name] = function() {
+                                    var result = original.apply(this, arguments);
+                                    setTimeout(notifyLocation, 0);
+                                    return result;
+                                };
+                            });
+                            window.addEventListener('popstate', notifyLocation);
+                            setInterval(notifyLocation, 500);
+                            notifyLocation();
+                        })();
+                        """.trimIndent(),
+                        null
+                    )
+                }
+
+                // JavDB 影片詳情頁：收藏統一使用左側愛心，避免顯示重複的書籤按鈕。
+                if (url?.matches(Regex("https://javdb\\.com/v/[A-Za-z0-9]+.*")) == true) {
+                    isOnJavDbVideoPage = true
+                    btnPlay.visibility = View.GONE
+                }
+
+                // JavTrailers 影片詳情頁也統一使用左側愛心收藏。
+                if (url?.contains("javtrailers.com/ja/video/") == true) {
+                    isOnJavTrailersVideoPage = true
+                    btnPlay.visibility = View.GONE
+                }
+
+                // javtrailers.com/ja/videos：頁面載入後等 5 秒再點「本日の新着」開關
+                if (url?.contains("javtrailers.com/ja/videos") == true) {
+                    val autoClickNewArrivalJs = """
+                        setTimeout(function() {
+                            var sw = document.getElementById('flexSwitchCheckDefault');
+                            if (sw && !sw.checked) {
+                                sw.click();
+                            }
+                        }, 5000);
+                    """.trimIndent()
+                    view?.evaluateJavascript(autoClickNewArrivalJs, null)
+                }
+
+                // 分享傳入的番號：landing page 載完後注入
+                if (url == "https://javbrowser.app/" && pendingJavCodesFromShare.isNotEmpty()) {
+                    val codesJson = org.json.JSONArray(pendingJavCodesFromShare).toString()
+                        .replace("\\", "\\\\").replace("'", "\\'")
+                    view?.evaluateJavascript("prefillJavCodes('$codesJson')", null)
+                    pendingJavCodesFromShare = emptyList()
+                }
+            }
+        }
+
+        webView.webChromeClient = object : android.webkit.WebChromeClient() {
+            override fun onShowFileChooser(
+                view: WebView?,
+                filePathCallback: android.webkit.ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                if (filePathCallback == null) return false
+                if (fileChooserInFlight || fileChooserParams == null) {
+                    filePathCallback.onReceiveValue(null)
+                    return true
+                }
+                pendingFileChooser = filePathCallback
+                try {
+                    val pickerIntent = fileChooserParams.createIntent().apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    fileChooserInFlight = true
+                    chooseWebFiles.launch(pickerIntent)
+                } catch (_: Exception) {
+                    fileChooserInFlight = false
+                    cancelPendingFileChooser()
+                    Toast.makeText(this@MainActivity,
+                        LanguageManager.text(this@MainActivity, "無法開啟檔案選擇器", "Unable to open the file picker"),
+                        Toast.LENGTH_SHORT).show()
+                }
+                return true
+            }
+
+
+            override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage?): Boolean {
+                consoleMessage?.let {
+                    if (it.message().contains("STRIPCHAT_HLS", ignoreCase = true)) {
+                        android.util.Log.d(
+                            "STRIPCHAT_HLS",
+                            "console ${it.messageLevel()} ${it.sourceId()}:${it.lineNumber()} ${it.message()}"
+                        )
+                    }
+                }
+                return super.onConsoleMessage(consoleMessage)
+            }
+
+            // 全螢幕：影片播放器按放大時呼叫
+            override fun onShowCustomView(view: android.view.View?, callback: CustomViewCallback?) {
+                if (customView != null) {
+                    onHideCustomView()
+                }
+                customView = view
+                customViewCallback = callback
+                fullscreenContainer.addView(view)
+                fullscreenContainer.visibility = android.view.View.VISIBLE
+                btnCrossSiteSearch.visibility = View.GONE
+                btnCopyPageUrl.visibility = View.GONE
+                val isStripchatFullscreen = webView.url
+                    ?.contains("stripchat.com", ignoreCase = true) == true
+                if (isStripchatFullscreen) {
+                    // Stripchat 同時有直式與橫式直播；依實際影片比例選擇方向。
+                    // 先保留手機目前方向，取得 metadata 後再鎖定對應感應方向。
+                    requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                    webView.evaluateJavascript(
+                        "(function(){var v=document.querySelector('video.video-element,video');" +
+                            "return !!(v&&v.videoWidth>0&&v.videoHeight>0&&v.videoHeight>v.videoWidth);})()"
+                    ) { result ->
+                        requestedOrientation = if (result == "true") {
+                            android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                        } else {
+                            android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                        }
+                    }
+                } else {
+                    // 其他網站維持原有的全螢幕橫向行為。
+                    requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                }
+                // 沉浸模式
+                window.decorView.systemUiVisibility =
+                    android.view.View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            }
+
+            // 全螢幕：關閉時呼叫（包含播放器內建的關閉按鈕）
+            override fun onHideCustomView() {
+                fullscreenContainer.removeAllViews()
+                fullscreenContainer.visibility = android.view.View.GONE
+                customViewCallback?.onCustomViewHidden()
+                customView = null
+                customViewCallback = null
+                // 恢復直向 + 系統 UI
+                requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                window.decorView.systemUiVisibility = android.view.View.SYSTEM_UI_FLAG_VISIBLE
+                if (isStripchatOverlayActive) {
+                    setStripchatPlayerChromeHidden(false)
+                } else {
+                    updateCrossSiteSearchButtonVisibility()
+                }
+            }
+
+            // 封殺所有 popup（javhdporn.net / Streamtape 點播放時會彈廣告分頁）
+            override fun onCreateWindow(
+                view: android.webkit.WebView?, isDialog: Boolean,
+                isUserGesture: Boolean, resultMsg: android.os.Message?
+            ): Boolean {
+                if ((AdditionalSiteMedia.hostMatches(currentPageUrl, "supjav.com") ||
+                        AdditionalSiteMedia.hostMatches(currentPageUrl, "javrate.com")) && resultMsg != null) {
+                    val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
+                    // A rejected window.open() may trigger the site's same-tab fallback.
+                    // Accept an isolated, script-free window and discard its navigation instead.
+                    val popup = WebView(this@MainActivity)
+                    blockedPopupViews.add(popup)
+                    fun discard() {
+                        popup.post {
+                            if (blockedPopupViews.remove(popup)) popup.destroy()
+                        }
+                    }
+                    popup.webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                            discard()
+                            return true
+                        }
+
+                        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse =
+                            WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                    }
+                    popup.webChromeClient = object : android.webkit.WebChromeClient() {
+                        override fun onCloseWindow(window: WebView?) { discard() }
+                    }
+                    transport.webView = popup
+                    resultMsg.sendToTarget()
+                    popup.postDelayed({ discard() }, 15_000)
+                    return true
+                }
+                return false
+            }
+        }
+
+        // Go 前置代理接入口（见 applyWebViewProxy）。
+        applyWebViewProxy()
+
     }
 
+    /**
+     * Go 前置代理接入口：后续集成代理时只填这个函数，由 EchProxyManager 实现。
+     * 在 setupWebView() 结尾调用一次。
+     */
+    private fun applyWebViewProxy() {
+        // TODO: Go 前置代理接在这里，由 EchProxyManager 实现
+    }
     private fun isAd(url: String): Boolean {
         val adKeywords = listOf(
             // General ad networks
@@ -3299,7 +2984,7 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun checkForVideo() {
-        val url = geckoCurrentUrl ?: return
+        val url = currentWebUrl ?: return
         
         // Only check on likely video pages to save resources
         // Jable: /videos/
@@ -3353,7 +3038,7 @@ class MainActivity : LocalizedActivity() {
                     };
                 })();
             """.trimIndent()
-            GeckoEval.runJavascript(geckoSession, monitorJs)
+            webView.evaluateJavascript(monitorJs, null)
         }
 
         if (url.contains("pigav.ws")) {
@@ -3455,7 +3140,7 @@ class MainActivity : LocalizedActivity() {
                     }, 800);
                 })();
             """.trimIndent()
-            GeckoEval.runJavascript(geckoSession, monitorJs)
+            webView.evaluateJavascript(monitorJs, null)
         }
 
         if (url.contains("avtoday.io", ignoreCase = true)) {
@@ -3543,7 +3228,7 @@ class MainActivity : LocalizedActivity() {
                     setTimeout(inspectPlayerFrame, 3000);
                 })();
             """.trimIndent()
-            GeckoEval.runJavascript(geckoSession, monitorJs)
+            webView.evaluateJavascript(monitorJs, null)
         }
 
         if (url.contains("stripchat.com", ignoreCase = true)) {
@@ -3708,11 +3393,11 @@ class MainActivity : LocalizedActivity() {
                     }, 1200);
                 })();
             """.trimIndent()
-            GeckoEval.runJavascript(geckoSession, monitorJs)
+            webView.evaluateJavascript(monitorJs, null)
         }
 
         // Also parse HTML to extract URL instantly for all supported sites
-        GeckoEval.evaluate(geckoSession, "(function() { return document.documentElement.outerHTML; })();") { html ->
+        webView.evaluateJavascript("(function() { return document.documentElement.outerHTML; })();") { html ->
             // html is a JSON string, e.g. "\u003Chtml>..."
             // We need to unescape it.
             val rawHtml = unescapeJsString(html.orEmpty())
@@ -3770,7 +3455,7 @@ class MainActivity : LocalizedActivity() {
             } else if (url.contains("avple.tv", ignoreCase = true)) {
                 // Avple 的主影片是動態分配 CDN，實際 HLS 由 shouldInterceptRequest
                 // 以 cdnedge.live/file/avple-asserts/hls/ 精確攔截。
-                GeckoEval.runJavascript(geckoSession, 
+                webView.evaluateJavascript(
                     """
                     (function() {
                         if (window.__javAvpleMonitor) return;
@@ -3802,7 +3487,7 @@ class MainActivity : LocalizedActivity() {
                             return oldOpen.apply(this, arguments);
                         };
                     })();
-                    """.trimIndent())
+                    """.trimIndent(), null)
             } else if (url.contains("whos.tv", ignoreCase = true)) {
                 // Whos.tv 詳情頁的主播放器以 data-preview-source/source 提供 HLS。
                 // 只取 data-main="true" 的播放器，避免抓到推薦卡片的預覽串流。
@@ -3821,7 +3506,7 @@ class MainActivity : LocalizedActivity() {
                 // 全程監控：每秒掃描一次頁面所有 innerHTML / script 內容，
                 // 找出 streamtape embed URL，持續 60 秒直到找到為止。
                 // 同時也嘗試從 blob iframe 的 contentDocument 或 src 取得 URL。
-                GeckoEval.runJavascript(geckoSession, """
+                webView.evaluateJavascript("""
                     (function(){
                         if(window._javhd_scan) return;
                         window._javhd_scan = true;
@@ -3861,8 +3546,8 @@ class MainActivity : LocalizedActivity() {
                         }
                         scan();
                     })();
-                """.trimIndent())
-                return@evaluate  // 非同步，此 branch 不用 extractedUrl
+                """.trimIndent(), null)
+                return@evaluateJavascript  // 非同步，此 branch 不用 extractedUrl
             }
 
             if (extractedUrl != null) {
@@ -3877,63 +3562,70 @@ class MainActivity : LocalizedActivity() {
      * 用隱藏 WebView 把 Streamtape embed URL 當主框架載入，
      * 攔截 shouldInterceptRequest 取得真實 mp4 URL。
      * Android 13+ cross-origin iframe 不觸發 shouldInterceptRequest，
-     * 必須用此方式繞過。
+     * 必須用此方式繞過。點播放後另以 DOM 輪詢 video.currentSrc/src
+     * 補無副檔名的 get_video 地址（攔截器看不到它）。
      */
     @android.annotation.SuppressLint("SetJavaScriptEnabled")
-    /**
-     * 用隐藏 GeckoSession 把 Streamtape embed URL 当主框架载入，
-     * 嗅探取得真实 mp4 URL（替代旧隐藏 WebView + shouldInterceptRequest）。
-     * Android 13+ cross-origin iframe 不触发拦截，必须用此方式绕过。
-     *
-     * 变化：① 拦截改嗅探（只观察、不阻断）；② 扩展嗅探器只上报路径以
-     * .m3u8/.mp4 结尾的请求，streamtape get_video（无副档名）它看
-     * 不到——点播放按钮后改由 DOM 轮询 video.currentSrc/src 补；
-     * ③ 旧版返回空响应阻断加载以省流量的行为没了。
-     */
     private fun extractStreamtapeUrl(embedUrl: String, callback: (String?) -> Unit) {
-        // 用 Handler 确保所有会话操作在 main thread
+        // 用 Handler 確保所有 WebView 操作在 main thread
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        var hiddenSession: GeckoSession? = null
+        var hiddenWebView: WebView? = null
         var found = false
 
         val timeoutRunnable = Runnable {
             if (!found) {
                 found = true
-                closeHiddenSession(hiddenSession)
-                hiddenSession = null
+                hiddenWebView?.destroy()
+                hiddenWebView = null
                 callback(null)
             }
         }
 
         handler.post {
-            val session = openHeadlessSession()
-            hiddenSession = session
+            val wv = WebView(this)
+            hiddenWebView = wv
 
-            JavhdGeckoExtension.ensureInstalled(this)
-            JavhdGeckoExtension.attachMediaSniffer(session) { candidate ->
-                android.util.Log.d("JAVHD_HIDDEN", "request: $candidate")
-                val isStreamtape = candidate.contains("streamtape") && candidate.contains("get_video")
-                val isTapecontent = candidate.contains("tapecontent") && candidate.contains(".mp4")
-                if ((isStreamtape || isTapecontent) && !found) {
-                    found = true
-                    handler.removeCallbacks(timeoutRunnable)
-                    val captured = candidate
-                    handler.post {
-                        closeHiddenSession(hiddenSession)
-                        hiddenSession = null
-                        callback(captured)
-                    }
-                }
+            wv.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                mediaPlaybackRequiresUserGesture = false
             }
+            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
-            session.progressDelegate = object : GeckoSession.ProgressDelegate {
-                override fun onPageStop(session: GeckoSession, success: Boolean) {
-                    android.util.Log.d("JAVHD_HIDDEN", "onPageStop success=$success")
-                    // 等 2 秒让 JS 生成播放按钮，再模拟点击
+            wv.webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: WebView?,
+                    request: WebResourceRequest?
+                ): WebResourceResponse? {
+                    val reqUrl = request?.url?.toString() ?: return null
+                    // DEBUG: 記錄所有請求
+                    android.util.Log.d("JAVHD_HIDDEN", "request: $reqUrl")
+                    val isStreamtape = reqUrl.contains("streamtape") && reqUrl.contains("get_video")
+                    val isTapecontent = reqUrl.contains("tapecontent") && reqUrl.contains(".mp4")
+                    if ((isStreamtape || isTapecontent) && !found) {
+                        found = true
+                        handler.removeCallbacks(timeoutRunnable)
+                        val captured = reqUrl
+                        handler.post {
+                            hiddenWebView?.destroy()
+                            hiddenWebView = null
+                            callback(captured)
+                        }
+                        return WebResourceResponse("text/plain", "utf-8",
+                            ByteArrayInputStream(ByteArray(0)))
+                    }
+                    return null
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    android.util.Log.d("JAVHD_HIDDEN", "onPageFinished: $url")
+                    // 等 2 秒讓 JS 生成播放按鈕，再模擬點擊
                     handler.postDelayed({
                         if (!found) {
-                            // DEBUG: 先印出页面上的元素
-                            GeckoEval.evaluate(session, """
+                            // DEBUG: 先印出頁面上的元素
+                            view?.evaluateJavascript("""
                                 (function(){
                                     var els = document.querySelectorAll('*[id],[class*="play"],[class*="btn"],[class*="overlay"]');
                                     var ids = [];
@@ -3945,7 +3637,7 @@ class MainActivity : LocalizedActivity() {
                             """.trimIndent()) { elementsRaw ->
                                 android.util.Log.d("JAVHD_HIDDEN", "Elements: $elementsRaw")
                             }
-                            GeckoEval.evaluate(session, """
+                            view?.evaluateJavascript("""
                                 (function(){
                                     var selectors = ['#overlay','#mainvideo','video','[id*="play"]','[class*="play"]','[class*="btn"]'];
                                     for(var i=0;i<selectors.length;i++){
@@ -3958,21 +3650,21 @@ class MainActivity : LocalizedActivity() {
                                 android.util.Log.d("JAVHD_HIDDEN", "Click result: $clickResult")
                             }
                             // 再等 2 秒读 video 元素：点播放后播放器会把
-                            // get_video 地址放到 video.src（嗅探器看不到
+                            // get_video 地址放到 video.src（拦截器看不到
                             // 无副档名的 get_video 请求，这里是唯一补位）。
                             handler.postDelayed({
                                 if (found) return@postDelayed
-                                GeckoEval.evaluate(session,
+                                view?.evaluateJavascript(
                                     "(function(){var v=document.querySelector('video');return (v&&(v.currentSrc||v.src))||'';})();"
                                 ) { raw ->
                                     val src = runCatching {
-                                        org.json.JSONTokener(raw).nextValue() as? String
+                                        org.json.JSONTokener(raw.orEmpty()).nextValue() as? String
                                     }.getOrNull().orEmpty()
                                     if (src.isNotBlank() && !found) {
                                         found = true
                                         handler.removeCallbacks(timeoutRunnable)
-                                        closeHiddenSession(hiddenSession)
-                                        hiddenSession = null
+                                        hiddenWebView?.destroy()
+                                        hiddenWebView = null
                                         callback(src)
                                     }
                                 }
@@ -3982,9 +3674,9 @@ class MainActivity : LocalizedActivity() {
                 }
             }
 
-            android.util.Log.d("JAVHD_DEBUG", "Loading hidden Gecko session: $embedUrl")
-            session.loadUri(embedUrl)
-            // 10 秒逾时
+            android.util.Log.d("JAVHD_DEBUG", "Loading hidden WebView: $embedUrl")
+            wv.loadUrl(embedUrl)
+            // 10 秒逾時
             handler.postDelayed(timeoutRunnable, 10000)
         }
     }
@@ -4008,54 +3700,59 @@ class MainActivity : LocalizedActivity() {
      * 播放網址由 pass_md5 產生短效 token，所以只在使用者按下播放時解析。
      */
     @android.annotation.SuppressLint("SetJavaScriptEnabled")
-    /**
-     * 解析 7MMTV 使用的 Playmogo/Dood 类嵌入播放器。
-     * 播放网址由 pass_md5 产生短效 token，所以只在使用者按下播放时解析。
-     * （隐藏 WebView → 隐藏 GeckoSession；拦截改嗅探 + DOM 扫描。）
-     *
-     * 注意：扩展嗅探器只上报 .m3u8/.mp4 结尾的请求，cloudatacdn /
-     * doodcdn 上无副档名的地址它看不到——那部分只剩 onPageStop 后的
-     * DOM 扫描（video/source/data-src），与旧版拦截互补。
-     */
     private fun resolvePlaymogoVideo(embedUrl: String, callback: (String?) -> Unit) {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        var hiddenSession: GeckoSession? = null
+        var hiddenWebView: WebView? = null
         var finished = false
 
         fun finish(result: String?) {
             if (finished) return
             finished = true
             handler.removeCallbacksAndMessages(null)
-            closeHiddenSession(hiddenSession)
-            hiddenSession = null
+            hiddenWebView?.stopLoading()
+            hiddenWebView?.destroy()
+            hiddenWebView = null
             callback(result)
         }
 
         handler.post {
-            val session = openHeadlessSession()
-            hiddenSession = session
+            val wv = WebView(this)
+            hiddenWebView = wv
+            wv.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                mediaPlaybackRequiresUserGesture = false
+                userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+            }
+            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
             val timeout = Runnable { finish(null) }
             handler.postDelayed(timeout, 15_000)
 
-            JavhdGeckoExtension.ensureInstalled(this)
-            JavhdGeckoExtension.attachMediaSniffer(session) { candidate ->
-                val lower = candidate.lowercase()
-                val host = runCatching { android.net.Uri.parse(candidate).host }
-                    .getOrNull().orEmpty().lowercase()
-                val isPlayable = candidate.startsWith("http", ignoreCase = true) &&
-                    !lower.contains("pass_md5") &&
-                    (lower.contains(".mp4") || host.contains("cloudatacdn") || host.contains("doodcdn"))
-                if (isPlayable) {
-                    handler.post { finish(candidate) }
+            wv.webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: WebView?,
+                    request: WebResourceRequest?
+                ): WebResourceResponse? {
+                    val candidate = request?.url?.toString().orEmpty()
+                    val lower = candidate.lowercase()
+                    val host = request?.url?.host.orEmpty().lowercase()
+                    val isPlayable = candidate.startsWith("http", ignoreCase = true) &&
+                        !lower.contains("pass_md5") &&
+                        (lower.contains(".mp4") || host.contains("cloudatacdn") || host.contains("doodcdn"))
+                    if (isPlayable) {
+                        handler.post { finish(candidate) }
+                        return WebResourceResponse("video/mp4", "binary", ByteArrayInputStream(ByteArray(0)))
+                    }
+                    return null
                 }
-            }
 
-            session.progressDelegate = object : GeckoSession.ProgressDelegate {
-                override fun onPageStop(session: GeckoSession, success: Boolean) {
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
                     handler.postDelayed({
                         if (finished) return@postDelayed
-                        GeckoEval.evaluate(session,
+                        view?.evaluateJavascript(
                             """
                             (function() {
                                 var nodes = document.querySelectorAll('video, source, [data-src]');
@@ -4091,29 +3788,23 @@ class MainActivity : LocalizedActivity() {
                     }, 900)
                 }
             }
-            session.loadUri(embedUrl)
+            wv.loadUrl(embedUrl)
         }
     }
 
     private fun injectStripchatWatchButton(pageUrl: String?) {
         if (stripchatModelKey(pageUrl.orEmpty()) == null) return
-        // 先装 bridge shim，再注入监录按钮 JS（shim 要在 asset JS 的
-        // Android.* 同步调用之前就位；见 stripchatBridgeShimJs）。
-        GeckoEval.runJavascript(geckoSession, stripchatBridgeShimJs())
-        pushStripchatBridgeState()
-        GeckoEval.evaluate(geckoSession, stripchatWatchControlsJs) { result ->
+        webView.evaluateJavascript(stripchatWatchControlsJs) { result ->
             android.util.Log.i("STRIPCHAT_WATCH_UI", "control mount=$result")
         }
     }
 
     private fun notifyStripchatWatchState() {
-        if (!::geckoSession.isInitialized) return
+        if (!::webView.isInitialized) return
         val recording = stripchatWatchSessionRecording ||
             stripchatStreamRecordingStore.isActive() ||
             StripchatRecordingService.isRecording
-        // 状态变化时先把新状态推到页面（shim 的 getter 读它），再刷新按钮。
-        pushStripchatBridgeState()
-        GeckoEval.runJavascript(geckoSession,
+        webView.evaluateJavascript(
             """
             (function() {
                 try {
@@ -4123,7 +3814,7 @@ class MainActivity : LocalizedActivity() {
                     if (window.__javRefreshStripchatWatchUi) window.__javRefreshStripchatWatchUi();
                 } catch (e) {}
             })();
-            """.trimIndent())
+            """.trimIndent(), null)
     }
 
 
@@ -4152,7 +3843,7 @@ class MainActivity : LocalizedActivity() {
                 return@setOnClickListener
             }
             // ── 原有播放邏輯 ──────────────────────────────────────
-            val pageUrl = geckoCurrentUrl ?: currentPageUrl
+            val pageUrl = currentWebUrl ?: currentPageUrl
             RouVideoStreams.playlistForPage(pageUrl)?.let { playlist ->
                 currentVideoUrl = playlist
                 currentVideoReferer = originForUrl(pageUrl)
@@ -4183,7 +3874,7 @@ class MainActivity : LocalizedActivity() {
                 }
                 when {
                     url.contains("streamhls") || url.contains(".m3u8") -> playVideo(url)
-                    url.contains("video1.javhdporn.net/p/") -> loadGeckoUrl(url)
+                    url.contains("video1.javhdporn.net/p/") -> loadWebViewUrl(url)
                     else -> playVideo(url)
                 }
             }
@@ -4191,7 +3882,7 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun saveJavDbPageAsBookmark() {
-        val pageUrl = geckoCurrentUrl ?: return
+        val pageUrl = currentWebUrl ?: return
 
         // Toggle：已收藏則移除
         val favorites = favoritesManager.getFavorites()
@@ -4274,7 +3965,7 @@ class MainActivity : LocalizedActivity() {
             })()
         """.trimIndent()
 
-        GeckoEval.evaluate(geckoSession, js) { result ->
+        webView.evaluateJavascript(js) { result ->
             runOnUiThread {
                 btnPlay.isEnabled = true
                 btnAddFavorite.isEnabled = true
@@ -4300,7 +3991,7 @@ class MainActivity : LocalizedActivity() {
                     val displayTitle = when {
                         code.isNotEmpty() && title.isNotEmpty() -> "$code $title".trim()
                         code.isNotEmpty() -> code
-                        else -> currentPageTitle() ?: pageUrl
+                        else -> webView.title ?: pageUrl
                     }
 
                     val added = favoritesManager.addFavorite(
@@ -4345,7 +4036,7 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun saveJavTrailersPageAsBookmark() {
-        val pageUrl = geckoCurrentUrl ?: return
+        val pageUrl = currentWebUrl ?: return
 
         // Toggle：已收藏則移除
         val favorites = favoritesManager.getFavorites()
@@ -4376,7 +4067,7 @@ class MainActivity : LocalizedActivity() {
             })()
         """.trimIndent()
 
-        GeckoEval.evaluate(geckoSession, js) { raw ->
+        webView.evaluateJavascript(js) { raw ->
             runOnUiThread {
                 btnPlay.isEnabled = true
                 btnPlay.text = "📚 書籤"
@@ -4443,7 +4134,7 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun savePigAvPageAsBookmark() {
-        val pageUrl = geckoCurrentUrl ?: return
+        val pageUrl = currentWebUrl ?: return
 
         val favorites = favoritesManager.getFavorites()
         val existing = favorites.find { it.url == pageUrl }
@@ -4528,12 +4219,12 @@ class MainActivity : LocalizedActivity() {
         """.trimIndent()
 
         btnAddFavorite.isEnabled = false
-        GeckoEval.evaluate(geckoSession, js) { raw ->
+        webView.evaluateJavascript(js) { raw ->
             runOnUiThread {
                 btnAddFavorite.isEnabled = true
                 try {
                     val obj = org.json.JSONObject(raw ?: "{}")
-                    val title = obj.optString("title", "").trim().ifEmpty { currentPageTitle() ?: pageUrl }
+                    val title = obj.optString("title", "").trim().ifEmpty { webView.title ?: pageUrl }
                     val coverUrl = obj.optString("coverUrl", "").trim()
                     android.util.Log.d("PIGAV_BOOKMARK", "page=$pageUrl cover=$coverUrl raw=${obj.optJSONArray("debugCoverCandidates")}")
                     val tags = mutableListOf<String>().also { list ->
@@ -4613,7 +4304,7 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun saveAvTodayPageAsBookmark() {
-        val pageUrl = geckoCurrentUrl ?: return
+        val pageUrl = currentWebUrl ?: return
         val existing = favoritesManager.getFavorites().find { it.url == pageUrl }
         if (existing != null) {
             favoritesManager.removeFavorite(pageUrl)
@@ -4648,12 +4339,12 @@ class MainActivity : LocalizedActivity() {
         """.trimIndent()
 
         btnAddFavorite.isEnabled = false
-        GeckoEval.evaluate(geckoSession, js) { raw ->
+        webView.evaluateJavascript(js) { raw ->
             runOnUiThread {
                 btnAddFavorite.isEnabled = true
                 try {
                     val obj = org.json.JSONObject(raw ?: "{}")
-                    val title = obj.optString("title", "").trim().ifEmpty { currentPageTitle() ?: pageUrl }
+                    val title = obj.optString("title", "").trim().ifEmpty { webView.title ?: pageUrl }
                     val cover = obj.optString("cover", "").trim()
                     val javCode = JavDbScraper.extractFc2Code(pageUrl, title, obj.optString("code", ""))
                         ?: JavDbScraper.extractJavCode(obj.optString("code", ""))
@@ -4698,6 +4389,126 @@ class MainActivity : LocalizedActivity() {
         }
     }
 
+    // ── 7MMTV 嗅探分类（sniff-rules-7mmtv.md）────────────────────────────────
+    // 注意：shouldInterceptRequest 只看得到请求，看不到响应，所以规则里
+    // “content-type 含 mpegurl”那路判断在这里没有等价物，只按 URL 判定。
+
+    /** 是否 7mmtv 播放页（域名或站名匹配，与站内既有写法一致）。 */
+    private fun isSevenMmTvPage(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val host = runCatching { android.net.Uri.parse(url).host }.getOrNull()?.lowercase().orEmpty()
+        return host == "7mmtv.sx" || host.endsWith(".7mmtv.sx") ||
+            url.contains("7mmtv", ignoreCase = true) || url.contains("7tv", ignoreCase = true)
+    }
+
+    /** 7mmtv 预览/广告：n39s.1024cdn.sx 的 .mp4（10 秒短片）、gif.7mmtv.sx 的 .webm。 */
+    private fun isSevenMmTvPreviewOrAd(url: String): Boolean {
+        val lower = url.lowercase()
+        val host = runCatching { android.net.Uri.parse(url).host }.getOrNull()?.lowercase().orEmpty()
+        val isPreviewMp4 = (host == "n39s.1024cdn.sx" || host.endsWith(".n39s.1024cdn.sx")) &&
+            lower.contains(".mp4")
+        val isAdWebm = (host == "gif.7mmtv.sx" || host.endsWith(".gif.7mmtv.sx")) &&
+            lower.contains(".webm")
+        return isPreviewMp4 || isAdWebm
+    }
+
+    /** 7mmtv .m3u8：URL 路径以 .m3u8 结尾（忽略 query/fragment）。 */
+    private fun isSevenMmTvM3u8(url: String): Boolean {
+        val path = runCatching { android.net.Uri.parse(url).path }.getOrNull().orEmpty().lowercase()
+        return path.endsWith(".m3u8")
+    }
+
+    /** 7mmtv .m3u8 优先级：0=media-hls.growcdnssedge.com，1=streamsuperpro，其余=2。 */
+    private fun sevenMmTvM3u8Rank(url: String): Int {
+        val host = runCatching { android.net.Uri.parse(url).host }.getOrNull()?.lowercase().orEmpty()
+        return when {
+            host == "media-hls.growcdnssedge.com" || host.endsWith(".media-hls.growcdnssedge.com") -> 0
+            host == "streamsuperpro.com" || host.endsWith(".streamsuperpro.com") -> 1
+            else -> 2
+        }
+    }
+
+    /**
+     * 7mmtv 播放页嗅到 .m3u8：记入本页候选，按“host 优先级 + 最长时长”挑正片。
+     * 不补 Referer（源站不要求）。只在最佳候选变化时更新播放按钮；
+     * 时长在后台拉清单算出后回主线程再比一次。须在主线程调用。
+     */
+    private fun noteSevenMmTvM3u8(url: String) {
+        val page = currentPageUrl
+        if (sevenMmTvCandidatePage != page) {
+            sevenMmTvCandidatePage = page
+            sevenMmTvCandidates.clear()
+        }
+        val isNew = !sevenMmTvCandidates.containsKey(url)
+        if (isNew) sevenMmTvCandidates[url] = null
+        updateSevenMmTvBest()
+        if (!isNew) return
+        sevenMmTvDurationExecutor.execute {
+            val seconds = resolveM3u8DurationSeconds(url)
+            runOnUiThread {
+                if (sevenMmTvCandidatePage != currentPageUrl) return@runOnUiThread
+                if (!sevenMmTvCandidates.containsKey(url)) return@runOnUiThread
+                sevenMmTvCandidates[url] = seconds
+                android.util.Log.d("JAVHD_INTERCEPT", "7mmtv candidate duration: $url -> ${seconds ?: "unknown"}s")
+                updateSevenMmTvBest()
+            }
+        }
+    }
+
+    /** 在本页 7mmtv 候选里挑最佳：host 优先级优先，同级内已知时长最长的优先，未知时长的排后。 */
+    private fun updateSevenMmTvBest() {
+        val best = sevenMmTvCandidates.entries
+            .sortedWith(
+                compareBy<Map.Entry<String, Double?>> { sevenMmTvM3u8Rank(it.key) }
+                    .thenByDescending { it.value != null }
+                    .thenByDescending { it.value ?: 0.0 }
+            )
+            .firstOrNull()?.key ?: return
+        if (currentVideoUrl != best) {
+            currentVideoUrl = best
+            showPlayButtonIfAllowed()
+        }
+    }
+
+    /**
+     * 取 .m3u8 播放时长（秒）：拉清单累加 #EXTINF；master 清单则跟第一个
+     * variant 再取一次。失败回 null（不参与时长比较，只按 host 优先级排）。
+     * 不带 Referer、不带 cookie，与播放器拉流一致。
+     */
+    private fun resolveM3u8DurationSeconds(playlistUrl: String): Double? {
+        fun fetch(url: String): String? {
+            val request = okhttp3.Request.Builder().url(url)
+                .header("User-Agent", MAIN_UA)
+                .get().build()
+            return runCatching {
+                sevenMmTvDurationClient.newCall(request).execute().use { resp ->
+                    if (!resp.isSuccessful) return@runCatching null
+                    resp.body?.string()
+                }
+            }.getOrNull()
+        }
+        fun sumExtinf(body: String): Double? {
+            var total = 0.0
+            var found = false
+            body.lineSequence().forEach { line ->
+                val t = line.trim()
+                if (t.startsWith("#EXTINF:")) {
+                    t.substringAfter("#EXTINF:").substringBefore(",").trim()
+                        .toDoubleOrNull()?.let { total += it; found = true }
+                }
+            }
+            return if (found) total else null
+        }
+        val body = fetch(playlistUrl) ?: return null
+        sumExtinf(body)?.let { return it }
+        val variant = body.lineSequence().map { it.trim() }
+            .firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: return null
+        val variantUrl = runCatching {
+            java.net.URL(java.net.URL(playlistUrl), variant).toString()
+        }.getOrNull() ?: return null
+        return fetch(variantUrl)?.let { sumExtinf(it) }
+    }
+
     /**
      * If the URL is a resolution-specific HLS variant (e.g. surrit.com/UUID/640x360/video.m3u8),
      * return the master playlist URL (surrit.com/UUID/playlist.m3u8) instead.
@@ -4714,7 +4525,7 @@ class MainActivity : LocalizedActivity() {
 
     private fun setupFavoritesButtons() {
         btnAddFavorite.setOnClickListener {
-            val url = geckoCurrentUrl
+            val url = currentWebUrl
             if (url != null && url.startsWith("http")) {
                 // JavDB 頁面沿用專用解析流程；收藏結果仍寫入同一份 App 書籤。
                 if (isOnJavDbVideoPage || url.matches(Regex("https://javdb\\.com/v/[A-Za-z0-9]+.*"))) {
@@ -4731,7 +4542,7 @@ class MainActivity : LocalizedActivity() {
                     return@setOnClickListener
                 }
                 resolveCurrentFavoriteUrl(url) { effectiveUrl ->
-                    val title = currentPageTitle() ?: "Unknown Page"
+                    val title = webView.title ?: "Unknown Page"
                     val favorites = favoritesManager.getFavorites()
                     val currentNormUrl = favoriteComparisonKey(effectiveUrl)
                     val isFavorite = favorites.any { favoriteComparisonKey(it.url) == currentNormUrl }
@@ -4743,7 +4554,7 @@ class MainActivity : LocalizedActivity() {
                         Toast.makeText(this, "已從書籤移除", Toast.LENGTH_SHORT).show()
                         btnAddFavorite.text = "♡"
                     } else {
-                        GeckoEval.evaluate(geckoSession, """
+                        webView.evaluateJavascript("""
                             (function() {
                                 function normalizeUrl(value) {
                                     if (!value) return '';
@@ -4825,13 +4636,13 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun updateFavoriteIcon(explicitUrl: String? = null) {
-        val url = explicitUrl ?: geckoCurrentUrl
+        val url = explicitUrl ?: currentWebUrl
         if (url != null && url.startsWith("http")) {
             val requestedKey = favoriteComparisonKey(url)
             resolveCurrentFavoriteUrl(url) { effectiveUrl ->
                 if (url.contains("stripchat.com", ignoreCase = true)) {
                     val latestUrl = currentPageUrl.takeIf { it.contains("stripchat.com", ignoreCase = true) }
-                        ?: geckoCurrentUrl.orEmpty()
+                        ?: currentWebUrl.orEmpty()
                     if (favoriteComparisonKey(latestUrl) != requestedKey) return@resolveCurrentFavoriteUrl
                 }
                 val favorites = favoritesManager.getFavorites()
@@ -4876,15 +4687,15 @@ class MainActivity : LocalizedActivity() {
         return "stripchat:${path.lowercase()}"
     }
     private fun playVideo(url: String) {
-        val page = geckoCurrentUrl ?: currentPageUrl
+        val page = currentWebUrl ?: currentPageUrl
         if (AdditionalSiteMedia.hostMatches(page, "javrate.com")) {
-            GeckoEval.evaluate(geckoSession, "document.querySelector('#v2-player')?.src || ''") { raw ->
+            webView.evaluateJavascript("document.querySelector('#v2-player')?.src || ''") { raw ->
                 val embed = runCatching { org.json.JSONTokener(raw).nextValue() as? String }.getOrNull().orEmpty()
                 if (JavrateStreams.isPlayer(embed)) {
-                    recordPlaybackPage(page, currentPageTitle().orEmpty())
+                    recordPlaybackPage(page, webView.title.orEmpty())
                     startActivity(Intent(this, FullscreenInternalPlayerActivity::class.java).apply {
                         putExtra(FullscreenInternalPlayerActivity.EXTRA_JAVRATE_PLAYER, embed)
-                        putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, currentPageTitle() ?: "video")
+                        putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, webView.title ?: "video")
                         putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, page)
                     })
                 } else {
@@ -4897,27 +4708,15 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun playResolvedVideo(url: String) {
-        // Gecko cookie 仓（含 HttpOnly）+ WebView/OkHttp 仓合并（Gecko 优先）。
-        // 取 cookie 的 URL 清单与下面 WebView 侧的分支一致（supjav 读视频
-        // 地址或 referer；javhdporn 读 www + video1 两个 host；其余读当前页）。
-        val referer = currentVideoReferer
-        val pageUrl = geckoCurrentUrl ?: referer ?: ""
-        val cookieUrls = if (AdditionalSiteMedia.hostMatches(pageUrl, "supjav.com")) {
-            listOf(url, referer.orEmpty())
-        } else if (referer?.contains("javhdporn.net") == true) {
-            listOf("https://www.javhdporn.net/", "https://video1.javhdporn.net/")
-        } else {
-            listOf(pageUrl, referer.orEmpty())
-        }
-        readGeckoCookies(cookieUrls) { geckoCookies ->
-            playResolvedVideoWithCookies(url, geckoCookies)
-        }
+        // 只有一个 WebView CookieManager 仓，直接读（supjav 读视频地址
+        // 或 referer；javhdporn 读 www + video1 两个 host；其余读当前页）。
+        playResolvedVideoWithCookies(url)
     }
 
-    private fun playResolvedVideoWithCookies(url: String, geckoCookies: String) {
+    private fun playResolvedVideoWithCookies(url: String) {
         val referer = currentVideoReferer
         val cookieManager = android.webkit.CookieManager.getInstance()
-        val currentPageUrl = geckoCurrentUrl ?: referer ?: ""
+        val currentPageUrl = currentWebUrl ?: referer ?: ""
         // javhdporn.net：cookie 需要從主頁和 video1 子域都取
         val webCookies = if (AdditionalSiteMedia.hostMatches(currentPageUrl, "supjav.com")) {
             cookieManager.getCookie(url).orEmpty().ifEmpty { cookieManager.getCookie(referer.orEmpty()).orEmpty() }
@@ -4930,7 +4729,7 @@ class MainActivity : LocalizedActivity() {
             cookieManager.getCookie(currentPageUrl) ?: cookieManager.getCookie(referer ?: "") ?: ""
         }
 
-        val cookies = mergeCookieStrings(geckoCookies, webCookies)
+        val cookies = webCookies
 
         if (privacySettings.alwaysUseInternalPlayer) {
             val isStripchatPage = referer?.contains("stripchat.com", ignoreCase = true) == true ||
@@ -5005,7 +4804,7 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun launchFullscreenInternalPlayer(videoUrl: String, referer: String) {
-        recordPlaybackPage(geckoCurrentUrl ?: currentPageUrl, currentPageTitle().orEmpty())
+        recordPlaybackPage(currentWebUrl ?: currentPageUrl, webView.title.orEmpty())
         val isMissAv = referer.contains("missav", ignoreCase = true) ||
             currentPageUrl.contains("missav", ignoreCase = true)
         val internalVideoUrl = if (isMissAv) normalizeMissavM3u8Url(videoUrl) else videoUrl
@@ -5020,9 +4819,9 @@ class MainActivity : LocalizedActivity() {
         val intent = Intent(this, FullscreenInternalPlayerActivity::class.java).apply {
             putExtra(FullscreenInternalPlayerActivity.EXTRA_VIDEO_URL, internalVideoUrl)
             putExtra(FullscreenInternalPlayerActivity.EXTRA_REFERER, referer)
-            val playerPageUrl = geckoCurrentUrl ?: currentPageUrl
+            val playerPageUrl = currentWebUrl ?: currentPageUrl
             putExtra(FullscreenInternalPlayerActivity.EXTRA_PAGE_URL, playerPageUrl)
-            putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, currentPageTitle() ?: "video")
+            putExtra(FullscreenInternalPlayerActivity.EXTRA_DOWNLOAD_NAME, webView.title ?: "video")
             if (AdditionalSiteMedia.hostMatches(playerPageUrl, "javday.app") && currentJavdayEpisodes.size > 1) {
                 val episodesJson = org.json.JSONArray()
                 currentJavdayEpisodes.forEach { episode ->
@@ -5060,7 +4859,7 @@ class MainActivity : LocalizedActivity() {
 
     private fun recordPlaybackPage(pageUrl: String, title: String) {
         PlaybackHistoryRepository.record(this, pageUrl, title)
-        GeckoEval.evaluate(geckoSession, """
+        webView.evaluateJavascript("""
             (function() {
                 var video = document.querySelector('video[poster]');
                 var meta = document.querySelector('meta[property="og:image"], meta[name="twitter:image"]');
@@ -5091,7 +4890,7 @@ class MainActivity : LocalizedActivity() {
                     actorsHtml: metadata.join('\n').slice(0, 300000) });
             })();
         """.trimIndent()) { raw ->
-            if (geckoCurrentUrl != pageUrl) return@evaluate
+            if (currentWebUrl != pageUrl) return@evaluateJavascript
             runCatching {
                 val json = org.json.JSONTokener(raw).nextValue() as? String ?: return@runCatching
                 val images = org.json.JSONObject(json)
@@ -5102,16 +4901,15 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun playInsideCurrentWebView(videoUrl: String, reusePageVideo: Boolean = false) {
-        recordPlaybackPage(geckoCurrentUrl ?: currentPageUrl, currentPageTitle().orEmpty())
+        recordPlaybackPage(currentWebUrl ?: currentPageUrl, webView.title.orEmpty())
         val videoUrlJson = org.json.JSONObject.quote(videoUrl)
         val reusePageVideoJs = if (reusePageVideo) "true" else "false"
         val shortSeekSeconds = privacySettings.playerShortSeekSeconds
         val longSeekSeconds = privacySettings.playerLongSeekSeconds
         val speedOptionsJson = org.json.JSONArray(privacySettings.playbackSpeedOptions).toString()
-        geckoMainHandler.post {
-            GeckoEval.evaluate(geckoSession, 
+        webView.post {
+            webView.evaluateJavascript(
                 """
-                ${stripchatBridgeShimJs()}
                 (function() {
                     var targetUrl = $videoUrlJson;
                     var reusePageVideo = $reusePageVideoJs;
@@ -5726,7 +5524,7 @@ class MainActivity : LocalizedActivity() {
                 })();
                 """.trimIndent()
             ) { result ->
-                android.util.Log.d("InternalPlayback", "result=$result url=${geckoCurrentUrl}")
+                android.util.Log.d("InternalPlayback", "result=$result url=${currentWebUrl}")
                 val overlayResult = runCatching { org.json.JSONTokener(result).nextValue() as? String }.getOrNull().orEmpty()
                 if (overlayResult != "overlay-ready" && !overlayResult.startsWith("overlay-injected:")) {
                     val detail = if (overlayResult == "stripchat-video-not-ready") {
@@ -5741,16 +5539,16 @@ class MainActivity : LocalizedActivity() {
                         notifyStripchatWatchState()
                         scheduleStripchatRecordingStatusCheck(20_000L)
                     }
-                    return@evaluate
+                    return@evaluateJavascript
                 }
                 if (reusePageVideo && stripchatWatchSessionActive &&
                     !stripchatStreamRecordingStore.isActive()
                 ) {
-                    geckoMainHandler.postDelayed({
+                    webView.postDelayed({
                         if (!stripchatWatchSessionActive || stripchatStreamRecordingStore.isActive()) {
                             return@postDelayed
                         }
-                        GeckoEval.evaluate(geckoSession, 
+                        webView.evaluateJavascript(
                             """
                             (function() {
                                 try {
@@ -5776,7 +5574,7 @@ class MainActivity : LocalizedActivity() {
 
     private fun setStripchatPlayerChromeHidden(hidden: Boolean) {
         if (hidden) {
-            val pageUrl = geckoCurrentUrl ?: currentPageUrl
+            val pageUrl = currentWebUrl ?: currentPageUrl
             if (!pageUrl.contains("stripchat.com", ignoreCase = true)) return
         }
 
@@ -5799,14 +5597,14 @@ class MainActivity : LocalizedActivity() {
             android.view.View.SYSTEM_UI_FLAG_VISIBLE
         }
 
-        val params = geckoView.layoutParams
+        val params = webView.layoutParams
         if (params is android.view.ViewGroup.MarginLayoutParams) {
             params.topMargin = if (hidden) {
                 0
             } else {
                 (60 * resources.displayMetrics.density).toInt()
             }
-            geckoView.layoutParams = params
+            webView.layoutParams = params
         }
     }
 
@@ -5824,7 +5622,7 @@ class MainActivity : LocalizedActivity() {
             )
             return
         }
-        val pageUrl = geckoCurrentUrl ?: currentPageUrl
+        val pageUrl = currentWebUrl ?: currentPageUrl
         if (!pageUrl.contains("stripchat.com", ignoreCase = true)) {
             Toast.makeText(this, "直播錄製僅支援 Stripchat 播放介面", Toast.LENGTH_SHORT).show()
             return
@@ -5854,8 +5652,6 @@ class MainActivity : LocalizedActivity() {
             return
         }
         showStripchatPrivacyShield()
-        // 隐私模式开关变化：推给页面，shim 的 isStripchatPrivacyMode() 读它。
-        pushStripchatBridgeState()
     }
 
     private fun showSetStripchatPrivacyPinDialog() {
@@ -6075,7 +5871,6 @@ class MainActivity : LocalizedActivity() {
 
     private fun dismissStripchatPrivacyShield() {
         stripchatPrivacyDialog?.takeIf { it.isShowing }?.dismiss()
-        pushStripchatBridgeState()
     }
 
     private fun restoreSecureWindowAfterRecording() {
@@ -6118,7 +5913,7 @@ class MainActivity : LocalizedActivity() {
             stripchatRecordingStatusUrl.isBlank()
         ) return
         if (stripchatRecordingStatusUrl.isBlank()) {
-            stripchatRecordingStatusUrl = geckoCurrentUrl ?: currentPageUrl
+            stripchatRecordingStatusUrl = currentWebUrl ?: currentPageUrl
         }
         val generation = stripchatRecordingStatusGeneration.get()
         stripchatRecordingStatusRunnable?.let(stripchatRecordingStatusHandler::removeCallbacks)
@@ -6139,9 +5934,9 @@ class MainActivity : LocalizedActivity() {
             scheduleStripchatRecordingStatusCheck(15_000L)
             return
         }
-        GeckoCookies.getCookie("https://stripchat.com/") { pageCookie ->
-            performStripchatRecordingStatusCheckWithCookies(generation, sourceUrl, username, pageCookie)
-        }
+        val pageCookie = android.webkit.CookieManager.getInstance()
+            .getCookie("https://stripchat.com/").orEmpty()
+        performStripchatRecordingStatusCheckWithCookies(generation, sourceUrl, username, pageCookie)
     }
 
     private fun performStripchatRecordingStatusCheckWithCookies(
@@ -6238,13 +6033,13 @@ class MainActivity : LocalizedActivity() {
     private fun probeStripchatPagePlayback(sourceUrl: String, callback: (Boolean) -> Unit) {
         val expectedKey = stripchatModelKey(sourceUrl)
         fun samePage() = expectedKey != null && !isDestroyed &&
-            stripchatModelKey(geckoCurrentUrl.orEmpty()) == expectedKey
+            stripchatModelKey(currentWebUrl.orEmpty()) == expectedKey
         if (!samePage()) { callback(false); return }
         val sample = "window.__javStripchatPlaybackProbe.sample(${org.json.JSONObject.quote(sourceUrl)})"
-        GeckoEval.evaluate(geckoSession, stripchatPlaybackProbeJs + "\n" + sample) {
-            geckoMainHandler.postDelayed({
+        webView.evaluateJavascript(stripchatPlaybackProbeJs + "\n" + sample) {
+            webView.postDelayed({
                 if (!samePage()) { callback(false); return@postDelayed }
-                GeckoEval.evaluate(geckoSession, sample) { value -> callback(samePage() && value == "true") }
+                webView.evaluateJavascript(sample) { value -> callback(samePage() && value == "true") }
             }, 1_250L)
         }
     }
@@ -6307,8 +6102,8 @@ class MainActivity : LocalizedActivity() {
         stopStripchatRecordingStatusMonitor()
         if (stripchatStreamRecordingStore.isActive()) {
             val quotedReason = org.json.JSONObject.quote(reason)
-            GeckoEval.runJavascript(geckoSession, 
-                "if(window.__javAutoStopStripchatRecording) window.__javAutoStopStripchatRecording($quotedReason);")
+            webView.evaluateJavascript(
+                "if(window.__javAutoStopStripchatRecording) window.__javAutoStopStripchatRecording($quotedReason);", null)
         }
         if (StripchatRecordingService.isRecording) {
             startService(
@@ -6332,7 +6127,7 @@ class MainActivity : LocalizedActivity() {
         stripchatWatchStartRequestedAt = System.currentTimeMillis()
         notifyStripchatWatchState()
 
-        val currentUrl = geckoCurrentUrl ?: currentPageUrl
+        val currentUrl = currentWebUrl ?: currentPageUrl
         val currentKey = stripchatModelKey(currentUrl)
         if (reusePlayingPage && currentKey == stripchatWatchSessionModelKey) {
             playInsideCurrentWebView(currentVideoUrl.orEmpty(), reusePageVideo = true)
@@ -6341,16 +6136,16 @@ class MainActivity : LocalizedActivity() {
         currentVideoUrl = null
         currentVideoReferer = originForUrl(stripchatWatchSessionUrl)
         if (currentKey == stripchatWatchSessionModelKey) {
-            geckoSession.reload()
+            webView.reload()
         } else {
-            loadGeckoUrl(stripchatWatchSessionUrl)
+            loadWebViewUrl(stripchatWatchSessionUrl)
         }
     }
 
     private fun maybeStartStripchatWatchRecording(videoUrl: String) {
         if (!stripchatWatchSessionActive || !stripchatWatchSessionStarting) return
         if (stripchatStreamRecordingStore.isActive() || StripchatRecordingService.isRecording) return
-        val currentUrl = geckoCurrentUrl ?: currentPageUrl
+        val currentUrl = currentWebUrl ?: currentPageUrl
         if (stripchatModelKey(currentUrl) != stripchatWatchSessionModelKey) return
         currentVideoReferer = originForUrl(stripchatWatchSessionUrl)
         playInsideCurrentWebView(videoUrl, reusePageVideo = true)
@@ -6368,8 +6163,8 @@ class MainActivity : LocalizedActivity() {
         stopStripchatRecordingStatusMonitor()
         if (stripchatStreamRecordingStore.isActive()) {
             val reason = org.json.JSONObject.quote("已手動停止監錄")
-            GeckoEval.runJavascript(geckoSession, 
-                "if(window.__javStopStripchatDirectRecording) window.__javStopStripchatDirectRecording($reason);")
+            webView.evaluateJavascript(
+                "if(window.__javStopStripchatDirectRecording) window.__javStopStripchatDirectRecording($reason);", null)
         }
         if (StripchatRecordingService.isRecording) {
             startService(
@@ -6653,13 +6448,13 @@ class MainActivity : LocalizedActivity() {
             return
         }
         // 全螢幕模式中，返回鍵先退出全螢幕
-        if (isGeckoFullscreen) {
-            exitGeckoFullscreen()
+        if (customView != null) {
+            webView.webChromeClient?.onHideCustomView()
             return
         }
-        if (geckoCanGoBack) {
+        if (webView.canGoBack()) {
             // 返回上一頁前，把當前的 Y 軸位置直接寫進該網頁的 sessionStorage
-            GeckoEval.evaluate(geckoSession, 
+            webView.evaluateJavascript(
                 """
                 (function() {
                     var sy = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
@@ -6671,7 +6466,7 @@ class MainActivity : LocalizedActivity() {
             ) { sy ->
                 android.util.Log.d("ScrollRestore", "Saved position to session: $sy")
                 // 寫完後立刻執行返回
-                geckoSession.goBack()
+                webView.goBack()
             }
         } else if (intent.getBooleanExtra(BrowserNavigator.EXTRA_RETURN_TO_SEARCH, false) ||
             intent.getBooleanExtra(BrowserNavigator.EXTRA_RETURN_TO_HISTORY, false)) {
@@ -6740,8 +6535,8 @@ class MainActivity : LocalizedActivity() {
     
     private fun isOnLandingPage(): Boolean {
         if (nativeHomeShowing) return true
-        val url = geckoCurrentUrl
-        return url == null || url == "about:blank" || url == LANDING_URL || url.startsWith(LANDING_ASSET_URL)
+        val url = currentWebUrl
+        return url == null || url == "about:blank" || url == LANDING_URL
     }
     
     // ── JAV code bookmark helpers ─────────────────────────────────────────────
@@ -6882,13 +6677,13 @@ class MainActivity : LocalizedActivity() {
 
     /** 首个首页加载（只发一次；post 与兜底延时都走这里）。 */
     // ── 原生首页（1.2.17-gecko）───────────────────────────────────────
-    // 首页改走原生 UI，不再经 GeckoSession 加载 landing.html，也就不再白屏。
-    // GeckoView 只在进入外站时才显示（loadGeckoUrl 会先调 showGeckoView）。
+    // 首页改走原生 UI，不再经 WebView 加载 landing.html，也就不再白屏。
+    // WebView 只在进入外站时才显示（loadWebViewUrl 会先调 showWebView）。
     // 1.2.14–1.2.16 的首页加载诊断、三地址探针与扩展桥首页
-    // （GeckoBridgeExtension landing.html）已随旧首页一并删除；
+    // （旧 landing.html 首页）已随旧首页一并删除；
     // 扩展本身（媒体嗅探等）不受影响。
 
-    /** 绑定原生首页视图与点击回调（initializeApp 里 setupGeckoSession 后调一次）。 */
+    /** 绑定原生首页视图与点击回调（initializeApp 里 setupWebView 后调一次）。 */
     private fun setupNativeHome() {
         val homeRoot = findViewById<View>(R.id.native_home) ?: return
         nativeHomeView = NativeHomeView(
@@ -6908,16 +6703,11 @@ class MainActivity : LocalizedActivity() {
                 }
 
                 override fun onNavigateToUrl(url: String) {
-                    startActivity(
-                        GeckoBrowserActivity.intent(
-                            this@MainActivity,
-                            domainConfig.updateUrlIfNeeded(url)
-                        )
-                    )
+                    loadWebViewUrl(domainConfig.updateUrlIfNeeded(url))
                 }
 
-                override fun onLoadGeckoUrl(url: String) {
-                    loadGeckoUrl(url)
+                override fun onLoadWebViewUrl(url: String) {
+                    loadWebViewUrl(url)
                 }
 
                 override fun onTodayNew() {
@@ -6943,7 +6733,7 @@ class MainActivity : LocalizedActivity() {
                 override fun onClipboardOpen() {
                     val link = pendingHomeClipboardLink ?: return
                     if (!privacySettings.isLockEnabled || isUnlocked) {
-                        loadGeckoUrl(link.url)
+                        loadWebViewUrl(link.url)
                     }
                 }
 
@@ -6962,13 +6752,13 @@ class MainActivity : LocalizedActivity() {
         )
     }
 
-    /** 显示原生首页（替代旧 loadLandingPage 的 Gecko 加载）。 */
+    /** 显示原生首页（替代旧 loadLandingPage 的 WebView 加载）。 */
     private fun showNativeHome() {
-        geckoCurrentUrl = LANDING_URL
+        currentWebUrl = LANDING_URL
         nativeHomeShowing = true
         progressBar.visibility = View.GONE
         cancelLoadTimeout()
-        if (::geckoView.isInitialized) geckoView.visibility = View.GONE
+        if (::webView.isInitialized) webView.visibility = View.GONE
         findViewById<View>(R.id.native_home)?.visibility = View.VISIBLE
         // 分享传来的番号：填进原生搜索框（替代旧版 landing.html 的 prefillJavCodes）。
         if (pendingJavCodesFromShare.isNotEmpty()) {
@@ -6976,14 +6766,14 @@ class MainActivity : LocalizedActivity() {
             pendingJavCodesFromShare = emptyList()
         }
         // 回首页时刷新剪贴板卡片（与旧版 onWindowFocusChanged 刷新一致）。
-        geckoMainHandler.post { refreshHomeClipboard() }
+        webView.post { refreshHomeClipboard() }
     }
 
-    /** 显示 GeckoView（进站时调；loadGeckoUrl 已先调）。 */
-    private fun showGeckoView() {
+    /** 显示 WebView（进站时调；loadWebViewUrl 已先调）。 */
+    private fun showWebView() {
         nativeHomeShowing = false
         findViewById<View>(R.id.native_home)?.visibility = View.GONE
-        if (::geckoView.isInitialized) geckoView.visibility = View.VISIBLE
+        if (::webView.isInitialized) webView.visibility = View.VISIBLE
     }
 
     /** 首页入口（保留旧名，各处调用点不动）：不再加载 landing.html，直接显示原生首页。 */
@@ -7044,14 +6834,14 @@ class MainActivity : LocalizedActivity() {
     }
 
     private fun updateCopyPageUrlVisibility() {
-        if (!::btnCopyPageUrl.isInitialized || !::geckoSession.isInitialized) return
-        btnCopyPageUrl.visibility = if (!isGeckoFullscreen && !isStripchatOverlayActive &&
-            PageUrlClipboard.copyableUrl(geckoCurrentUrl) != null) View.VISIBLE else View.GONE
+        if (!::btnCopyPageUrl.isInitialized || !::webView.isInitialized) return
+        btnCopyPageUrl.visibility = if (!customView != null && !isStripchatOverlayActive &&
+            PageUrlClipboard.copyableUrl(currentWebUrl) != null) View.VISIBLE else View.GONE
     }
 
     private fun copyCurrentPageUrl() {
         // Query WebView on click so redirects and client-side history are reflected immediately.
-        val url = PageUrlClipboard.copyableUrl(geckoCurrentUrl)
+        val url = PageUrlClipboard.copyableUrl(currentWebUrl)
         if (url == null) {
             Toast.makeText(this, LanguageManager.text(this, "目前沒有可複製的網頁網址", "No page URL to copy"), Toast.LENGTH_SHORT).show()
             return
@@ -7128,7 +6918,7 @@ class MainActivity : LocalizedActivity() {
                     .setTitle("Connection Timeout")
                     .setMessage("Page load took too long.\n\nSuggestions:\n• Check your internet connection\n• Switch between WiFi/4G\n• Tap Retry")
                     .setPositiveButton("Retry") { _, _ ->
-                        geckoSession.reload()
+                        webView.reload()
                     }
                     .setNegativeButton("Go Home") { _, _ ->
                         loadLandingPage()
@@ -7282,8 +7072,9 @@ class MainActivity : LocalizedActivity() {
     }
 
     override fun onDestroy() {
-        cancelPendingFilePrompt()
+        cancelPendingFileChooser()
         supjavMediaResolver.close()
+        clearBlockedPopupViews()
         // 取消註冊書籤頁 URL 廣播接收器
         androidx.localbroadcastmanager.content.LocalBroadcastManager.getInstance(this)
             .unregisterReceiver(favUrlReceiver)
@@ -7294,13 +7085,8 @@ class MainActivity : LocalizedActivity() {
         dismissStripchatPrivacyShield()
         stopStripchatRecordingStatusMonitor()
         stripchatRecordingStatusExecutor.shutdownNow()
+        sevenMmTvDurationExecutor.shutdownNow()
         stopService(Intent(this, StripchatPrivacyKeepAliveService::class.java))
-        // 拆掉桥与嗅探，关闭主会话（GeckoView 随布局一起销毁）。
-        if (::geckoSession.isInitialized) {
-            runCatching { GeckoBridge.detachBridge(geckoSession) }
-            runCatching { JavhdGeckoExtension.detachMediaSniffer(geckoSession) }
-            runCatching { geckoSession.close() }
-        }
         super.onDestroy()
     }
 }
