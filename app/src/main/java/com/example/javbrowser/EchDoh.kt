@@ -80,6 +80,12 @@ import java.util.concurrent.TimeUnit
  * dialing the hint works). A CNAME'd HTTPS record can carry
  * someone else's ech; without a Cloudflare edge behind it the
  * ech is ignored.
+ *
+ * A shared config (public_name cloudflare-ech.com) is never trusted
+ * from a site's own record: that record is a snapshot and CF rotates
+ * the shared keys hourly (5h expiry), so it is fetched live from
+ * cloudflare-ech.com on every cache miss instead. Own configs
+ * (public_name is the site itself) are used as-is.
  */
 object EchDoh {
 
@@ -267,10 +273,29 @@ object EchDoh {
                 val (records, minTtl) = resolveFromEndpoint(endpoint, host)
                 if (!records.resolvedViaDoh) continue
                 if (records.echConfigList != null) {
-                    val ech = records.echConfigList
+                    val recordEch = records.echConfigList
                     val hintIsCf = records.echHints.any { isCloudflareIp(it) }
                     val addrIsCf = records.addresses.any { isCloudflareIp(it) }
                     if (hintIsCf || addrIsCf) {
+                        // A shared config (public_name
+                        // cloudflare-ech.com) from a site's record is
+                        // a snapshot: CF rotates the shared keys
+                        // hourly (5h expiry) and a manually-placed
+                        // record is never refreshed, so fetch the
+                        // current shared config live from
+                        // cloudflare-ech.com instead. Fall back to
+                        // the snapshot when the live fetch fails.
+                        // Own configs (public_name is the site
+                        // itself) are used as-is. (cloudflare-ech.com
+                        // itself is exempt: its record IS the live
+                        // value.)
+                        val ech = if (isSharedEchConfig(recordEch) && key != SHARED_ECH_HOST) {
+                            fetchLiveSharedEch() ?: recordEch.also {
+                                Log.w(TAG, "live shared ech fetch failed for $host, using record snapshot")
+                            }
+                        } else {
+                            recordEch
+                        }
                         // Dial the edge the ech is valid for: the
                         // HTTPS hints when they are Cloudflare,
                         // otherwise the A/AAAA addresses. (avjoy.me:
@@ -703,6 +728,64 @@ object EchDoh {
                 return bytes.copyOfRange(pos, pos + len)
             }
             pos += len
+        }
+        return null
+    }
+
+    /**
+     * public_name of the first entry of an ECHConfigList, or null
+     * when the bytes do not parse. Wire layout (RFC 9846): list
+     * length u16, then entries (version u16, length u16, contents);
+     * contents are key_config (config_id u8, kem_id u16, public_key
+     * u16-len + bytes, cipher_suites u16-len + bytes),
+     * maximum_name_length u8, public_name u8-len + bytes.
+     */
+    private fun echPublicName(wire: ByteArray): String? {
+        if (wire.size < 2 + 4) return null
+        var p = 2
+        if (p + 4 > wire.size) return null
+        val contentLen = ((wire[p + 2].toInt() and 0xFF) shl 8) or (wire[p + 3].toInt() and 0xFF)
+        p += 4
+        if (contentLen <= 0 || p + contentLen > wire.size) return null
+        val end = p + contentLen
+        if (p + 1 + 2 + 2 > end) return null
+        p += 1 // config_id
+        p += 2 // kem_id
+        val pkLen = ((wire[p].toInt() and 0xFF) shl 8) or (wire[p + 1].toInt() and 0xFF)
+        p += 2 + pkLen
+        if (p + 2 > end) return null
+        val csLen = ((wire[p].toInt() and 0xFF) shl 8) or (wire[p + 1].toInt() and 0xFF)
+        p += 2 + csLen
+        if (p + 1 > end) return null
+        p += 1 // maximum_name_length
+        if (p + 1 > end) return null
+        val nameLen = wire[p].toInt() and 0xFF
+        p += 1
+        if (nameLen == 0 || p + nameLen > end) return null
+        return runCatching { String(wire, p, nameLen, Charsets.US_ASCII) }.getOrNull()
+    }
+
+    /** Whether an ECHConfigList is Cloudflare's shared config. */
+    private fun isSharedEchConfig(wire: ByteArray): Boolean =
+        echPublicName(wire)?.equals(SHARED_ECH_HOST, ignoreCase = true) == true
+
+    /**
+     * Current shared Cloudflare ECH config, fetched live from
+     * [SHARED_ECH_HOST]'s HTTPS record via the Gateway endpoints in
+     * order. Never the snapshot from a site's own record: CF rotates
+     * the shared keys hourly (5h expiry, IETF 126 measured) and a
+     * manually-placed record goes stale within hours. Null when
+     * unavailable. The result is cached as part of the caller's
+     * HostRecords, so this runs at most once per cache TTL.
+     */
+    private fun fetchLiveSharedEch(): ByteArray? {
+        for (endpoint in ENDPOINTS) {
+            try {
+                val shared = echFromEndpoint(endpoint, SHARED_ECH_HOST)
+                if (shared.ech != null) return shared.ech
+            } catch (e: Exception) {
+                Log.w(TAG, "live shared ech via ${endpoint.name} failed: ${e.message}")
+            }
         }
         return null
     }
