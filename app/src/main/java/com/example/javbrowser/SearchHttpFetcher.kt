@@ -23,8 +23,8 @@ data class SearchHttpResponse(val statusCode: Int, val finalUrl: String, val bod
  * 原先的 ECH（Conscrypt）/ Cronet H3 路徑已隨 EchH3Router、EchDoh、
  * ConscryptEch 一起刪除。瀏覽器載入（嵌頁播放器）走 WebView（无 ECH）；
  * 搜索抓取仍走 OkHttp，但已是明文 SNI——在用戶網絡上
- * 明文 SNI 可能被 RST，搜索受影響時應把抓取也改走前置代理
- * （见 MainActivity.applyWebViewProxy 接入点）。
+ * 明文 SNI 可能被 RST。Go 前置代理已於 1.2.21 拆除（DoH 被污染打不通），
+ * 播放改走 App 原生直取（見 SevenMmTvResolver）。
  *
  * 保留：CookieManager 雙向同步、host allowlist、2MB 體 cap、
  * 超時、取消、retryAfter / cf-mitigated 標記。

@@ -702,6 +702,15 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             }
             return
         }
+        // 7mmtv 原生直取（2026-11-22，1.2.21）：正片 m3u8 是 JS 动态加载的，
+        // 静态 HTML 里没有；以前靠进播放页实时嗅探（WebView + Go 代理），
+        // 代理 DoH 被污染打不通，播放页一直打不开。改由 App 直接抓数据：
+        // 详情页 HTML -> 解 play.php id -> play.php -> 正片 m3u8，
+        // 全程原生 OkHttp，不经 WebView、不经 Go 代理。
+        if (item.siteId == SearchSiteIds.SEVEN_MM_TV) {
+            resolveSevenMmTv(item, sessionId)
+            return
+        }
         SearchScheduler.workers.execute {
             val (candidates, ads) = trySniffVideoCandidates(item, sessionId)
             runOnUiThread {
@@ -772,6 +781,62 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                 showSniffPicker(item, listOf(resolverRecord(realUrl, "resolver-hentaimama")), sessionId)
             } else {
                 BrowserNavigator.open(this, item.detailUrl)
+            }
+        }
+    }
+
+    /**
+     * 7mmtv 原生直取：详情页 HTML -> play.php id -> play.php -> 正片 m3u8。
+     * 全程原生 OkHttp（与搜寻同一条网络栈），不经 WebView、不经 Go 代理。
+     * 有候选就进同一套过滤 + 选择器；取不到就回浏览器（不走 WebView
+     * 实时嗅探）。Never throws.
+     */
+    private fun resolveSevenMmTv(item: SearchItem, sessionId: Long) {
+        runOnUiThread {
+            android.widget.Toast.makeText(this,
+                LanguageManager.text(this, "正在解析真实地址…", "Resolving real video URL…"),
+                android.widget.Toast.LENGTH_SHORT).show()
+        }
+        SearchScheduler.workers.execute {
+            val site = sites.firstOrNull { it.id == item.siteId }
+            val scored: List<VideoPageSniffer.ScoredCandidate> = try {
+                if (site == null) {
+                    PlaybackDataStore.recordFail(sessionId, "站點未註冊")
+                    emptyList()
+                } else {
+                    val response = SearchHttpFetcher().fetch(item.detailUrl, SearchCancellation(), site)
+                    if (response.transportError != null) {
+                        PlaybackDataStore.recordFail(sessionId, "取詳情頁失敗：${response.transportError}")
+                        emptyList()
+                    } else if (response.statusCode !in 200..299) {
+                        PlaybackDataStore.recordFail(sessionId, "詳情頁HTTP ${response.statusCode}")
+                        emptyList()
+                    } else if (response.body.isBlank()) {
+                        PlaybackDataStore.recordFail(sessionId, "詳情頁為空")
+                        emptyList()
+                    } else {
+                        SevenMmTvResolver.resolve(response.body, site)
+                    }
+                }
+            } catch (e: Exception) {
+                PlaybackDataStore.recordFail(sessionId, "7mmtv解析異常：${e.message}")
+                emptyList()
+            }
+            val (kept, ads) = if (scored.isEmpty() || site == null) {
+                emptyList<SniffCandidateRecord>() to emptyList<SniffCandidateRecord>()
+            } else {
+                filterSniffCandidates(scored, site, sessionId)
+            }
+            runOnUiThread {
+                if (isDestroyed || isFinishing) return@runOnUiThread
+                when {
+                    kept.isNotEmpty() -> showSniffPicker(item, kept, sessionId, ads)
+                    ads.isNotEmpty() -> showSniffPicker(item, emptyList(), sessionId, ads)
+                    else -> {
+                        if (scored.isEmpty()) PlaybackDataStore.recordFail(sessionId, "7mmtv直取無正片m3u8")
+                        BrowserNavigator.open(this, item.detailUrl)
+                    }
+                }
             }
         }
     }
@@ -2544,9 +2609,11 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
     private fun playSniffed(item: SearchItem, videoUrl: String, sessionId: Long) {
         // HentaiMama and javhdporn direct files play in the native player:
         // the WebView player stalls on them (plays ~1s, then jumps back),
-        // while the same URL plays fine in a browser. Every other site
-        // keeps the existing internal player.
-        val target = if (item.siteId == SearchSiteIds.HENTAIMAMA || item.siteId == SearchSiteIds.JAVHD) {
+        // while the same URL plays fine in a browser. 7mmtv's direct HLS
+        // also goes to the native player (ExoPlayer handles the AES-128
+        // segments). Every other site keeps the existing internal player.
+        val target = if (item.siteId == SearchSiteIds.HENTAIMAMA || item.siteId == SearchSiteIds.JAVHD ||
+            item.siteId == SearchSiteIds.SEVEN_MM_TV) {
             NativePlayerActivity::class.java
         } else {
             FullscreenInternalPlayerActivity::class.java
@@ -2556,8 +2623,12 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // Send the embed page instead: it is the real player referer,
         // the one JWPlayer itself sends. Fall back to no referer (a
         // bare link also plays) when the embed URL wasn't recorded.
+        // 7mmtv: no Referer at all (verified: the player fetches the
+        // stream with an empty Referer).
         val referer = if (item.siteId == SearchSiteIds.JAVHD) {
             javhdEmbedRefererByUrl[videoUrl].orEmpty()
+        } else if (item.siteId == SearchSiteIds.SEVEN_MM_TV) {
+            ""
         } else {
             item.detailUrl
         }

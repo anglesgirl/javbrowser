@@ -19,9 +19,9 @@ class JavBrowserApplication : Application() {
         // （该 Activity 已随 WebView 回切删除。）
         if (!isMainProcess()) return
         AppTelemetry.initialize(this)
-        // Go 前置代理（本机 DoH/ECH HTTP 代理）：主进程启动时在后台线程起，
-        // WebView 经 ProxyController 指到它。代理起不来不影响启动。
-        EchProxyManager.ensureStarted(this)
+        // Go 前置代理已拆（1.2.21）：DoH 被污染打不通，播放改走 App 原生
+        // 直取，不再经 WebView + Go 代理。EchProxyManager 保留未删，
+        // 仅不再启动；设置里的“Go 代理狀態”诊断页会显示未启动。
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             override fun onActivityCreated(activity: Activity, state: Bundle?) {
                 if (state != null) return
