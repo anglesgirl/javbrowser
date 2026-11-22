@@ -249,6 +249,9 @@ object SearchProviderFactory {
             SearchParserKind.JAVRATE -> JavrateSearchProvider(context, site)
             SearchParserKind.HENTAIMAMA -> HentaimamaSearchProvider(context, site)
             SearchParserKind.ROU_VIDEO, SearchParserKind.ROU_SERIES -> RouSearchProvider(context, site)
+            // RULES 是规则中心拉 rules.json 用的合成站点，不在注册表里，
+            // 永远到不了这里；加分支只为满足 exhaustive when。
+            SearchParserKind.RULES -> throw IllegalStateException("RULES is not a search provider")
         }
     }
 }
