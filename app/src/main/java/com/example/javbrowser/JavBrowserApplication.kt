@@ -19,9 +19,8 @@ class JavBrowserApplication : Application() {
         // （该 Activity 已随 WebView 回切删除。）
         if (!isMainProcess()) return
         AppTelemetry.initialize(this)
-        // Go 前置代理已拆（1.2.21）：DoH 被污染打不通，播放改走 App 原生
-        // 直取，不再经 WebView + Go 代理。EchProxyManager 保留未删，
-        // 仅不再启动；设置里的“Go 代理狀態”诊断页会显示未启动。
+        // Go 前置代理已彻底拆除（1.2.22）：libgojni.so 未做 16 KB 对齐，
+        // 真机弹 Android 兼容性警告；播放已改走 App 原生直取，不再需要它。
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             override fun onActivityCreated(activity: Activity, state: Bundle?) {
                 if (state != null) return

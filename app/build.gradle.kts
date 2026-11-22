@@ -17,8 +17,8 @@ android {
         // minSdk 26（原 GeckoView 151 要求；Go 前置代理 .aar 同样要求 26，保留）。
         minSdk = 26
         targetSdk = 34
-        versionCode = 169
-        versionName = "1.2.21"
+        versionCode = 170
+        versionName = "1.2.22"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -100,10 +100,6 @@ dependencies {
     // WebKit extras: addDocumentStartJavaScript (inject before page JS)
     implementation("androidx.webkit:webkit:1.10.0")
 
-    // Go 前置代理（co3/ech/echproxy，gomobile 导出）：本机 DoH/ECH HTTP 代理。
-    // 预编译 .aar（arm64，minSdk 26），重编方法见 app/libs/README.md。
-    // WebView 经 ProxyController 指到它；代理起不来时不设 override（直接联网）。
-    implementation(files("libs/echproxy.aar"))
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
