@@ -57,8 +57,10 @@ jobs:
           EOF
 
       # The full legacy test suite currently has an unrelated failing local-video test.
-      - name: Test landing URL mapping and build debug APK
-        run: gradle testDebugUnitTest --tests com.example.javbrowser.LandingUrlMapperTest assembleDebug --no-daemon
+      # LandingUrlMapperTest 已随 WebView 回切删除（LandingUrlMapper 是 Gecko 专属），
+      # 改跑 JavhdMediaRoutingTest（媒体分流，7mmtv 嗅探分类相关）。
+      - name: Test media routing and build debug APK
+        run: gradle testDebugUnitTest --tests com.example.javbrowser.JavhdMediaRoutingTest assembleDebug --no-daemon
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4

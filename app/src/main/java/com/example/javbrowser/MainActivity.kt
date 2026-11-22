@@ -2949,11 +2949,13 @@ class MainActivity : LocalizedActivity() {
     }
 
     /**
-     * Go 前置代理接入口：后续集成代理时只填这个函数，由 EchProxyManager 实现。
+     * Go 前置代理接入口：EchProxyManager 在后台起本机代理（127.0.0.1:PORT），
+     * 这里把 WebView 经 ProxyController 指到它。代理还没起好时登记回调，
+     * 起好后自动设；代理失败或 WebView 不支持时静默跳过（直接联网）。
      * 在 setupWebView() 结尾调用一次。
      */
     private fun applyWebViewProxy() {
-        // TODO: Go 前置代理接在这里，由 EchProxyManager 实现
+        EchProxyManager.applyProxyOverride()
     }
     private fun isAd(url: String): Boolean {
         val adKeywords = listOf(
