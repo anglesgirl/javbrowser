@@ -1,0 +1,264 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 原生首页（1.2.17-gecko）：替代 landing.html + GeckoSession 加载。
+     首页不再经过 GeckoSession，也就不再白屏；GeckoView 只在进入外站时才显示。
+     内容与 app/src/main/assets/landing.html 对齐（站点入口、搜索入口、常用操作）。 -->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/native_home_scroll"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#121212"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="14dp"
+        android:paddingEnd="14dp"
+        android:paddingTop="20dp"
+        android:paddingBottom="48dp">
+
+        <!-- 标题行 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginStart="2dp"
+            android:layout_marginEnd="2dp"
+            android:layout_marginBottom="14dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="JAV Browser"
+                android:textColor="#FFFFFF"
+                android:textSize="24sp"
+                android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/native_home_help"
+                android:layout_width="32dp"
+                android:layout_height="32dp"
+                android:background="@drawable/circle_button_bg"
+                android:text="?"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp" />
+        </LinearLayout>
+
+        <!-- 剪贴板链接卡片（默认隐藏，有检测到的站内链接时显示） -->
+        <LinearLayout
+            android:id="@+id/native_home_clipboard_card"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#251B32"
+            android:padding="14dp"
+            android:layout_marginBottom="14dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/native_home_clipboard_title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/native_home_clipboard_ask"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:layout_marginTop="6dp"
+                android:layout_marginBottom="12dp" />
+
+            <TextView
+                android:id="@+id/native_home_clipboard_url"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#CCCCCC"
+                android:textSize="13sp"
+                android:layout_marginBottom="12dp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/native_home_clipboard_open"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="4dp"
+                    android:backgroundTint="#BB86FC"
+                    android:textColor="#24152B"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+
+                <Button
+                    android:id="@+id/native_home_clipboard_dismiss"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:layout_marginStart="4dp"
+                    android:backgroundTint="#3B3345"
+                    android:textColor="#FFFFFF"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- 搜索框 -->
+        <EditText
+            android:id="@+id/native_home_search_input"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:background="@drawable/search_box_bg"
+            android:paddingStart="14dp"
+            android:paddingEnd="14dp"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#888888"
+            android:textSize="16sp"
+            android:singleLine="true"
+            android:imeOptions="actionSearch"
+            android:inputType="text" />
+
+        <!-- 统一搜索按钮 -->
+        <Button
+            android:id="@+id/native_home_search_button"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="10dp"
+            android:backgroundTint="#BB86FC"
+            android:textColor="#24152B"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <!-- JAV 番号提示（默认隐藏，搜到番号时显示） -->
+        <Button
+            android:id="@+id/native_home_jav_hint"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:layout_marginTop="10dp"
+            android:backgroundTint="#BB86FC"
+            android:textColor="#000000"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+        <!-- 搜索结果（默认隐藏，有关键词时显示；标题可点开/收合） -->
+        <LinearLayout
+            android:id="@+id/native_home_search_results"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#1B1B1B"
+            android:padding="12dp"
+            android:layout_marginTop="12dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/native_home_search_results_header"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:gravity="center_vertical"
+                android:textColor="#DDDDDD"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/native_home_search_hint"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#A9A2B1"
+                android:textSize="12sp"
+                android:layout_marginTop="4dp"
+                android:layout_marginBottom="12dp" />
+
+            <GridLayout
+                android:id="@+id/native_home_search_grid"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:columnCount="2"
+                android:useDefaultMargins="false" />
+        </LinearLayout>
+
+        <!-- 快捷入口：今日新片 / 销量排行 -->
+        <GridLayout
+            android:id="@+id/native_home_quick_grid"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:columnCount="2"
+            android:layout_marginTop="14dp"
+            android:useDefaultMargins="false" />
+
+        <!-- 分隔 -->
+        <TextView
+            android:id="@+id/native_home_divider"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#AAAAAA"
+            android:textSize="13sp"
+            android:textStyle="bold"
+            android:layout_marginStart="2dp"
+            android:layout_marginTop="14dp"
+            android:layout_marginBottom="8dp" />
+
+        <!-- 站点入口 -->
+        <GridLayout
+            android:id="@+id/native_home_site_grid"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:columnCount="2"
+            android:useDefaultMargins="false" />
+
+        <!-- 播放记录 -->
+        <Button
+            android:id="@+id/native_home_history"
+            android:layout_width="match_parent"
+            android:layout_height="54dp"
+            android:layout_marginTop="14dp"
+            android:backgroundTint="#776014"
+            android:textColor="#FFF4C4"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <!-- 广告卡片 -->
+        <LinearLayout
+            android:id="@+id/native_home_ad_card"
+            android:layout_width="match_parent"
+            android:layout_height="58dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/ad_card_bg"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:layout_marginTop="14dp">
+
+            <TextView
+                android:id="@+id/native_home_ad_headline"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/native_home_ad_action"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#FFFFFF"
+                android:textSize="12sp"
+                android:alpha="0.9" />
+        </LinearLayout>
+
+    </LinearLayout>
+</ScrollView>

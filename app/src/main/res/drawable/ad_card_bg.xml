@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 原生首页广告卡片：紫蓝渐变圆角（对齐 landing.html .ad-card）。 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <gradient
+        android:angle="135"
+        android:startColor="#586BD8"
+        android:endColor="#7447A8"
+        android:type="linear" />
+    <corners android:radius="12dp" />
+</shape>

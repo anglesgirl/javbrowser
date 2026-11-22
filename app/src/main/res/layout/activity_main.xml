@@ -106,6 +106,20 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
 
+    <!-- 原生首页（1.2.17-gecko）：与 WebView 同位置，初始隐藏；GeckoView
+         在 setupGeckoSession() 里原位替换 WebView，首页显示时 GeckoView 隐藏。 -->
+    <include
+        android:id="@+id/native_home"
+        layout="@layout/view_native_home"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_marginTop="60dp"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
     <!-- 右下角操作：複製目前網址；跨站搜尋在其上方，互不遮擋。 -->
     <com.google.android.material.button.MaterialButton
         android:id="@+id/btn_copy_page_url"
