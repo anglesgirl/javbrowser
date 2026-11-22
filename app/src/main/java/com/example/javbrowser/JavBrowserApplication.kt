@@ -24,6 +24,9 @@ class JavBrowserApplication : Application() {
         // Cronet/H3 restored 1.2.25 (both deleted in the 2026-11-13
         // GeckoView migration); the Context is for the Cronet engine.
         EchH3Router.init(this)
+        // 规则中心（1.2.27）：启动时异步拉远程 rules.json（镜像先行，
+        // 失败走直连），拉不到用缓存、再没有用 assets 兜底。
+        RuleCenter.init(this)
         // Go 前置代理已彻底拆除（1.2.22）：libgojni.so 未做 16 KB 对齐，
         // 真机弹 Android 兼容性警告；播放已改走 App 原生直取，不再需要它。
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {

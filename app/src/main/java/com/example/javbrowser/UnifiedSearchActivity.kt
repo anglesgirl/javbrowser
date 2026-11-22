@@ -659,6 +659,23 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // pick, and the real playback outcome are recorded against it, so
         // the analysis can later say which path actually plays.
         val sessionId = PlaybackDataStore.startSession(item.siteId, item.detailUrl)
+        // 规则中心（1.2.27）：按详情页 host 查远程规则；有规则走规则
+        // 解析，无规则落回原有各站分支。7mmtv 的 native 规则走同一条
+        // resolveSevenMmTv，不另起分叉。
+        val detailHost = runCatching { java.net.URL(item.detailUrl).host }.getOrNull().orEmpty()
+        val siteRule = RuleCenter.ruleFor(detailHost)
+        if (siteRule != null) {
+            when (siteRule.type) {
+                "native" -> if (siteRule.resolver == "SevenMmTvResolver") {
+                    resolveSevenMmTv(item, sessionId)
+                    return
+                }
+                "regex-mp4", "regex-m3u8" -> {
+                    resolveByRule(item, sessionId, siteRule)
+                    return
+                }
+            }
+        }
         // javhdporn（2026-11-10 改走嵌頁直播）：嗅探取直鏈 + 原生播放器走不通
         // （播放器 onCreate 跑了、正片就是不出），改把 /api/play/ 拿到的嵌頁
         // 直接裝進全螢幕 WebView（JavhdEmbedPlayerActivity），用站方 JWPlayer 原頁播，廣告攔掉、VAST 自動
@@ -834,6 +851,62 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     ads.isNotEmpty() -> showSniffPicker(item, emptyList(), sessionId, ads)
                     else -> {
                         if (scored.isEmpty()) PlaybackDataStore.recordFail(sessionId, "7mmtv直取無正片m3u8")
+                        BrowserNavigator.open(this, item.detailUrl)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 规则中心解析（1.2.27）：详情页 HTML -> 规则 patterns 提地址。
+     * 与 resolveSevenMmTv 同一条路（取详情页、过滤、选择器、取不到
+     * 回浏览器），只差提地址这一步走规则。referer 按规则来（当前
+     * 规则全为空，不带 Referer）。Never throws.
+     */
+    private fun resolveByRule(item: SearchItem, sessionId: Long, rule: SiteRule) {
+        runOnUiThread {
+            android.widget.Toast.makeText(this,
+                LanguageManager.text(this, "正在解析真实地址…", "Resolving real video URL…"),
+                android.widget.Toast.LENGTH_SHORT).show()
+        }
+        SearchScheduler.workers.execute {
+            val site = sites.firstOrNull { it.id == item.siteId }
+            val scored: List<VideoPageSniffer.ScoredCandidate> = try {
+                if (site == null) {
+                    PlaybackDataStore.recordFail(sessionId, "站點未註冊")
+                    emptyList()
+                } else {
+                    val response = SearchHttpFetcher().fetch(item.detailUrl, SearchCancellation(), site)
+                    if (response.transportError != null) {
+                        PlaybackDataStore.recordFail(sessionId, "取詳情頁失敗：${response.transportError}")
+                        emptyList()
+                    } else if (response.statusCode !in 200..299) {
+                        PlaybackDataStore.recordFail(sessionId, "詳情頁HTTP ${response.statusCode}")
+                        emptyList()
+                    } else if (response.body.isBlank()) {
+                        PlaybackDataStore.recordFail(sessionId, "詳情頁為空")
+                        emptyList()
+                    } else {
+                        RuleResolver.resolveRegex(response.body, rule)
+                    }
+                }
+            } catch (e: Exception) {
+                PlaybackDataStore.recordFail(sessionId, "規則解析異常：${e.message}")
+                emptyList()
+            }
+            val (kept, ads) = if (scored.isEmpty() || site == null) {
+                emptyList<SniffCandidateRecord>() to emptyList<SniffCandidateRecord>()
+            } else {
+                filterSniffCandidates(scored, site, sessionId)
+            }
+            runOnUiThread {
+                if (isDestroyed || isFinishing) return@runOnUiThread
+                when {
+                    kept.isNotEmpty() -> showSniffPicker(item, kept, sessionId, ads)
+                    ads.isNotEmpty() -> showSniffPicker(item, emptyList(), sessionId, ads)
+                    else -> {
+                        if (scored.isEmpty()) PlaybackDataStore.recordFail(sessionId, "規則解析無候選")
                         BrowserNavigator.open(this, item.detailUrl)
                     }
                 }

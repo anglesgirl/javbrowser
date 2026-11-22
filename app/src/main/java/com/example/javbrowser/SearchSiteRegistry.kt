@@ -18,8 +18,8 @@ enum class SearchParserKind {
     JAVRATE,
     HENTAIMAMA,
     ROU_VIDEO,
-    ROU_SERIES
-}
+    ROU_SERIES,
+    RULES // 规则中心拉 rules.json 用的合成站点，不对应真实搜索站
 
 data class SearchSite(
     val id: String,
