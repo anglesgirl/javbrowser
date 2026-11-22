@@ -89,6 +89,11 @@ object EchH3Router {
      * Decides the transport for [host]. DoH runs first even for the
      * Cronet route: the decision itself needs the HTTPS record, and the
      * ECH client later reuses the cached config.
+     *
+     * One "DoH" transport-log line is written per decision (see
+     * [logDohDiagnosis]): which Gateway endpoint answered, whether an
+     * ech config was obtained, and the route taken — so one search
+     * shows whether DoH itself worked, without adb.
      */
     fun route(host: String): Route {
         if (!ConscryptEch.ensureProvider()) {
@@ -96,7 +101,7 @@ object EchH3Router {
             return Route.Cronet
         }
         val records = EchDoh.resolve(host)
-        return if (records.echConfigList != null) {
+        val route = if (records.echConfigList != null) {
             Log.d(TAG, "route $host -> ECH (${records.echConfigList.size}B config, ${records.addresses.size} addrs)")
             Route.Ech
         } else {
@@ -106,6 +111,40 @@ object EchH3Router {
             )
             Route.Cronet
         }
+        logDohDiagnosis(host, records, route)
+        return route
+    }
+
+    /**
+     * One DoH diagnosis line per route decision: the Gateway endpoint
+     * that answered (GW-<id>), whether an ech config was obtained,
+     * and the route taken. A total DoH failure carries the last
+     * endpoint error; a DoH success without ech is not an error
+     * (the route is Cronet, visible in the next log line).
+     */
+    private fun logDohDiagnosis(host: String, records: EchDoh.HostRecords, route: Route) {
+        val diag = EchDoh.diagnosisFor(host)
+        val echBytes = records.echConfigList?.size ?: 0
+        val shared = records.dohSource.contains("共享")
+        val decision = if (route == Route.Ech) "ECH" else "Cronet"
+        val detail = when {
+            diag == null -> "→$decision"
+            !diag.ok -> "5 端点全失败 →Cronet"
+            route == Route.Ech -> "ech=${echBytes}B${if (shared) "(共享)" else ""} →ECH"
+            else -> "无 ech →Cronet"
+        }
+        NetworkLogStore.add(
+            NetworkLogEntry(
+                timeMs = System.currentTimeMillis(),
+                host = host,
+                route = "DoH",
+                hasEchConfig = records.echConfigList != null,
+                negotiated = null,
+                error = if (diag?.ok == false) diag.error else null,
+                dohSource = diag?.source ?: records.dohSource,
+                detail = detail,
+            ),
+        )
     }
 
     /**

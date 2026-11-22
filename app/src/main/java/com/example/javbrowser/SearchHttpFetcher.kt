@@ -33,6 +33,16 @@ data class SearchHttpResponse(val statusCode: Int, val finalUrl: String, val bod
  * 恢復 Cronet/H3（ConscryptEch / EchDoh / EchH3Router）；DoH 走
  * 用戶自己的 Cloudflare Gateway（1.2.24 已驗證），不是阿里。
  *
+ * 1.2.26 對齊 Han1meViewer 通的那套 ECH（DoH 傳輸層照搬）：
+ * bootstrap IP 改 172.64.229/24（Han1meViewer 用 172.64.229.69、
+ * co3 用 172.64.229.1–8），DoH 客戶端只走 HTTP/1.1、不走代理、
+ * 3 秒超時；ech= 提取器照搬 Han1meViewer（引號/無引號、標準/
+ * URL-safe base64、wire 格式校驗）。之前 162.159.36.x 的釘死 IP
+ * 在沙箱能通、在用戶手機上拿不到配置，route() 每次都掉到
+ * Cronet/明文、兩條路都被 RST。另加 DoH 診斷日誌：每次搜尋
+ * route() 寫一條 DoH 傳輸事件（哪個 Gateway 端點、拿到 ech 沒、
+ * 走 ECH 還是 Cronet），一次操作就能看清 DoH 通沒通。
+ *
  * 保留：CookieManager 雙向同步、host allowlist、2MB 體 cap、
  * 超時、取消、retryAfter / cf-mitigated 標記。
  */

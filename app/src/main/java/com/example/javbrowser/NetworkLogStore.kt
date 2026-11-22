@@ -20,12 +20,14 @@ import java.util.Locale
 data class NetworkLogEntry(
     val timeMs: Long,
     val host: String,
-    val route: String, // "ECH" / "Cronet" / "OkHttp"
+    val route: String, // "ECH" / "Cronet" / "OkHttp" / "DoH"
     val hasEchConfig: Boolean,
     val negotiated: String?, // Cronet negotiated protocol ("h3"/"h2"/"http/1.1"), null otherwise
     val error: String?, // null = success
     /** DoH endpoint that provided the record ("Gateway"), "" when unknown. */
     val dohSource: String = "",
+    /** Extra diagnostic detail (DoH entries: endpoint outcome + route decision). */
+    val detail: String = "",
 )
 
 object NetworkLogStore {
@@ -69,7 +71,9 @@ object NetworkLogStore {
 
     fun formatEntry(e: NetworkLogEntry): String {
         val base = "${formatTime(e.timeMs)} ${e.host} ${e.route}" +
-            (e.negotiated?.let { " $it" } ?: "")
+            (if (e.route == "DoH" && e.dohSource.isNotBlank()) " ${e.dohSource}" else "") +
+            (e.negotiated?.let { " $it" } ?: "") +
+            (e.detail.takeIf { it.isNotBlank() }?.let { " $it" } ?: "")
         return if (e.error == null) "$base 成功" else "$base 失敗：${e.error}"
     }
 

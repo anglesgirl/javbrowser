@@ -4,10 +4,12 @@ import android.util.Base64
 import android.util.Log
 import okhttp3.Dns
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import org.json.JSONObject
 import java.io.IOException
 import java.net.InetAddress
+import java.net.Proxy
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -28,13 +30,26 @@ import java.util.concurrent.TimeUnit
  * handshake fails on the user's network). Five Gateway endpoints
  * are tried in order; the first that answers wins.
  *
- * Each endpoint is reached by pinned bootstrap IP + SNI (the
- * gateway hostname), never through the system resolver and never
- * with an IP in the URL: the Gateway certificate's SAN carries no
- * IP, so SNI must be the gateway domain — for routing and for
- * certificate validation. The DoH client below overrides DNS for
- * exactly the gateway hosts. Bootstrap IPs: 162.159.36.5 /
- * 162.159.36.20 / 176.24.239.99.
+ * Transport (aligned 1.2.26 with Han1meViewer's proven ECH stack
+ * and co3's proven DoH client — same principle, both work on the
+ * user's phone; javbrowser's 1.2.23–1.2.25 transport never
+ * produced an ECH config there):
+ *  - Bootstrap IPs are Cloudflare edge IPs from the 172.64.229/24
+ *    range (Han1meViewer: 172.64.229.69; co3: 172.64.229.1–8).
+ *    Any edge IP serves any *.cloudflare-gateway.com hostname via
+ *    SNI routing (verified in sandbox for all five endpoints).
+ *    The previous pins (162.159.36.5/162.159.36.20, Cloudflare's
+ *    public-DNS range, + 176.24.239.99) answered in the sandbox
+ *    but never produced a config on the phone — route() always
+ *    fell through to Cronet/plain and both RST.
+ *  - The DoH client pins every lookup to those bootstrap IPs
+ *    (Han1meViewer query() pattern), speaks HTTP/1.1 only and
+ *    never goes through a proxy (co3: H2 misbehaves on flaky
+ *    networks; a proxy silently stalls DoH), 3s connect/read,
+ *    8s call timeout, no retries.
+ *  - The ech= extractor is Han1meViewer's: quoted or unquoted,
+ *    standard or URL-safe base64, and the decoded bytes are
+ *    validated as an ECHConfigList before being trusted.
  *
  * Transport is the Gateway JSON API (GET /dns-query?name=...&type=...),
  * the same JSON shape Ali's /resolve returned (Status / Answer
@@ -66,40 +81,41 @@ object EchDoh {
     private const val SVC_PARAM_ECH = 5
     private const val MAX_CHAIN_HOPS = 2
 
-    private data class DohEndpoint(val name: String, val url: String, val pinnedIps: List<String>)
+    private data class DohEndpoint(val name: String, val url: String)
 
     // The user's own Cloudflare Gateway DoH, in try order (first
     // answer wins). Logs use only the short "GW-<id>" names, never
-    // the URL. Each host is pinned to bootstrap IPs (direct IP +
-    // SNI = gateway domain); the first three share the pool, the
-    // last two have their own known bootstrap IPs.
-    private val BOOTSTRAP_IPS = listOf("162.159.36.5", "162.159.36.20", "176.24.239.99")
-
-    private val ENDPOINTS = listOf(
-        DohEndpoint("GW-m2b4x7vw98", "https://m2b4x7vw98.cloudflare-gateway.com/dns-query", BOOTSTRAP_IPS),
-        DohEndpoint("GW-pieqllv9i7", "https://pieqllv9i7.cloudflare-gateway.com/dns-query", BOOTSTRAP_IPS),
-        DohEndpoint("GW-dz1598pphb", "https://dz1598pphb.cloudflare-gateway.com/dns-query", BOOTSTRAP_IPS),
-        DohEndpoint("GW-0kbpekmcr1", "https://0kbpekmcr1.cloudflare-gateway.com/dns-query", listOf("176.24.239.99")),
-        DohEndpoint("GW-82sew1c85i", "https://82sew1c85i.cloudflare-gateway.com/dns-query", listOf("162.159.36.20", "162.159.36.5")),
+    // the URL. All five share one bootstrap pool (see the class
+    // KDoc): any Cloudflare edge IP serves any gateway hostname.
+    private val BOOTSTRAP_IPS = listOf(
+        "172.64.229.69", "172.64.229.1", "172.64.229.2", "172.64.229.3",
+        "172.64.229.4", "172.64.229.5", "172.64.229.6", "172.64.229.7",
+        "172.64.229.8",
     )
 
-    private val pinnedByHost: Map<String, List<String>> = ENDPOINTS.associate { endpoint ->
-        val host = endpoint.url.substringAfter("https://").substringBefore("/")
-        host to endpoint.pinnedIps
-    }
+    private val ENDPOINTS = listOf(
+        DohEndpoint("GW-m2b4x7vw98", "https://m2b4x7vw98.cloudflare-gateway.com/dns-query"),
+        DohEndpoint("GW-pieqllv9i7", "https://pieqllv9i7.cloudflare-gateway.com/dns-query"),
+        DohEndpoint("GW-dz1598pphb", "https://dz1598pphb.cloudflare-gateway.com/dns-query"),
+        DohEndpoint("GW-0kbpekmcr1", "https://0kbpekmcr1.cloudflare-gateway.com/dns-query"),
+        DohEndpoint("GW-82sew1c85i", "https://82sew1c85i.cloudflare-gateway.com/dns-query"),
+    )
+
+    private val BOOTSTRAP_ADDRS: List<InetAddress> =
+        BOOTSTRAP_IPS.map { InetAddress.getByName(it) }
 
     private val dohClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.SECONDS)
-        .writeTimeout(5, TimeUnit.SECONDS)
+        .protocols(listOf(Protocol.HTTP_1_1)) // co3: H2 misbehaves on flaky networks
+        .proxy(Proxy.NO_PROXY) // DoH must never go through a proxy (2026-09-22 lesson)
+        .retryOnConnectionFailure(false)
+        .connectTimeout(3, TimeUnit.SECONDS)
+        .readTimeout(3, TimeUnit.SECONDS)
+        .callTimeout(8, TimeUnit.SECONDS)
         .dns(object : Dns {
-            override fun lookup(hostname: String): List<InetAddress> {
-                pinnedByHost[hostname.lowercase()]?.let { ips ->
-                    // IP literals parse without touching the system resolver.
-                    return ips.map { InetAddress.getByName(it) }
-                }
-                return Dns.SYSTEM.lookup(hostname)
-            }
+            // Han1meViewer query() pattern: the gateway hostname must
+            // never go through system DNS (poisoned); every lookup on
+            // this client answers with the bootstrap pins.
+            override fun lookup(hostname: String): List<InetAddress> = BOOTSTRAP_ADDRS
         })
         .build()
 
@@ -133,6 +149,21 @@ object EchDoh {
      * never triggers network, so transport logging can use it freely.
      */
     fun sourceFor(host: String): String = cache[host.lowercase()]?.records?.dohSource ?: ""
+
+    /** Outcome of the last DoH resolution for a host (fresh or cached). */
+    data class DohDiagnosis(
+        val endpoint: String, // "GW-..." that answered, "" when all failed
+        val ok: Boolean, // any endpoint answered
+        val error: String?, // last error when all endpoints failed
+        val hasEch: Boolean,
+        val echBytes: Int,
+        val source: String, // dohSource of the records ("GW-..." / "GW-...+共享" / "")
+    )
+
+    private val lastDiagnosis = ConcurrentHashMap<String, DohDiagnosis>()
+
+    /** Cache-only read: never triggers network. */
+    fun diagnosisFor(host: String): DohDiagnosis? = lastDiagnosis[host.lowercase()]
 
     fun invalidate(host: String) {
         cache.remove(host.lowercase())
@@ -207,11 +238,16 @@ object EchDoh {
     fun resolve(host: String): HostRecords {
         val key = host.lowercase()
         cache[key]?.let { if (System.currentTimeMillis() < it.expiresAtMs) return it.records }
+        var lastError: String? = null
         for (endpoint in ENDPOINTS) {
             try {
                 val (records, minTtl) = resolveFromEndpoint(endpoint, host)
                 if (!records.resolvedViaDoh) continue
                 if (records.echConfigList != null) {
+                    lastDiagnosis[key] = DohDiagnosis(
+                        endpoint.name, true, null, true,
+                        records.echConfigList.size, records.dohSource,
+                    )
                     cacheResolved(key, records, minTtl)
                     return records
                 }
@@ -230,6 +266,10 @@ object EchDoh {
                                     records.addresses, sharedEch, true,
                                     "${records.dohSource}+共享",
                                 )
+                                lastDiagnosis[key] = DohDiagnosis(
+                                    sharedEndpoint.name, true, null, true,
+                                    sharedEch.size, merged.dohSource,
+                                )
                                 cacheResolved(key, merged, minOf(minTtl, sharedTtl))
                                 Log.d(
                                     TAG,
@@ -244,12 +284,17 @@ object EchDoh {
                     }
                 }
                 // No endpoint had ech and no shared config applied: the first valid record stands.
+                lastDiagnosis[key] = DohDiagnosis(
+                    endpoint.name, true, null, false, 0, records.dohSource,
+                )
                 cacheResolved(key, records, minTtl)
                 return records
             } catch (e: Exception) {
+                lastError = "${e.javaClass.simpleName}: ${e.message}"
                 Log.w(TAG, "DoH via ${endpoint.name} failed for $host: ${e.message}")
             }
         }
+        lastDiagnosis[key] = DohDiagnosis("", false, lastError, false, 0, "")
         val empty = HostRecords(emptyList(), null, false, "")
         cache[key] = CacheEntry(empty, System.currentTimeMillis() + 30_000L)
         return empty
@@ -405,7 +450,10 @@ object EchDoh {
 
     /**
      * Extracts the ech SvcParam from one HTTPS record's JSON-API
-     * `data` string. Textual SVCB form (`1 . alpn="h2" ech="BASE64"
+     * `data` string. Ported from Han1meViewer's proven extractor:
+     * quoted or unquoted ech=, standard or URL-safe base64, and the
+     * decoded bytes are validated as an ECHConfigList before being
+     * trusted. Textual SVCB form (`1 . alpn="h2" ech="BASE64"
      * ...`) is the common case; a `\# <len> <hex>` RFC 3597
      * wire-form answer is handled as a fallback.
      */
@@ -414,14 +462,40 @@ object EchDoh {
         if (trimmed.startsWith("\\#")) {
             val hex = trimmed.removePrefix("\\#").trim().split(Regex("\\s+"))
             if (hex.size >= 2) {
-                return extractEchFromWireHex(hex.drop(1).joinToString(""))
+                val wire = extractEchFromWireHex(hex.drop(1).joinToString(""))
+                if (wire != null && isValidEchConfigList(wire)) return wire
             }
             return null
         }
-        val match = Regex("""ech="([^"]+)"""").find(trimmed) ?: return null
-        return runCatching {
-            Base64.decode(match.groupValues[1], Base64.DEFAULT)
-        }.getOrNull()
+        val b64 = extractEchParam(trimmed) ?: return null
+        val flags = if ('-' in b64 || '_' in b64) Base64.URL_SAFE else Base64.DEFAULT
+        val wire = runCatching { Base64.decode(b64, flags) }.getOrNull() ?: return null
+        return wire.takeIf { isValidEchConfigList(it) }
+    }
+
+    private fun extractEchParam(data: String): String? {
+        val match = Regex(
+            """(?:^|\s)ech=(?:"([A-Za-z0-9+/_=-]+)"|([A-Za-z0-9+/_=-]+))(?=\s|$)""",
+            RegexOption.IGNORE_CASE,
+        ).find(data) ?: return null
+        return (match.groupValues[1].ifEmpty { match.groupValues[2] }).takeIf { it.isNotEmpty() }
+    }
+
+    /** Validates an ECHConfigList: 2-byte list length + version/length-delimited entries. */
+    private fun isValidEchConfigList(wire: ByteArray): Boolean {
+        if (wire.size < 7) return false
+        val listLength = ((wire[0].toInt() and 0xff) shl 8) or (wire[1].toInt() and 0xff)
+        if (listLength != wire.size - 2) return false
+        var offset = 2
+        var configCount = 0
+        while (offset < wire.size) {
+            if (wire.size - offset < 4) return false
+            val configLength = ((wire[offset + 2].toInt() and 0xff) shl 8) or (wire[offset + 3].toInt() and 0xff)
+            if (configLength == 0 || configLength > wire.size - offset - 4) return false
+            offset += 4 + configLength
+            configCount++
+        }
+        return configCount > 0 && offset == wire.size
     }
 
     /**
