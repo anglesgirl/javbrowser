@@ -4,5 +4,12 @@
 # You can edit the include path and order by changing the proguardFiles
 # directive in build.gradle.
 
-# (GeckoView 遷移後：Conscrypt ECH keep 已刪——ConscryptEch、
-# EchDoh、EchH3Router 已刪除，ECH 走 Gecko 原生。)
+# ECH (Conscrypt) — MANDATORY, even though the release build does not
+# minify today. Conscrypt reaches
+# ConscryptEch$PolicyTrustManager.getNetworkSecurityPolicy() by
+# reflection; if R8 strips or renames it, setEchConfigList silently
+# becomes a no-op (no error, no ECH extension on the wire) and the app
+# would believe ECH works while it does not. Restored 1.2.23 with the
+# ECH stack (deleted in the 2026-11-13 GeckoView migration).
+-keep class org.conscrypt.** { *; }
+-keep class com.example.javbrowser.ConscryptEch** { *; }

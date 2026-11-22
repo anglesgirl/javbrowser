@@ -1,5 +1,6 @@
 package com.example.javbrowser
 
+import android.util.Log
 import android.webkit.CookieManager
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
@@ -18,13 +19,18 @@ data class SearchHttpResponse(val statusCode: Int, val finalUrl: String, val bod
                               val rendered: Boolean = false)
 
 /**
- * 搜索 HTML 抓取（纯 OkHttp 明文；GeckoView 回切后仍是如此）。
+ * 搜索 HTML 抓取：ECH 优先、明文兜底。
  *
- * 原先的 ECH（Conscrypt）/ Cronet H3 路徑已隨 EchH3Router、EchDoh、
- * ConscryptEch 一起刪除。瀏覽器載入（嵌頁播放器）走 WebView（无 ECH）；
- * 搜索抓取仍走 OkHttp，但已是明文 SNI——在用戶網絡上
- * 明文 SNI 可能被 RST。Go 前置代理已於 1.2.21 拆除（DoH 被污染打不通），
- * 播放改走 App 原生直取（見 SevenMmTvResolver）。
+ * 路由（見 EchH3Router）：每站先經 Ali DoH 查 HTTPS 記錄——有 ECH
+ * 配置（自家 ech=，或地址是 Cloudflare 邊緣 IP 時的共享 ech）就走
+ * OkHttp + Conscrypt ECH；沒有就走明文 OkHttp。ECH 交握失敗絕不靜
+ * 默降級明文（會暴露 SNI 招 DPI RST），而是 transportError
+ * "ECH_FAILED"，搜尋層按站降級、其餘站照常出結果。
+ *
+ * 1.2.23 從 2026-11-13 刪除前的版本恢復（ConscryptEch / EchDoh /
+ * EchH3Router），Cronet/H3 未恢復（延後）：非 ECH 站走明文 OkHttp，
+ * 與恢復前行為一致。DoH 只用阿里（直連 IP + SNI，不走系統 DNS）；
+ * 360 在用戶真機上 TLS 交握失敗打不通，已棄用。
  *
  * 保留：CookieManager 雙向同步、host allowlist、2MB 體 cap、
  * 超時、取消、retryAfter / cf-mitigated 標記。
@@ -33,15 +39,114 @@ class SearchHttpFetcher {
     fun fetch(url: String, cancellation: SearchCancellation, site: SearchSite): SearchHttpResponse {
         cancellation.check()
         val host = url.toHttpUrlOrNull()?.host
+        if (host != null) {
+            // route() already resolved this host via DoH, so this read is
+            // cache-warm and adds no network round trip.
+            val hasEchConfig = runCatching { EchDoh.resolve(host).echConfigList != null }.getOrDefault(false)
+            val route = runCatching { EchH3Router.route(host) }.getOrElse {
+                Log.d("EchH3", "route failed for $host, plain OkHttp: ${it.message}")
+                EchH3Router.Route.Plain
+            }
+            return when (route) {
+                EchH3Router.Route.Ech -> fetchEch(url, cancellation, site, host)
+                EchH3Router.Route.Plain -> fetchPlainLogged(url, cancellation, site, host, hasEchConfig)
+            }
+        }
+        return fetchPlain(url, cancellation, site)
+    }
+
+    /**
+     * ECH path: the ECH-capable client, fail-closed. A first-attempt
+     * failure (DoH/ECH config may not have been ready on the first
+     * request) → sleep 700ms, invalidate the cached config, retry once.
+     * A second failure becomes transportError "ECH_FAILED" — never a
+     * silent plaintext retry (that would leak the SNI ECH exists to
+     * hide). The search layer already handles transportError by
+     * degrading that provider while others still return results.
+     * SearchTransportException (allowlist / body cap) is not a
+     * transport failure: it propagates unchanged, never retried and
+     * never converted to ECH_FAILED.
+     */
+    private fun fetchEch(
+        url: String,
+        cancellation: SearchCancellation,
+        site: SearchSite,
+        host: String,
+    ): SearchHttpResponse {
+        val client = try {
+            EchH3Router.searchEchClient()
+                .newBuilder()
+                .addNetworkInterceptor(cookieInterceptor(site))
+                .build()
+        } catch (e: IOException) {
+            if (cancellation.isCancelled) throw e
+            Log.w("EchH3", "ECH client unavailable for $host (fail-closed, no plaintext fallback): ${e.message}")
+            NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, e.message, EchDoh.sourceFor(host)))
+            return SearchHttpResponse(
+                statusCode = 0,
+                finalUrl = url,
+                body = "",
+                contentType = null,
+                transportError = "ECH_FAILED",
+            )
+        }
+        try {
+            val response = executeOkHttp(client, url, cancellation, site)
+            NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, null, EchDoh.sourceFor(host)))
+            return response
+        } catch (e: SearchTransportException) {
+            throw e
+        } catch (e: IOException) {
+            if (cancellation.isCancelled) throw e
+            Log.d("EchH3", "ECH attempt failed for $host, retrying after 700ms: ${e.message}")
+            try {
+                Thread.sleep(700)
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IOException("Canceled", ie)
+            }
+            cancellation.check()
+            EchDoh.invalidate(host)
+            try {
+                val response = executeOkHttp(client, url, cancellation, site)
+                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, null, EchDoh.sourceFor(host)))
+                return response
+            } catch (ste: SearchTransportException) {
+                throw ste
+            } catch (e2: IOException) {
+                if (cancellation.isCancelled) throw e2
+                Log.w("EchH3", "ECH failed for $host (fail-closed, no plaintext fallback): ${e2.message}")
+                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "ECH", true, null, e2.message, EchDoh.sourceFor(host)))
+                return SearchHttpResponse(
+                    statusCode = 0,
+                    finalUrl = url,
+                    body = "",
+                    contentType = null,
+                    transportError = "ECH_FAILED",
+                )
+            }
+        }
+    }
+
+    /**
+     * Plain-OkHttp path with transport logging. The host==null edge
+     * at the end of [fetch] keeps using [fetchPlain] directly: an
+     * unparseable URL has no host worth logging.
+     */
+    private fun fetchPlainLogged(
+        url: String,
+        cancellation: SearchCancellation,
+        site: SearchSite,
+        host: String,
+        hasEchConfig: Boolean,
+    ): SearchHttpResponse {
         return try {
             val response = fetchPlain(url, cancellation, site)
-            if (host != null) {
-                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "OkHttp", false, null, null, ""))
-            }
+            NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "OkHttp", hasEchConfig, null, null, EchDoh.sourceFor(host)))
             response
         } catch (e: IOException) {
-            if (host != null && !cancellation.isCancelled) {
-                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "OkHttp", false, null, e.message, ""))
+            if (!cancellation.isCancelled) {
+                NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "OkHttp", hasEchConfig, null, e.message, EchDoh.sourceFor(host)))
             }
             throw e
         }
