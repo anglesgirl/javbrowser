@@ -19,18 +19,18 @@ data class SearchHttpResponse(val statusCode: Int, val finalUrl: String, val bod
                               val rendered: Boolean = false)
 
 /**
- * 搜索 HTML 抓取：ECH 优先、明文兜底。
+ * 搜索 HTML 抓取：ECH 优先、Cronet H3 其次、明文最后兜底。
  *
  * 路由（見 EchH3Router）：每站先經 Gateway DoH 查 HTTPS 記錄——有 ECH
  * 配置（自家 ech=，或地址是 Cloudflare 邊緣 IP 時的共享 ech）就走
- * OkHttp + Conscrypt ECH；沒有就走明文 OkHttp。ECH 交握失敗絕不靜
+ * OkHttp + Conscrypt ECH；沒有就走 Cronet 抓 HTTP/3（QUIC 走 UDP，
+ * 躲 TCP RST）；Cronet 失敗才回落明文 OkHttp。ECH 交握失敗絕不靜
  * 默降級明文（會暴露 SNI 招 DPI RST），而是 transportError
  * "ECH_FAILED"，搜尋層按站降級、其餘站照常出結果。
  *
- * 1.2.23 從 2026-11-13 刪除前的版本恢復（ConscryptEch / EchDoh /
- * EchH3Router），Cronet/H3 未恢復（延後）：非 ECH 站走明文 OkHttp，
- * 與恢復前行為一致。DoH 只用阿里（直連 IP + SNI，不走系統 DNS）；
- * 360 在用戶真機上 TLS 交握失敗打不通，已棄用。
+ * 1.2.25 從火狐內核之前（74085d6，2026-11-13 刪除前）的版本完整
+ * 恢復 Cronet/H3（ConscryptEch / EchDoh / EchH3Router）；DoH 走
+ * 用戶自己的 Cloudflare Gateway（1.2.24 已驗證），不是阿里。
  *
  * 保留：CookieManager 雙向同步、host allowlist、2MB 體 cap、
  * 超時、取消、retryAfter / cf-mitigated 標記。
@@ -43,14 +43,20 @@ class SearchHttpFetcher {
             // route() already resolved this host via DoH, so this read is
             // cache-warm and adds no network round trip.
             val hasEchConfig = runCatching { EchDoh.resolve(host).echConfigList != null }.getOrDefault(false)
-            val route = runCatching { EchH3Router.route(host) }.getOrElse {
-                Log.d("EchH3", "route failed for $host, plain OkHttp: ${it.message}")
-                EchH3Router.Route.Plain
+            when (EchH3Router.route(host)) {
+                EchH3Router.Route.Ech -> return fetchEch(url, cancellation, site, host)
+                EchH3Router.Route.Cronet -> {
+                    try {
+                        return EchH3Router.fetchViaCronet(url, site, cancellation, headerList(url, site))
+                    } catch (e: EchH3Router.CronetFetchFailed) {
+                        if (cancellation.isCancelled) throw IOException("Canceled")
+                        Log.d("EchH3", "Cronet failed for $host, falling back to plain OkHttp: ${e.message}")
+                    }
+                    // SearchTransportException (allowlist / body cap) and
+                    // IOException("Canceled") propagate: never fall back.
+                }
             }
-            return when (route) {
-                EchH3Router.Route.Ech -> fetchEch(url, cancellation, site, host)
-                EchH3Router.Route.Plain -> fetchPlainLogged(url, cancellation, site, host, hasEchConfig)
-            }
+            return fetchPlainLogged(url, cancellation, site, host, hasEchConfig)
         }
         return fetchPlain(url, cancellation, site)
     }
@@ -161,6 +167,18 @@ class SearchHttpFetcher {
             .addNetworkInterceptor(cookieInterceptor(site))
             .build()
         return executeOkHttp(client, url, cancellation, site)
+    }
+
+    private fun headerList(url: String, site: SearchSite): List<Pair<String, String>> {
+        val headers = mutableListOf(
+            "User-Agent" to USER_AGENT,
+            "Accept" to "text/html,application/xhtml+xml",
+            "Accept-Language" to "zh-TW,zh;q=0.9,en;q=0.8",
+        )
+        if (site.parserKind == SearchParserKind.JABLE && url.contains("function=get_block")) {
+            headers += "X-Requested-With" to "XMLHttpRequest"
+        }
+        return headers
     }
 
     /** The original fetch body, unchanged: request, call, 2MB cap, response mapping. */

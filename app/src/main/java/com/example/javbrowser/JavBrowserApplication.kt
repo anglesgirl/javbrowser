@@ -19,10 +19,11 @@ class JavBrowserApplication : Application() {
         // （该 Activity 已随 WebView 回切删除。）
         if (!isMainProcess()) return
         AppTelemetry.initialize(this)
-        // App-layer ECH: install Conscrypt (provider #1) so the EchH3
-        // factory can build ECH-capable clients for search. Restored
-        // 1.2.23 (deleted in the 2026-11-13 GeckoView migration).
-        EchH3Router.init()
+        // App-layer ECH: install Conscrypt (provider #1) and the
+        // Cronet engine for search. ECH stack restored 1.2.23,
+        // Cronet/H3 restored 1.2.25 (both deleted in the 2026-11-13
+        // GeckoView migration); the Context is for the Cronet engine.
+        EchH3Router.init(this)
         // Go 前置代理已彻底拆除（1.2.22）：libgojni.so 未做 16 KB 对齐，
         // 真机弹 Android 兼容性警告；播放已改走 App 原生直取，不再需要它。
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {

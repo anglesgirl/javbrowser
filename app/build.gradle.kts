@@ -17,8 +17,8 @@ android {
         // minSdk 26（原 GeckoView 151 要求；Go 前置代理 .aar 同样要求 26，保留）。
         minSdk = 26
         targetSdk = 34
-        versionCode = 172
-        versionName = "1.2.24"
+        versionCode = 173
+        versionName = "1.2.25"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -114,12 +114,13 @@ dependencies {
     // WebView embed player and is unaffected).
     implementation("androidx.media3:media3-datasource-okhttp:1.4.1")
 
-    // App-layer ECH (Conscrypt) for search/page fetch, restored 1.2.23
-    // from the pre-2026-11-13 code (ConscryptEch / EchDoh /
-    // EchH3Router). Cronet/H3 NOT restored (deferred); the ECH client
-    // is OkHttp + Conscrypt only. OkHttp, AGP, Kotlin and the SDK
-    // levels are deliberately NOT upgraded.
+    // App-layer ECH (Conscrypt) + HTTP/3 (Cronet) for search/page fetch,
+    // restored 1.2.25 from the pre-2026-11-13 code (74085d6, before the
+    // GeckoView migration deleted the ECH stack). DoH is the user's own
+    // Cloudflare Gateway (1.2.24), not Ali. OkHttp, AGP, Kotlin and the
+    // SDK levels are deliberately NOT upgraded.
     implementation("org.conscrypt:conscrypt-android:2.7.0")
+    implementation("org.chromium.net:cronet-embedded:143.7445.0")
 
     implementation("org.mp4parser:muxer:1.9.56")
     implementation("androidx.work:work-runtime-ktx:2.9.0")

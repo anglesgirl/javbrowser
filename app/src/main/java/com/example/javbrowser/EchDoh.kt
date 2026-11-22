@@ -283,7 +283,7 @@ object EchDoh {
             dohOk = true
             minTtl = minOf(minTtl, ans.minTtl)
             if (ans.echConfigList != null) return Triple(ans.echConfigList, minTtl, dohOk)
-            val next = ans.cnameTarget ?: break
+            val next = ans.aliasTarget ?: ans.cnameTarget ?: break
             if (next.equals(name, ignoreCase = true)) break
             name = next
         }
@@ -328,6 +328,7 @@ object EchDoh {
         val addresses: List<InetAddress> = emptyList(),
         val echConfigList: ByteArray? = null,
         val cnameTarget: String? = null,
+        val aliasTarget: String? = null,
         val minTtl: Long = 300,
     )
 
@@ -357,6 +358,7 @@ object EchDoh {
         val addresses = mutableListOf<InetAddress>()
         var ech: ByteArray? = null
         var cname: String? = null
+        var aliasTarget: String? = null
         var minTtl = Long.MAX_VALUE
         for (i in 0 until answers.length()) {
             val a = answers.optJSONObject(i) ?: continue
@@ -373,6 +375,7 @@ object EchDoh {
                 }
                 TYPE_HTTPS -> {
                     if (ech == null) ech = extractEchFromHttpsData(data)
+                    if (aliasTarget == null) aliasTarget = extractAliasTarget(data)
                 }
             }
         }
@@ -380,8 +383,24 @@ object EchDoh {
             addresses = addresses,
             echConfigList = ech,
             cnameTarget = cname,
+            aliasTarget = aliasTarget,
             minTtl = if (minTtl == Long.MAX_VALUE) 300 else minTtl,
         )
+    }
+
+    /**
+     * AliasMode target of one HTTPS record's JSON-API `data` string
+     * (`0 <target>.`): the next name in the chain, mirroring the
+     * pre-2026-11-13 wire parser's AliasMode handling. Null for
+     * ServiceMode records (priority > 0) and for wire-form answers.
+     */
+    private fun extractAliasTarget(data: String): String? {
+        val trimmed = data.trim()
+        if (trimmed.startsWith("\\#")) return null
+        val parts = trimmed.split(Regex("\\s+"), limit = 3)
+        if (parts.size < 2) return null
+        if (parts[0].toIntOrNull() != 0) return null
+        return parts[1].trimEnd('.').ifEmpty { null }
     }
 
     /**

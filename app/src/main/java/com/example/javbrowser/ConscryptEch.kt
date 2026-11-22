@@ -52,12 +52,9 @@ object ConscryptEch {
     /**
      * Installs Conscrypt as provider #1 if it is not already present.
      * Idempotent; returns true when the Conscrypt provider is available
-     * afterwards. Callers that cannot run ECH (provider missing) must
-     * not silently use a plaintext OkHttp path for an ECH-configured
-     * host: the router routes such a host to plain only when no ECH
-     * config exists, and the ECH fetch fails closed (ECH_FAILED) when
-     * the ECH client cannot be built. (The Cronet fallback this comment
-     * used to name was dropped with the 1.2.23 restore.)
+     * afterwards. Callers that cannot run ECH (provider missing) must fall
+     * back to the Cronet path, never to a plaintext OkHttp path for an
+     * ECH-configured host.
      */
     fun ensureProvider(): Boolean {
         providerInstalled?.let { return it }
