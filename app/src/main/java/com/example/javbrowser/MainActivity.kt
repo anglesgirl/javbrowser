@@ -6837,7 +6837,7 @@ class MainActivity : LocalizedActivity() {
 
     private fun updateCopyPageUrlVisibility() {
         if (!::btnCopyPageUrl.isInitialized || !::webView.isInitialized) return
-        btnCopyPageUrl.visibility = if (!customView != null && !isStripchatOverlayActive &&
+        btnCopyPageUrl.visibility = if (customView == null && !isStripchatOverlayActive &&
             PageUrlClipboard.copyableUrl(currentWebUrl) != null) View.VISIBLE else View.GONE
     }
 
