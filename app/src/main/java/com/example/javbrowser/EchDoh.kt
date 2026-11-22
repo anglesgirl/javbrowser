@@ -69,6 +69,17 @@ import java.util.concurrent.TimeUnit
  * the shared Cloudflare ECH config is fetched live from
  * cloudflare-ech.com's HTTPS record. A rejected handshake still
  * fails closed; this never falls back to plaintext.
+ *
+ * The ech is only trusted when it is backed by a Cloudflare edge:
+ * either the HTTPS record's ipv4hint/ipv6hint or the A/AAAA
+ * addresses must be Cloudflare edge IPs. When the hints are
+ * Cloudflare, the dial addresses are the hints, not the A/AAAA
+ * addresses — the browser's behavior (avjoy.me: A record
+ * 8.39.125.92 is a non-CF origin, its ipv4hint 104.18.10.118 is
+ * the CF edge; dialing the A record with ECH gets ECH_REJECTED,
+ * dialing the hint works). A CNAME'd HTTPS record can carry
+ * someone else's ech; without a Cloudflare edge behind it the
+ * ech is ignored.
  */
 object EchDoh {
 
@@ -125,6 +136,12 @@ object EchDoh {
         val resolvedViaDoh: Boolean,
         /** DoH endpoint that provided this record: "GW-..." / "GW-...+共享" / "" (not via DoH). */
         val dohSource: String = "",
+        /**
+         * ipv4hint/ipv6hint from the HTTPS record that provided
+         * [echConfigList] (IPv4 first). Empty when no ech: hints are
+         * only meaningful together with the ech they belong to.
+         */
+        val echHints: List<InetAddress> = emptyList(),
     )
 
     private class CacheEntry(val records: HostRecords, val expiresAtMs: Long)
@@ -217,12 +234,18 @@ object EchDoh {
     /**
      * Resolves [host] through the Gateway endpoints in order. The
      * first endpoint that answers wins: a valid answer is adopted
-     * immediately when it carries an ech config (the common case:
-     * no second query). When a valid answer has NO ech, resolution
-     * proceeds directly to the shared-config last resort below
-     * (there is no point asking another endpoint of the same
-     * Gateway — it would answer identically); a transport failure
-     * moves on to the next endpoint.
+     * when it carries an ech config AND the ech is backed by a
+     * Cloudflare edge — either the HTTPS record's ipv4hint/ipv6hint
+     * or the A/AAAA addresses must be Cloudflare edge IPs. When the
+     * hints are Cloudflare, the dial addresses are the hints, not
+     * the A/AAAA addresses (the browser's behavior: avjoy.me's A
+     * record 8.39.125.92 is a non-CF origin while its ipv4hint
+     * 104.18.10.118 is the CF edge — dialing the A record with ECH
+     * gets ECH_REJECTED, dialing the hint works). When an HTTPS
+     * record carries an ech but neither the hints nor the A/AAAA
+     * addresses are Cloudflare, the ech belongs to someone else's
+     * edge (reached via CNAME) and is ignored; the host goes
+     * Cronet/plain instead of failing ECH.
      *
      * Last resort, after the Gateway's HTTPS record lacks ech: if the site's
      * dial addresses are Cloudflare edge IPs, fetch the shared
@@ -244,12 +267,55 @@ object EchDoh {
                 val (records, minTtl) = resolveFromEndpoint(endpoint, host)
                 if (!records.resolvedViaDoh) continue
                 if (records.echConfigList != null) {
-                    lastDiagnosis[key] = DohDiagnosis(
-                        endpoint.name, true, null, true,
-                        records.echConfigList.size, records.dohSource,
+                    val ech = records.echConfigList
+                    val hintIsCf = records.echHints.any { isCloudflareIp(it) }
+                    val addrIsCf = records.addresses.any { isCloudflareIp(it) }
+                    if (hintIsCf || addrIsCf) {
+                        // Dial the edge the ech is valid for: the
+                        // HTTPS hints when they are Cloudflare,
+                        // otherwise the A/AAAA addresses. (avjoy.me:
+                        // A record 8.39.125.92 is a non-CF origin,
+                        // its ipv4hint 104.18.10.118 is the CF edge;
+                        // dialing the A record with ECH gets
+                        // ECH_REJECTED, dialing the hint works.)
+                        val dialAddrs = if (hintIsCf) {
+                            records.echHints.distinct().sortedBy { it.address.size }
+                        } else {
+                            records.addresses
+                        }
+                        val adopted = HostRecords(
+                            dialAddrs, ech, true, records.dohSource, records.echHints,
+                        )
+                        lastDiagnosis[key] = DohDiagnosis(
+                            endpoint.name, true, null, true,
+                            ech.size, adopted.dohSource,
+                        )
+                        cacheResolved(key, adopted, minTtl)
+                        if (hintIsCf) {
+                            Log.d(
+                                TAG,
+                                "resolved $host: dialing HTTPS hints (${dialAddrs.size} addrs) instead of A/AAAA",
+                            )
+                        }
+                        return adopted
+                    }
+                    // HTTPS carried an ech but neither the hints nor
+                    // the A/AAAA addresses are Cloudflare: the ech
+                    // belongs to someone else's edge (reached via
+                    // CNAME) and cannot be used for this host.
+                    Log.d(
+                        TAG,
+                        "resolved $host: HTTPS ech ignored, neither hints nor A/AAAA are Cloudflare " +
+                            "(addrs=${records.addresses}, hints=${records.echHints})",
                     )
-                    cacheResolved(key, records, minTtl)
-                    return records
+                    val noEch = HostRecords(
+                        records.addresses, null, true, records.dohSource, records.echHints,
+                    )
+                    lastDiagnosis[key] = DohDiagnosis(
+                        endpoint.name, true, null, false, 0, records.dohSource,
+                    )
+                    cacheResolved(key, noEch, minTtl)
+                    return noEch
                 }
                 // Last resort: shared Cloudflare ECH config. Only when
                 // the site's own ech is missing from every endpoint AND
@@ -260,7 +326,8 @@ object EchDoh {
                 if (records.addresses.any { isCloudflareIp(it) }) {
                     for (sharedEndpoint in ENDPOINTS) {
                         try {
-                            val (sharedEch, sharedTtl, _) = echFromEndpoint(sharedEndpoint, SHARED_ECH_HOST)
+                            val shared = echFromEndpoint(sharedEndpoint, SHARED_ECH_HOST)
+                            val sharedEch = shared.ech
                             if (sharedEch != null) {
                                 val merged = HostRecords(
                                     records.addresses, sharedEch, true,
@@ -270,7 +337,7 @@ object EchDoh {
                                     sharedEndpoint.name, true, null, true,
                                     sharedEch.size, merged.dohSource,
                                 )
-                                cacheResolved(key, merged, minOf(minTtl, sharedTtl))
+                                cacheResolved(key, merged, minOf(minTtl, shared.minTtl))
                                 Log.d(
                                     TAG,
                                     "resolved $host: no own ech, using shared Cloudflare ech " +
@@ -314,12 +381,27 @@ object EchDoh {
     }
 
     /**
-     * HTTPS-chain-only lookup: the ech SvcParam for [host] from one
-     * endpoint, following CNAME chains. Returns the ech bytes (or
-     * null), the smallest TTL seen, and whether any HTTPS query
-     * answered. Throws on transport/parse failure like [queryJson].
+     * Result of one HTTPS-record chain lookup: the ech bytes (if the
+     * terminal record carries one) plus the ipv4hint/ipv6hint from
+     * the same record. Hints are only returned together with an ech;
+     * without an ech they are meaningless for ECH.
      */
-    private fun echFromEndpoint(endpoint: DohEndpoint, host: String): Triple<ByteArray?, Long, Boolean> {
+    private class HttpsResult(
+        val ech: ByteArray?,
+        val ipv4Hint: List<InetAddress>,
+        val ipv6Hint: List<InetAddress>,
+        val minTtl: Long,
+        val dohOk: Boolean,
+    )
+
+    /**
+     * HTTPS-chain-only lookup: the ech SvcParam for [host] from one
+     * endpoint, following CNAME chains, plus the ipv4hint/ipv6hint
+     * from the same terminal record. Returns the ech bytes (or
+     * null), the hints, the smallest TTL seen, and whether any HTTPS
+     * query answered. Throws on transport/parse failure like [queryJson].
+     */
+    private fun echFromEndpoint(endpoint: DohEndpoint, host: String): HttpsResult {
         var name = host
         var minTtl = 300L
         var dohOk = false
@@ -327,12 +409,14 @@ object EchDoh {
             val ans = queryJson(endpoint, name, TYPE_HTTPS) ?: break
             dohOk = true
             minTtl = minOf(minTtl, ans.minTtl)
-            if (ans.echConfigList != null) return Triple(ans.echConfigList, minTtl, dohOk)
+            if (ans.echConfigList != null) {
+                return HttpsResult(ans.echConfigList, ans.ipv4Hint, ans.ipv6Hint, minTtl, dohOk)
+            }
             val next = ans.aliasTarget ?: ans.cnameTarget ?: break
             if (next.equals(name, ignoreCase = true)) break
             name = next
         }
-        return Triple(null, minTtl, dohOk)
+        return HttpsResult(null, emptyList(), emptyList(), minTtl, dohOk)
     }
 
     private fun resolveFromEndpoint(endpoint: DohEndpoint, host: String): Pair<HostRecords, Long> {
@@ -340,9 +424,10 @@ object EchDoh {
         var dohOk = false
         // HTTPS chain via the shared helper: ServiceMode records carry
         // the ech param directly; a plain CNAME points at the next name.
-        val (ech, httpsTtl, httpsOk) = echFromEndpoint(endpoint, host)
-        minTtl = minOf(minTtl, httpsTtl)
-        dohOk = dohOk || httpsOk
+        val https = echFromEndpoint(endpoint, host)
+        val ech = https.ech
+        minTtl = minOf(minTtl, https.minTtl)
+        dohOk = dohOk || https.dohOk
         // Address chains (A and AAAA are independent CNAME chains).
         val collected = mutableListOf<InetAddress>()
         for (qtype in intArrayOf(TYPE_A, TYPE_AAAA)) {
@@ -365,6 +450,7 @@ object EchDoh {
             echConfigList = ech,
             resolvedViaDoh = dohOk,
             dohSource = endpoint.name,
+            echHints = (https.ipv4Hint + https.ipv6Hint).distinct(),
         )
         return records to minTtl
     }
@@ -375,6 +461,8 @@ object EchDoh {
         val cnameTarget: String? = null,
         val aliasTarget: String? = null,
         val minTtl: Long = 300,
+        val ipv4Hint: List<InetAddress> = emptyList(),
+        val ipv6Hint: List<InetAddress> = emptyList(),
     )
 
     /**
@@ -404,6 +492,8 @@ object EchDoh {
         var ech: ByteArray? = null
         var cname: String? = null
         var aliasTarget: String? = null
+        val ipv4Hint = mutableListOf<InetAddress>()
+        val ipv6Hint = mutableListOf<InetAddress>()
         var minTtl = Long.MAX_VALUE
         for (i in 0 until answers.length()) {
             val a = answers.optJSONObject(i) ?: continue
@@ -420,6 +510,9 @@ object EchDoh {
                 }
                 TYPE_HTTPS -> {
                     if (ech == null) ech = extractEchFromHttpsData(data)
+                    val (v4, v6) = extractHintsFromHttpsData(data)
+                    ipv4Hint += v4
+                    ipv6Hint += v6
                     if (aliasTarget == null) aliasTarget = extractAliasTarget(data)
                 }
             }
@@ -430,6 +523,8 @@ object EchDoh {
             cnameTarget = cname,
             aliasTarget = aliasTarget,
             minTtl = if (minTtl == Long.MAX_VALUE) 300 else minTtl,
+            ipv4Hint = ipv4Hint,
+            ipv6Hint = ipv6Hint,
         )
     }
 
@@ -479,6 +574,86 @@ object EchDoh {
             RegexOption.IGNORE_CASE,
         ).find(data) ?: return null
         return (match.groupValues[1].ifEmpty { match.groupValues[2] }).takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * Extracts the ipv4hint / ipv6hint SvcParams from one HTTPS
+     * record's JSON-API `data` string. Textual SVCB form is the
+     * common case (`ipv4hint=104.18.10.118,104.18.11.118 ...`);
+     * a `\# <len> <hex>` wire-form answer is handled as a fallback
+     * (keys 4 and 6). Returns empty lists when the record carries
+     * no hints. Unparseable entries are dropped, never fatal.
+     */
+    internal fun extractHintsFromHttpsData(data: String): Pair<List<InetAddress>, List<InetAddress>> {
+        val trimmed = data.trim()
+        if (trimmed.startsWith("\\#")) {
+            val hex = trimmed.removePrefix("\\#").trim().split(Regex("\\s+"))
+            if (hex.size >= 2) return extractHintsFromWireHex(hex.drop(1).joinToString(""))
+            return emptyList<InetAddress>() to emptyList()
+        }
+        val v4 = Regex("""(?:^|\s)ipv4hint="?([0-9.,]+)"?""", RegexOption.IGNORE_CASE)
+            .findAll(trimmed)
+            .flatMap { it.groupValues[1].split(",") }
+            .mapNotNull { runCatching { InetAddress.getByName(it.trim()) }.getOrNull() }
+            .toList()
+        val v6 = Regex("""(?:^|\s)ipv6hint="?([0-9a-fA-F:,]+)"?""", RegexOption.IGNORE_CASE)
+            .findAll(trimmed)
+            .flatMap { it.groupValues[1].split(",") }
+            .mapNotNull { runCatching { InetAddress.getByName(it.trim()) }.getOrNull() }
+            .toList()
+        return v4 to v6
+    }
+
+    /**
+     * Extracts ipv4hint (key 4, 4 bytes per address) and ipv6hint
+     * (key 6, 16 bytes per address) from an HTTPS RDATA hex string.
+     * Same SvcParam walk as [extractEchFromWireHex].
+     */
+    private fun extractHintsFromWireHex(hex: String): Pair<List<InetAddress>, List<InetAddress>> {
+        val bytes = runCatching {
+            hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        }.getOrNull() ?: return emptyList<InetAddress>() to emptyList()
+        if (bytes.size < 3) return emptyList<InetAddress>() to emptyList()
+        var pos = 2 // skip priority
+        // Skip the target name (plain labels, no compression in RDATA).
+        while (pos < bytes.size) {
+            val len = bytes[pos].toInt() and 0xFF
+            if (len == 0) {
+                pos += 1
+                break
+            }
+            pos += 1 + len
+            if (pos > bytes.size) return emptyList<InetAddress>() to emptyList()
+        }
+        val v4 = mutableListOf<InetAddress>()
+        val v6 = mutableListOf<InetAddress>()
+        while (pos + 4 <= bytes.size) {
+            val key = ((bytes[pos].toInt() and 0xFF) shl 8) or (bytes[pos + 1].toInt() and 0xFF)
+            val len = ((bytes[pos + 2].toInt() and 0xFF) shl 8) or (bytes[pos + 3].toInt() and 0xFF)
+            pos += 4
+            if (pos + len > bytes.size) break
+            val value = bytes.copyOfRange(pos, pos + len)
+            when (key) {
+                4 -> {
+                    var i = 0
+                    while (i + 4 <= value.size) {
+                        runCatching { InetAddress.getByAddress(value.copyOfRange(i, i + 4)) }
+                            .getOrNull()?.let { v4 += it }
+                        i += 4
+                    }
+                }
+                6 -> {
+                    var i = 0
+                    while (i + 16 <= value.size) {
+                        runCatching { InetAddress.getByAddress(value.copyOfRange(i, i + 16)) }
+                            .getOrNull()?.let { v6 += it }
+                        i += 16
+                    }
+                }
+            }
+            pos += len
+        }
+        return v4 to v6
     }
 
     /** Validates an ECHConfigList: 2-byte list length + version/length-delimited entries. */

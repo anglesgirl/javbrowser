@@ -26,10 +26,14 @@ import java.util.concurrent.TimeUnit
  *
  * Routing (ECH first, security over speed): for every host, [EchDoh]
  * resolves the HTTPS record first. A host that publishes an ECH config
- * goes through OkHttp + Conscrypt ECH; a host that does not goes through
- * Cronet to grab HTTP/3. The Cronet path is allowed to fall back to
- * plain OkHttp on failure; the ECH path is not — a failed ECH handshake
- * must never silently degrade to plaintext SNI (see SearchHttpFetcher).
+ * backed by a Cloudflare edge — its HTTPS ipv4hint/ipv6hint or its
+ * A/AAAA addresses — goes through OkHttp + Conscrypt ECH, dialing the
+ * hints when they are the Cloudflare evidence (the browser's behavior:
+ * avjoy.me's A record is a non-CF origin, its ipv4hint is the CF
+ * edge); a host that does not goes through Cronet to grab HTTP/3. The
+ * Cronet path is allowed to fall back to plain OkHttp on failure; the
+ * ECH path is not — a failed ECH handshake must never silently degrade
+ * to plaintext SNI (see SearchHttpFetcher).
  *
  * Cronet preserves the exact semantics SearchHttpFetcher's OkHttp path
  * has: host allowlist (including on cross-host redirects), CookieManager
