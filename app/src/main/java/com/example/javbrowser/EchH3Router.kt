@@ -16,7 +16,7 @@ import java.util.concurrent.TimeUnit
  * + Conscrypt ECH and fail closed.
  *
  * Routing (ECH first, security over speed): for every host, [EchDoh]
- * resolves the HTTPS record first (Ali DoH). A host that publishes
+ * resolves the HTTPS record first (Gateway DoH). A host that publishes
  * an ECH config — its own, or the shared Cloudflare config when its
  * dial addresses are Cloudflare edge IPs — goes through OkHttp +
  * Conscrypt ECH; a host that does not goes through plain OkHttp.

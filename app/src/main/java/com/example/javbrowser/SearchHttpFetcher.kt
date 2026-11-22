@@ -21,7 +21,7 @@ data class SearchHttpResponse(val statusCode: Int, val finalUrl: String, val bod
 /**
  * 搜索 HTML 抓取：ECH 优先、明文兜底。
  *
- * 路由（見 EchH3Router）：每站先經 Ali DoH 查 HTTPS 記錄——有 ECH
+ * 路由（見 EchH3Router）：每站先經 Gateway DoH 查 HTTPS 記錄——有 ECH
  * 配置（自家 ech=，或地址是 Cloudflare 邊緣 IP 時的共享 ech）就走
  * OkHttp + Conscrypt ECH；沒有就走明文 OkHttp。ECH 交握失敗絕不靜
  * 默降級明文（會暴露 SNI 招 DPI RST），而是 transportError

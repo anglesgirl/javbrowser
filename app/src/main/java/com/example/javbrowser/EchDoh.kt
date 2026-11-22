@@ -13,33 +13,37 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
- * DNS-over-HTTPS (Ali JSON API) resolver for the two record families
- * the app-layer ECH path needs:
+ * DNS-over-HTTPS (user's own Cloudflare Gateway JSON API) resolver
+ * for the two record families the app-layer ECH path needs:
  *
  *  - HTTPS (type 65): its `ech` SvcParam carries the ECHConfigList that
  *    [org.conscrypt.Conscrypt.setEchConfigList] consumes verbatim.
  *  - A / AAAA: the addresses to dial, so an ECH handshake never depends on
  *    the system resolver for the target host.
  *
- * Endpoint is Ali dns.alidns.com ONLY (2026-11-22 user decision).
- * 360 was dropped: its TLS handshake fails on the user's network
- * (1.2.20: "DoH resolve for 7mmtv.sx failed ... tls: handshake
- * failure"). The private Cloudflare Gateway endpoint the deleted
- * 2026-11-13 code used is NOT restored here. Ali is reached by
- * pinned IP + SNI (the DoH hostname), never through the system
- * resolver: the DoH client below overrides DNS for exactly that
- * host. Pinned IPs are Ali's public DNS IPs (dns.alidns.com A
- * answers: 223.5.5.5 / 223.6.6.6).
+ * Endpoints are the user's own Cloudflare Gateway DoH hostnames
+ * (2026-11-22 user decision — the same Gateway DoH hyper-browser
+ * and co3 use). Ali was dropped in 1.2.24: it is not the user's
+ * own resolver. 360 was already dropped in 1.2.23 (its TLS
+ * handshake fails on the user's network). Five Gateway endpoints
+ * are tried in order; the first that answers wins.
  *
- * Transport is Ali's JSON API (GET /resolve?name=...&type=...),
- * NOT RFC 8484 wire format: Ali's /dns-query wire endpoint does
- * not answer from this sandbox (HTTP 000 / timeout), while the JSON
- * API answers instantly. The JSON API returns HTTPS records in
- * textual SVCB form (`1 . alpn="h2" ... ech="BASE64" ...`); a
- * `\# <len> <hex>` wire-form answer is also handled as a fallback.
- * Results are cached per host with the records' TTL, clamped to
- * [30s, 10min]; failures and empty answers are cached briefly so a
- * dead DoH endpoint cannot stall every request.
+ * Each endpoint is reached by pinned bootstrap IP + SNI (the
+ * gateway hostname), never through the system resolver and never
+ * with an IP in the URL: the Gateway certificate's SAN carries no
+ * IP, so SNI must be the gateway domain — for routing and for
+ * certificate validation. The DoH client below overrides DNS for
+ * exactly the gateway hosts. Bootstrap IPs: 162.159.36.5 /
+ * 162.159.36.20 / 176.24.239.99.
+ *
+ * Transport is the Gateway JSON API (GET /dns-query?name=...&type=...),
+ * the same JSON shape Ali's /resolve returned (Status / Answer
+ * array, HTTPS records in textual SVCB form
+ * `1 . alpn="h2" ... ech="BASE64" ...`); a `\# <len> <hex>`
+ * wire-form answer is also handled as a fallback. Results are
+ * cached per host with the records' TTL, clamped to [30s, 10min];
+ * failures and empty answers are cached briefly so a dead DoH
+ * endpoint cannot stall every request.
  *
  * Blocking calls: call only from worker threads (search runs on
  * SearchScheduler.workers; OkHttp dispatcher threads for the socket factory).
@@ -64,9 +68,19 @@ object EchDoh {
 
     private data class DohEndpoint(val name: String, val url: String, val pinnedIps: List<String>)
 
-    // Ali only. Logs use only the short name "Ali", never the URL.
+    // The user's own Cloudflare Gateway DoH, in try order (first
+    // answer wins). Logs use only the short "GW-<id>" names, never
+    // the URL. Each host is pinned to bootstrap IPs (direct IP +
+    // SNI = gateway domain); the first three share the pool, the
+    // last two have their own known bootstrap IPs.
+    private val BOOTSTRAP_IPS = listOf("162.159.36.5", "162.159.36.20", "176.24.239.99")
+
     private val ENDPOINTS = listOf(
-        DohEndpoint("Ali", "https://dns.alidns.com/resolve", listOf("223.5.5.5", "223.6.6.6")),
+        DohEndpoint("GW-m2b4x7vw98", "https://m2b4x7vw98.cloudflare-gateway.com/dns-query", BOOTSTRAP_IPS),
+        DohEndpoint("GW-pieqllv9i7", "https://pieqllv9i7.cloudflare-gateway.com/dns-query", BOOTSTRAP_IPS),
+        DohEndpoint("GW-dz1598pphb", "https://dz1598pphb.cloudflare-gateway.com/dns-query", BOOTSTRAP_IPS),
+        DohEndpoint("GW-0kbpekmcr1", "https://0kbpekmcr1.cloudflare-gateway.com/dns-query", listOf("176.24.239.99")),
+        DohEndpoint("GW-82sew1c85i", "https://82sew1c85i.cloudflare-gateway.com/dns-query", listOf("162.159.36.20", "162.159.36.5")),
     )
 
     private val pinnedByHost: Map<String, List<String>> = ENDPOINTS.associate { endpoint ->
@@ -93,7 +107,7 @@ object EchDoh {
         val addresses: List<InetAddress>,
         val echConfigList: ByteArray?,
         val resolvedViaDoh: Boolean,
-        /** DoH endpoint that provided this record: "Ali" / "Ali+共享" / "" (not via DoH). */
+        /** DoH endpoint that provided this record: "GW-..." / "GW-...+共享" / "" (not via DoH). */
         val dohSource: String = "",
     )
 
@@ -114,7 +128,7 @@ object EchDoh {
     fun sharedEchConfig(): ByteArray? = resolve(SHARED_ECH_HOST).echConfigList
 
     /**
-     * DoH endpoint that provided the cached record for [host] ("Ali"),
+     * DoH endpoint that provided the cached record for [host] ("GW-..."),
      * or "" when nothing is cached. Cache-only read:
      * never triggers network, so transport logging can use it freely.
      */
@@ -170,13 +184,16 @@ object EchDoh {
     }
 
     /**
-     * Resolves [host] through Ali only (single endpoint). A valid
-     * answer is adopted immediately when it carries an ech config
-     * (the common case: no second query). When a valid answer has NO
-     * ech, resolution proceeds directly to the shared-config last
-     * resort below (there is no second resolver to ask).
+     * Resolves [host] through the Gateway endpoints in order. The
+     * first endpoint that answers wins: a valid answer is adopted
+     * immediately when it carries an ech config (the common case:
+     * no second query). When a valid answer has NO ech, resolution
+     * proceeds directly to the shared-config last resort below
+     * (there is no point asking another endpoint of the same
+     * Gateway — it would answer identically); a transport failure
+     * moves on to the next endpoint.
      *
-     * Last resort, after Ali's HTTPS record lacks ech: if the site's
+     * Last resort, after the Gateway's HTTPS record lacks ech: if the site's
      * dial addresses are Cloudflare edge IPs, fetch the shared
      * Cloudflare ECH config live from [SHARED_ECH_HOST]'s HTTPS
      * record. The shared value is fetched on every cache miss, never
@@ -315,7 +332,7 @@ object EchDoh {
     )
 
     /**
-     * One Ali JSON-API query. Returns null only when the response has
+     * One Gateway JSON-API query. Returns null only when the response has
      * no usable Answer section; a DNS error status (NXDOMAIN etc.)
      * yields an empty answer, not a throw. Throws on transport or
      * HTTP failure so the caller can try the next endpoint.
