@@ -255,6 +255,7 @@ object EchH3Router {
 
         private var finalUrl: String = initialUrl
         private var statusCode: Int = 0
+        private var negotiated: String? = null
         private var headers: Map<String, List<String>> = emptyMap()
         private val body = ByteArrayOutputStream()
 
@@ -278,6 +279,7 @@ object EchH3Router {
         override fun onResponseStarted(request: UrlRequest, info: UrlResponseInfo) {
             statusCode = info.httpStatusCode
             finalUrl = info.url
+            negotiated = info.negotiatedProtocol
             headers = info.allHeaders
             // Bidirectional cookie sync, mirroring the OkHttp interceptor.
             headerValues("set-cookie").forEach { value ->
@@ -348,6 +350,7 @@ object EchH3Router {
                 cfMitigated = headerValue("cf-mitigated"),
                 cloudflareServed = (server?.contains("cloudflare", ignoreCase = true) == true) ||
                     headerValue("cf-ray") != null,
+                negotiated = negotiated,
             )
         }
 

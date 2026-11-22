@@ -16,7 +16,8 @@ data class SearchHttpResponse(val statusCode: Int, val finalUrl: String, val bod
                               val transportError: String? = null,
                               val cfMitigated: String? = null,
                               val cloudflareServed: Boolean = false,
-                              val rendered: Boolean = false)
+                              val rendered: Boolean = false,
+                              val negotiated: String? = null)
 
 /**
  * 搜索 HTML 抓取：ECH 优先、Cronet H3 其次、明文最后兜底。
@@ -47,9 +48,12 @@ class SearchHttpFetcher {
                 EchH3Router.Route.Ech -> return fetchEch(url, cancellation, site, host)
                 EchH3Router.Route.Cronet -> {
                     try {
-                        return EchH3Router.fetchViaCronet(url, site, cancellation, headerList(url, site))
+                        val response = EchH3Router.fetchViaCronet(url, site, cancellation, headerList(url, site))
+                        NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "Cronet", hasEchConfig, response.negotiated, null, EchDoh.sourceFor(host)))
+                        return response
                     } catch (e: EchH3Router.CronetFetchFailed) {
                         if (cancellation.isCancelled) throw IOException("Canceled")
+                        NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(), host, "Cronet", hasEchConfig, null, e.message, EchDoh.sourceFor(host)))
                         Log.d("EchH3", "Cronet failed for $host, falling back to plain OkHttp: ${e.message}")
                     }
                     // SearchTransportException (allowlist / body cap) and
