@@ -730,6 +730,71 @@
             </LinearLayout>
         </androidx.cardview.widget.CardView>
 
+        <!-- Go Proxy Status Section -->
+        <TextView
+            android:id="@+id/tv_proxy_title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Go 代理狀態"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:textColor="#FFFFFF"
+            android:layout_marginTop="10dp"
+            android:layout_marginBottom="10dp" />
+
+        <androidx.cardview.widget.CardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="20dp"
+            android:backgroundTint="#1E1E1E">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:id="@+id/tv_proxy_status"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:maxHeight="320dp"
+                    android:scrollbars="vertical"
+                    android:typeface="monospace"
+                    android:textSize="12sp"
+                    android:textColor="#BBBBBB"
+                    android:background="#121212"
+                    android:padding="10dp"
+                    android:text="載入中..." />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginTop="12dp">
+
+                    <Button
+                        android:id="@+id/btn_proxy_refresh"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:backgroundTint="#3700B3"
+                        android:text="重新整理"
+                        android:textColor="#FFFFFF"
+                        android:layout_marginEnd="8dp" />
+
+                    <Button
+                        android:id="@+id/btn_proxy_copy"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:backgroundTint="#2196F3"
+                        android:text="複製"
+                        android:textColor="#FFFFFF" />
+                </LinearLayout>
+            </LinearLayout>
+        </androidx.cardview.widget.CardView>
+
         <!-- Back Button -->
         <TextView
             android:id="@+id/tv_telemetry_notice"

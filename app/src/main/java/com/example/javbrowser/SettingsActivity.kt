@@ -43,6 +43,9 @@ class SettingsActivity : LocalizedActivity() {
     private lateinit var etPressHoldPlaybackRate: android.widget.EditText
     private lateinit var btnSavePressHoldPlaybackRate: Button
     private lateinit var rgLanguage: RadioGroup
+    private lateinit var tvProxyStatus: android.widget.TextView
+    private lateinit var btnProxyRefresh: Button
+    private lateinit var btnProxyCopy: Button
 
     companion object {
         private const val REQUEST_CODE_EXPORT_FAV = 3001
@@ -103,14 +106,58 @@ class SettingsActivity : LocalizedActivity() {
         etPressHoldPlaybackRate = findViewById(R.id.et_press_hold_playback_rate)
         btnSavePressHoldPlaybackRate = findViewById(R.id.btn_save_press_hold_playback_rate)
         rgLanguage = findViewById(R.id.rg_language)
+        tvProxyStatus = findViewById(R.id.tv_proxy_status)
+        btnProxyRefresh = findViewById(R.id.btn_proxy_refresh)
+        btnProxyCopy = findViewById(R.id.btn_proxy_copy)
         favoritesManager = FavoritesManager(this)
 
         loadSettings()
         setupListeners()
+        setupProxyStatus()
         updateRulesStatus()
         setupScrapeDoToken()
         setupFavoritesBackup()
         FooterHelper.setup(this)
+    }
+
+    // Go 代理诊断：只读状态展示，不改代理逻辑。打开设置页与点刷新时填 tv_proxy_status，
+    // 重点看 handshake 一行有没有 ECHAccepted=true（7mmtv 播放页没走 ECH 的定位用）。
+    private fun setupProxyStatus() {
+        findViewById<android.widget.TextView>(R.id.tv_proxy_title).text =
+            t("Go 代理狀態", "Go Proxy Status")
+        btnProxyRefresh.text = t("重新整理", "Refresh")
+        btnProxyCopy.text = t("複製", "Copy")
+        tvProxyStatus.movementMethod = android.text.method.ScrollingMovementMethod()
+        btnProxyRefresh.setOnClickListener { refreshProxyStatus() }
+        btnProxyCopy.setOnClickListener {
+            val text = tvProxyStatus.text.toString()
+            val clipboard =
+                getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            clipboard.setPrimaryClip(
+                android.content.ClipData.newPlainText("proxy-status", text)
+            )
+            Toast.makeText(this, t("已複製", "Copied"), Toast.LENGTH_SHORT).show()
+        }
+        refreshProxyStatus()
+    }
+
+    private fun refreshProxyStatus() {
+        tvProxyStatus.text = buildProxyDiagnostics()
+    }
+
+    private fun buildProxyDiagnostics(): String {
+        val sb = StringBuilder()
+        sb.append("started: ").append(EchProxyManager.started).append('\n')
+        sb.append("proxyPort: ").append(EchProxyManager.proxyPort).append('\n')
+        sb.append("proxyOverrideApplied: ").append(EchProxyManager.proxyOverrideApplied).append('\n')
+        EchProxyManager.startError?.let { sb.append("startError: ").append(it).append('\n') }
+        sb.append("--- status ---\n")
+        sb.append(EchProxyManager.status()).append('\n')
+        sb.append("--- logs (last 30) ---\n")
+        val logLines = EchProxyManager.drainLogs().lines()
+        val tail = if (logLines.size > 30) logLines.takeLast(30) else logLines
+        sb.append(tail.joinToString("\n"))
+        return sb.toString()
     }
 
     private fun loadSettings() {
