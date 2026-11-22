@@ -711,14 +711,6 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
             resolveSevenMmTv(item, sessionId)
             return
         }
-        // AvJoy 原生直取（2026-11-23，1.2.27）：正片是详情页 <video> 的
-        // <source> 直链 MP4（/video/ H.264 优先，/av1/ AV1 备用）；token
-        // 与过期时间戳每次都变，必须现取现用；growcdnssedge 的 m3u8
-        // 是站内其他视频的预览，别用；不用 Referer。
-        if (item.siteId == SearchSiteIds.AVJOY) {
-            resolveAvJoy(item, sessionId)
-            return
-        }
         SearchScheduler.workers.execute {
             val (candidates, ads) = trySniffVideoCandidates(item, sessionId)
             runOnUiThread {
@@ -842,63 +834,6 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
                     ads.isNotEmpty() -> showSniffPicker(item, emptyList(), sessionId, ads)
                     else -> {
                         if (scored.isEmpty()) PlaybackDataStore.recordFail(sessionId, "7mmtv直取無正片m3u8")
-                        BrowserNavigator.open(this, item.detailUrl)
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * AvJoy 原生直取：详情页 HTML -> <source> 直链 MP4（/video/ H.264
-     * 优先，/av1/ AV1 备用）。全程原生 OkHttp（与搜寻同一条网络栈），
-     * 不经 WebView；不用 Referer。growcdnssedge 的 m3u8 是站内其他
-     * 视频的预览，解析器根本不找 m3u8。有候选就进同一套过滤 +
-     * 选择器；取不到就回浏览器（不走 WebView 实时嗅探）。Never throws.
-     */
-    private fun resolveAvJoy(item: SearchItem, sessionId: Long) {
-        runOnUiThread {
-            android.widget.Toast.makeText(this,
-                LanguageManager.text(this, "正在解析真实地址…", "Resolving real video URL…"),
-                android.widget.Toast.LENGTH_SHORT).show()
-        }
-        SearchScheduler.workers.execute {
-            val site = sites.firstOrNull { it.id == item.siteId }
-            val scored: List<VideoPageSniffer.ScoredCandidate> = try {
-                if (site == null) {
-                    PlaybackDataStore.recordFail(sessionId, "站點未註冊")
-                    emptyList()
-                } else {
-                    val response = SearchHttpFetcher().fetch(item.detailUrl, SearchCancellation(), site)
-                    if (response.transportError != null) {
-                        PlaybackDataStore.recordFail(sessionId, "取詳情頁失敗：${response.transportError}")
-                        emptyList()
-                    } else if (response.statusCode !in 200..299) {
-                        PlaybackDataStore.recordFail(sessionId, "詳情頁HTTP ${response.statusCode}")
-                        emptyList()
-                    } else if (response.body.isBlank()) {
-                        PlaybackDataStore.recordFail(sessionId, "詳情頁為空")
-                        emptyList()
-                    } else {
-                        AvJoyResolver.resolve(response.body, site)
-                    }
-                }
-            } catch (e: Exception) {
-                PlaybackDataStore.recordFail(sessionId, "AvJoy解析異常：${e.message}")
-                emptyList()
-            }
-            val (kept, ads) = if (scored.isEmpty() || site == null) {
-                emptyList<SniffCandidateRecord>() to emptyList<SniffCandidateRecord>()
-            } else {
-                filterSniffCandidates(scored, site, sessionId)
-            }
-            runOnUiThread {
-                if (isDestroyed || isFinishing) return@runOnUiThread
-                when {
-                    kept.isNotEmpty() -> showSniffPicker(item, kept, sessionId, ads)
-                    ads.isNotEmpty() -> showSniffPicker(item, emptyList(), sessionId, ads)
-                    else -> {
-                        if (scored.isEmpty()) PlaybackDataStore.recordFail(sessionId, "AvJoy直取無正片MP4")
                         BrowserNavigator.open(this, item.detailUrl)
                     }
                 }
@@ -2678,7 +2613,7 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // also goes to the native player (ExoPlayer handles the AES-128
         // segments). Every other site keeps the existing internal player.
         val target = if (item.siteId == SearchSiteIds.HENTAIMAMA || item.siteId == SearchSiteIds.JAVHD ||
-            item.siteId == SearchSiteIds.SEVEN_MM_TV || item.siteId == SearchSiteIds.AVJOY) {
+            item.siteId == SearchSiteIds.SEVEN_MM_TV) {
             NativePlayerActivity::class.java
         } else {
             FullscreenInternalPlayerActivity::class.java
@@ -2689,11 +2624,10 @@ class UnifiedSearchActivity : LocalizedActivity(), SearchSnapshotListener {
         // the one JWPlayer itself sends. Fall back to no referer (a
         // bare link also plays) when the embed URL wasn't recorded.
         // 7mmtv: no Referer at all (verified: the player fetches the
-        // stream with an empty Referer). AvJoy: same — all requests
-        // in the sniff log carry an empty Referer, direct MP4 plays bare.
+        // stream with an empty Referer).
         val referer = if (item.siteId == SearchSiteIds.JAVHD) {
             javhdEmbedRefererByUrl[videoUrl].orEmpty()
-        } else if (item.siteId == SearchSiteIds.SEVEN_MM_TV || item.siteId == SearchSiteIds.AVJOY) {
+        } else if (item.siteId == SearchSiteIds.SEVEN_MM_TV) {
             ""
         } else {
             item.detailUrl
