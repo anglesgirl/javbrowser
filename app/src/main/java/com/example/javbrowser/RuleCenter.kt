@@ -86,8 +86,19 @@ object RuleCenter {
         SearchScheduler.workers.execute { refresh() }
     }
 
+    /**
+     * 多个远端里取版本号最大的那份；没有比当前新的就返回 null。
+     * 镜像可能滞后（实测 gh.anglesya.win 长期停在 v1，仓库已是 v3），
+     * 不能拿到第一个旧版就当“已是最新”直接返回、把直连的更新挡在外面。
+     */
+    internal fun pickNewest(candidates: List<Pair<RuleSet, String>>, currentVersion: Int): Pair<RuleSet, String>? {
+        val best = candidates.maxByOrNull { it.first.version } ?: return null
+        return if (best.first.version > currentVersion) best else null
+    }
+
     private fun refresh() {
         val ctx = appContext ?: return
+        val candidates = mutableListOf<Pair<RuleSet, String>>()
         for (url in REMOTE_URLS) {
             try {
                 val resp = SearchHttpFetcher().fetch(url, SearchCancellation(), rulesSite)
@@ -96,18 +107,18 @@ object RuleCenter {
                     continue
                 }
                 val parsed = parse(resp.body) ?: continue
-                if (parsed.version <= version()) {
-                    Log.d(TAG, "rules up to date (v${parsed.version}) from $url")
-                    return
-                }
-                current = parsed
-                runCatching { File(ctx.filesDir, CACHE_FILE).writeText(resp.body) }
-                Log.d(TAG, "rules updated to v${parsed.version} from $url")
-                return
+                candidates += parsed to resp.body
             } catch (e: Exception) {
                 Log.d(TAG, "rules fetch error $url: ${e.message}")
             }
         }
+        val (best, body) = pickNewest(candidates, version()) ?: run {
+            Log.d(TAG, "rules up to date (v${version()})")
+            return
+        }
+        current = best
+        runCatching { File(ctx.filesDir, CACHE_FILE).writeText(body) }
+        Log.d(TAG, "rules updated to v${best.version}")
     }
 
     private fun loadFromAssets(): RuleSet? {
