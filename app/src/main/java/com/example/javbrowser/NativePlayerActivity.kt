@@ -1,7 +1,12 @@
 package com.example.javbrowser
 
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.os.Bundle
+import android.view.Gravity
 import android.view.WindowManager
+import android.widget.FrameLayout
+import android.widget.ImageButton
 import android.widget.Toast
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -58,7 +63,25 @@ class NativePlayerActivity : LocalizedActivity() {
             useController = true
             keepScreenOn = true
         }
-        setContentView(playerView)
+        // 手動旋轉鈕：播放器不再自動旋轉（Manifest 的 fullSensor 已拿掉，
+        // 會尊重系統直向鎖定）；要轉就點這個鈕，在直向/橫向之間切。
+        val rotateBtn = ImageButton(this).apply {
+            setImageResource(android.R.drawable.ic_menu_rotate)
+            contentDescription = "旋轉"
+            setBackgroundColor(0x66000000)
+            setColorFilter(0xFFFFFFFF)
+            val size = (48 * resources.displayMetrics.density).toInt()
+            layoutParams = FrameLayout.LayoutParams(size, size).apply {
+                gravity = Gravity.TOP or Gravity.END
+                val m = (12 * resources.displayMetrics.density).toInt()
+                setMargins(m, m, m, m)
+            }
+            setOnClickListener { toggleOrientation() }
+        }
+        setContentView(FrameLayout(this).apply {
+            addView(playerView)
+            addView(rotateBtn)
+        })
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, playerView).apply {
             hide(WindowInsetsCompat.Type.systemBars())
@@ -191,6 +214,15 @@ class NativePlayerActivity : LocalizedActivity() {
         PlaybackDataStore.addTrace(sessionId, "播放器 onPause：started=$started positionMs=${player?.currentPosition ?: 0}")
         player?.pause()
         recordOutcome()
+    }
+
+    /** 手動旋轉：直向/橫向切換。設的是固定方向，不會再被感應器轉回去。 */
+    private fun toggleOrientation() {
+        requestedOrientation = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        }
     }
 
     /**

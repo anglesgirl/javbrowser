@@ -112,7 +112,9 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         immersiveMode = playerUiPreferences.getBoolean(PREFERENCE_IMMERSIVE_MODE, false)
         val maxPictureMode = playerUiPreferences.getBoolean(PREFERENCE_MAX_PICTURE_MODE, false)
         requestedOrientation = if (orientationLockMode == "auto") {
-            ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+            // 跟隨系統（尊重用戶的直向鎖定），不用 FULL_SENSOR——
+            // FULL_SENSOR 會無視系統鎖定、照感應器轉，這就是「鎖豎屏還自動轉」的根因。
+            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         } else {
             ActivityInfo.SCREEN_ORIENTATION_LOCKED
         }
@@ -544,7 +546,8 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
             if (orientationLockMode != "auto") {
                 orientationLockMode = "auto"
                 runOnUiThread {
-                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+                    // 回到跟隨系統（尊重直向鎖定），不用 FULL_SENSOR。
+                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                 }
                 return "auto"
             }
