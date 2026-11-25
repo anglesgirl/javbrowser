@@ -83,7 +83,7 @@ object SearchSiteRegistry {
             SearchSite(SearchSiteIds.AVJOY, "AvJoy", 2, SearchParserKind.AVJOY,
                 "avjoy:$avjoyHost", { query, page -> page ?: "https://$avjoyHost/search/videos/${pathQuery(query)}" }, setOf(avjoyHost)),
             SearchSite(SearchSiteIds.PIGAV, "PigAV", 3, SearchParserKind.PIGAV,
-                "pigav:$pigavHost", { query, page -> page ?: "https://$pigavHost/search?search=${encodedQuery(query)}&searchTarget=local" }, setOf(pigavHost)),
+                "pigav:$pigavHost", { query, page -> page ?: "https://$pigavHost/search?search=${encodedQuery(query)}&searchTarget=local" }, setOf(pigavHost, "pigav.ws", "www.pigav.ws")),
             SearchSite(SearchSiteIds.AVTODAY, "AVToday", 4, SearchParserKind.AVTODAY,
                 "avtoday:$avtodayHost", { query, page -> page ?: "https://$avtodayHost/search?s=${encodedQuery(query)}" }, setOf(avtodayHost)),
             SearchSite(SearchSiteIds.JAVHD, "JavHDPorn", 5, SearchParserKind.JAVHD,

@@ -742,7 +742,7 @@ class MainActivity : LocalizedActivity() {
             })
             put(org.json.JSONObject().apply {
                 put("label", "PigAV")
-                put("template", "https://pigav.ws/search?search={code}&searchTarget=local")
+                put("template", "https://${domainConfig.getPigAvDomain()}/search?search={code}&searchTarget=local")
             })
             put(org.json.JSONObject().apply {
                 put("label", "AVToday")
