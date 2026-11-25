@@ -1005,7 +1005,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         // 片名：顯示在頂部空白區（下載名即片名），HTML 轉義防注入。
         val videoTitleHtml = downloadName.replace("&", "&amp;").replace("<", "&lt;")
             .replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;")
-        val closeLabel = if (uiEnglish) "Close" else "關閉"
+        val closeLabel = if (uiEnglish) "Exit playback" else "退出播放"
         val displayLabel = if (uiEnglish) "Display" else "畫面"
         val speedLabel = if (uiEnglish) "Speed" else "速度"
         val qualityLabel = if (uiEnglish) "Auto" else "自動"
@@ -1079,14 +1079,19 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   right: 0;
                   top: 0;
                   display: flex;
-                  flex-wrap: wrap;
-                  align-items: center;
-                  justify-content: space-between;
-                  gap: 8px;
+                  flex-direction: column;
+                  gap: 4px;
                   padding: 10px 12px;
                   background: linear-gradient(to bottom, rgba(0, 0, 0, .72), rgba(0, 0, 0, 0));
                   font-size: 13px;
                   z-index: 2;
+                }
+                #top-row {
+                  display: flex;
+                  flex-wrap: wrap;
+                  align-items: center;
+                  justify-content: space-between;
+                  gap: 8px;
                 }
                 #status {
                   flex: 1;
@@ -1095,13 +1100,9 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   white-space: nowrap;
                   text-overflow: ellipsis;
                 }
-                /* 片名：放在頂部控制列下方、影片上方的空白區，長名省略。 */
+                /* 片名：頂部控制列的第二行，跟著按鈕換行走，不再固定 top，永不壓到按鈕。 */
                 #video-title {
-                  position: absolute;
-                  left: 0;
-                  right: 0;
-                  top: 56px;
-                  padding: 4px 16px;
+                  padding: 2px 4px;
                   text-align: center;
                   font-size: 15px;
                   font-weight: 600;
@@ -1111,7 +1112,6 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   white-space: nowrap;
                   text-overflow: ellipsis;
                   pointer-events: none;
-                  z-index: 2;
                 }
                 #top-actions {
                   display: flex;
@@ -1818,7 +1818,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   100% { opacity: 0; transform: scaleX(1.02); }
                 }
                 html.clean-view #video { height: 100%; }
-                html.clean-view #top, html.clean-view #controls, html.clean-view #video-title,
+                html.clean-view #top, html.clean-view #controls,
                 html.clean-view #tip-message, html.clean-view #tip-list-toggle,
                 html.clean-view #tip-list-drawer, html.clean-view #tip-list-backdrop,
                 html.clean-view #press-hold-speed, html.clean-view .seek-zone-feedback {
@@ -1830,6 +1830,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
             <body>
               <div id="wrap">
                 <div id="top">
+                  <div id="top-row">
                   <div id="status">$playerStatus</div>
                   <div id="top-actions">
                     $downloadButtonHtml
@@ -1847,8 +1848,9 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     <button id="clean-view" type="button" title="${if (uiEnglish) "Hide controls; tap the picture to restore" else "隱藏控制介面，點畫面恢復"}">${if (uiEnglish) "Hide UI" else "純畫面"}</button>
                     <button id="close">$closeLabel</button>
                   </div>
+                  </div>
+                  <div id="video-title">$videoTitleHtml</div>
                 </div>
-                <div id="video-title">$videoTitleHtml</div>
                 <video id="video" autoplay playsinline webkit-playsinline></video>
                 <div id="press-hold-speed">
                   <div id="press-hold-speed-main">▶▶ ${pressHoldPlaybackRateText}x</div>
