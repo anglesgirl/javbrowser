@@ -33,7 +33,14 @@ open class SiteHtmlSearchProvider(override val site: SearchSite,
         fun error(status: SearchStatus, code: String) =
             SiteSearchResult(request.requestId, site.id, attemptId, status, errorCode = code,
                 message = SearchFailure.zh(code), diagnostic = "phase=HTTP host=" + url.toHttpUrlOrNull()?.host)
-        if (!SearchResultNormalizer.validUrl(url, site)) return error(SearchStatus.PARSE_ERROR, "INVALID_SEARCH_URL")
+        // 搜尋網址未通過核准網域/連接埠檢查：還沒發任何網路請求就直接失敗。
+        // 記一筆傳輸日誌，否則使用者只看到「沒網、沒日誌」，無從判斷是網址/網域設定問題。
+        if (!SearchResultNormalizer.validUrl(url, site)) {
+            NetworkLogStore.add(NetworkLogEntry(System.currentTimeMillis(),
+                url.toHttpUrlOrNull()?.host.orEmpty(), "Validation", false, null,
+                "INVALID_SEARCH_URL", ""))
+            return error(SearchStatus.PARSE_ERROR, "INVALID_SEARCH_URL")
+        }
         try {
             cancellation.check()
             val started = System.nanoTime()
