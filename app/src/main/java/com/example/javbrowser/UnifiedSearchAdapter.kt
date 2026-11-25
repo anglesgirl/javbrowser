@@ -72,8 +72,12 @@ class UnifiedSearchAdapter(
         val english = LanguageManager.isEnglish(context)
         holder.title.text = group.title
         holder.meta.text = buildString {
-            append(group.code ?: LanguageManager.text(context, "未辨識番號", "Code unidentified"))
-            append(" · ").append(LanguageManager.text(context,
+            // 没番号就不占位：HentaiMama 这类剧集本来就没有番号，显示“未辨識番號”
+            // 是误导；其他站解析不到番号时也一样，卡片只展示已有的数据。
+            if (group.code != null) {
+                append(group.code).append(" · ")
+            }
+            append(LanguageManager.text(context,
                 "${group.links.map { it.siteId }.distinct().size} 站／${group.links.size} 個連結",
                 "${group.links.map { it.siteId }.distinct().size} sites / ${group.links.size} links"))
             append("\n").append(group.links.map { siteNames[it.siteId] ?: it.siteId }.distinct().joinToString(" · "))

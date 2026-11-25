@@ -32,6 +32,14 @@ class SearchHtmlParserTest {
                 response(fixture(name + "-empty"))).status)
         }
     }
+    @Test fun backgroundImageCoverIsUsedWhenNoImgPresent() {
+        val body = "<main class='search-results'><div class='video-img-box'>" +
+            "<a href='/videos/test-001/?id=17' title='TEST-001'>" +
+            "<div class='cover' style=\"background-image: url('/cover.png')\"></div></a></div></main>"
+        val result = parse(body)
+        assertEquals(SearchStatus.SUCCESS, result.status)
+        assertEquals("https://test.invalid/cover.png", result.items.single().coverUrl)
+    }
     @Test fun recordsWhichParsingStageFailed() {
         assertEquals("RESULT_CONTAINER_NOT_FOUND", parse("<main>unknown layout</main>").errorCode)
         assertEquals("DETAIL_LINKS_REJECTED", parse("<div class='video-img-box'><a href='https://ads.invalid/videos/x'>x</a></div>").errorCode)

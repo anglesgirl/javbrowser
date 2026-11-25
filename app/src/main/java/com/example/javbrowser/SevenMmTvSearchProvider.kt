@@ -7,6 +7,6 @@ class SevenMmTvSearchProvider(context: Context, site: SearchSite) : SiteHtmlSear
     companion object {
         val RULES = SearchParserRules("a[href*='_content/']", ".video, .item, li, .thumbnail",
             Regex("/(?:[a-z]+/)?[a-z_]+_content/[0-9]+/[^/]+[.]html", RegexOption.IGNORE_CASE),
-            ".search-results .no-results, .search-results .no-result", false)
+            ".search-results .no-results, .search-results .no-result", true)
     }
 }

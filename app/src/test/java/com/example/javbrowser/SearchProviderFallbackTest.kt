@@ -46,6 +46,33 @@ class SearchProviderFallbackTest {
             { _, _ -> response(shell) }, { _, _ -> response("", 403).copy(cfMitigated = "challenge", rendered = true) })
         assertEquals("CF_CHALLENGE", provider.search(request).errorCode)
     }
+    @Test fun browseWithTooFewItemsRendersToRecoverHomePageCards() {
+        val browseRequest = request.copy(runMode = SearchRunMode.BROWSE)
+        var rendered = 0
+        val thinCard = "<my-app><div class='unknown-wrapper'><a href='/w/only-one'><img data-src='/cover.png'></a><span class='video-name'>ONLY-001</span></div></my-app>"
+        val richCard = "<my-app>" +
+            "<div class='unknown-wrapper'><a href='/w/one'><img data-src='/cover.png'></a><span class='video-name'>ONE-001</span></div>" +
+            "<div class='unknown-wrapper'><a href='/w/two'><img data-src='/cover.png'></a><span class='video-name'>TWO-001</span></div>" +
+            "<div class='unknown-wrapper'><a href='/w/three'><img data-src='/cover.png'></a><span class='video-name'>THREE-001</span></div></my-app>"
+        val provider = SiteHtmlSearchProvider(site, PigavSearchProvider.RULES,
+            { _, _ -> response(thinCard) }, { _, _ -> rendered++; response(richCard).copy(rendered = true) })
+        val result = provider.search(browseRequest, attemptId = "a")
+        assertEquals(1, rendered)
+        assertEquals(SearchStatus.SUCCESS, result.status)
+        assertEquals(3, result.items.size)
+    }
+    @Test fun browseThinResultKeepsHttpItemsWhenRenderingFindsNothing() {
+        val browseRequest = request.copy(runMode = SearchRunMode.BROWSE)
+        var rendered = 0
+        val thinCard = "<my-app><div class='unknown-wrapper'><a href='/w/only-one'><img data-src='/cover.png'></a><span class='video-name'>ONLY-001</span></div></my-app>"
+        val provider = SiteHtmlSearchProvider(site, PigavSearchProvider.RULES,
+            { _, _ -> response(thinCard) }, { _, _ -> rendered++; response("<my-app></my-app>").copy(rendered = true) })
+        val result = provider.search(browseRequest, attemptId = "a")
+        assertEquals(1, rendered)
+        assertEquals(SearchStatus.SUCCESS, result.status)
+        assertEquals(1, result.items.size)
+        assertEquals("ONLY-001", result.items.single().title)
+    }
     @Test fun explicitEmptyAndSuccessfulHttpResultsDoNotNeedRendering() {
         listOf(card to SearchStatus.SUCCESS, "<main><div class='no-results'>No results found</div></main>" to SearchStatus.EMPTY).forEach { (html, status) ->
             var calls = 0

@@ -43,15 +43,40 @@ open class SiteHtmlSearchProvider(override val site: SearchSite,
             if (TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) > 15_000)
                 return error(SearchStatus.TIMEOUT, "HTTP_DEADLINE")
             // Interactive verification is never automated; the user opens the original site.
+            // 浏览模式（首页）用的还是搜索页的选择器，首页卡片结构不同时原生解析
+            // 常常只剩一两条；这时也走一次 WebView 渲染兜底，JS 展开后的卡片常能补全。
+            // 渲染失败不丢原结果（薄但真实），渲染出空也不覆盖原有条目。
+            val browseTooFew = request.runMode == SearchRunMode.BROWSE &&
+                parsed.status == SearchStatus.SUCCESS && parsed.items.size < 4
             if (rules.browserFallback && (parsed.status == SearchStatus.PARSE_ERROR ||
-                    parsed.status in setOf(SearchStatus.SUCCESS, SearchStatus.EMPTY) && parsed.pageState == SearchPageState.UNSUPPORTED) &&
+                    parsed.status in setOf(SearchStatus.SUCCESS, SearchStatus.EMPTY) && parsed.pageState == SearchPageState.UNSUPPORTED ||
+                    browseTooFew) &&
                 SearchResultNormalizer.validUrl(response.finalUrl, site)) {
-                val rendered = renderHtml(response.finalUrl, cancellation)
-                cancellation.check()
-                val renderedResult = SearchHtmlParser(site, rules).parse(request, attemptId, rendered)
-                parsed = renderedResult.copy(
-                    items = if (renderedResult.status in setOf(SearchStatus.SUCCESS, SearchStatus.EMPTY)) renderedResult.items else parsed.items,
-                    diagnostic = "phase=WebView " + renderedResult.diagnostic + " httpCode=" + parsed.errorCode)
+                // 渲染失败不丢原结果（薄但真实）；取消仍要透传，不能被兜底吞掉。
+                val renderedResult: SiteSearchResult? = try {
+                    val rendered = renderHtml(response.finalUrl, cancellation)
+                    cancellation.check()
+                    SearchHtmlParser(site, rules).parse(request, attemptId, rendered)
+                } catch (e: InterruptedException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
+                if (renderedResult != null) {
+                    val renderedBetter = renderedResult.status == SearchStatus.SUCCESS &&
+                        renderedResult.items.size > parsed.items.size
+                    val renderedEmptyOk = renderedResult.status == SearchStatus.EMPTY &&
+                        parsed.status != SearchStatus.SUCCESS
+                    parsed = if (renderedBetter || renderedEmptyOk) {
+                        renderedResult.copy(
+                            diagnostic = "phase=WebView " + renderedResult.diagnostic + " httpCode=" + parsed.errorCode)
+                    } else {
+                        // 渲染没赢过原生解析：留着原结果，只在诊断里记一笔，不把
+                        // 状态改成渲染那边的 EMPTY/错误，避免薄结果被空结果盖掉。
+                        parsed.copy(diagnostic = parsed.diagnostic +
+                            " webviewTried=" + renderedResult.status.name)
+                    }
+                }
             }
             return parsed
         } catch (e: InterruptedException) {
@@ -195,7 +220,7 @@ class SearchHtmlParser(private val site: SearchSite, private val rules: SearchPa
             Regex("url\\(['\"]?([^)'\"]+)").find(element.attr("style"))?.groupValues?.get(1)
                 ?.let { runCatching { java.net.URI(element.baseUri()).resolve(it).toString() }.getOrNull() }
                 ?.takeIf { it.toHttpUrlOrNull() != null }
-        }
+        } ?: backgroundImageCover(card)
         val evidence = title + " " + href
         val tags = buildList {
             if (evidence.contains("中文字幕") || evidence.contains("中文")) add("中文字幕")
@@ -229,6 +254,30 @@ class SearchHtmlParser(private val site: SearchSite, private val rules: SearchPa
             card = parent
         }
         return card
+    }
+
+    /**
+     * 封面兜底：有些站把海报画成 div 的 background-image（懒加载 / CSS 图），
+     * 卡片里没有 <img>，只认 img 就会丢封面、整张卡只剩灰块。
+     * 在卡片本身及后代里找带 background-image 的 style，类名像封面/缩略图的优先；
+     * 只读本卡，不碰相邻卡片。相对地址按页面基址解析，无效地址跳过。
+     */
+    private fun backgroundImageCover(card: Element): String? {
+        val urlRe = Regex("background-image\\s*:\\s*url\\(['\"]?([^)'\"]+)")
+        // select() 只含后代，卡片本身的 style 也要算进去。
+        val candidates = listOf(card) + card.select("[style]")
+        val ordered = candidates.sortedBy { el ->
+            val cls = el.className().lowercase()
+            if (cls.contains("cover") || cls.contains("thumb") || cls.contains("poster") ||
+                cls.contains("image") || cls.contains("preview")) 0 else 1
+        }
+        for (el in ordered) {
+            val url = urlRe.find(el.attr("style"))?.groupValues?.get(1) ?: continue
+            val resolved = runCatching { java.net.URI(el.baseUri()).resolve(url).toString() }.getOrNull()
+                ?.takeIf { it.toHttpUrlOrNull() != null } ?: continue
+            return resolved
+        }
+        return null
     }
 }
 
