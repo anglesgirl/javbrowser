@@ -269,7 +269,8 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                 rouEpisodes,
                 currentRouEpisodeId,
                 additionalEpisodes,
-                videoUrl
+                videoUrl,
+                downloadName
             ),
             "text/html",
             "UTF-8",
@@ -565,6 +566,26 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     "orientation locked mode=$mode config=${resources.configuration.orientation} " +
                         "rotation=${display?.rotation} requested=$requestedOrientation"
                 )
+            }
+            return mode
+        }
+
+        @JavascriptInterface
+        fun rotateScreen(): String {
+            // 手動旋轉：直向/橫向切換。設固定方向並同步鎖定模式，
+            // 鎖定鈕的圖示才跟得上（再點鎖定鈕回到跟隨系統）。
+            val mode = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+                "portrait"
+            } else {
+                "landscape"
+            }
+            orientationLockMode = mode
+            runOnUiThread {
+                requestedOrientation = if (mode == "landscape") {
+                    ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                } else {
+                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                }
             }
             return mode
         }
@@ -931,7 +952,8 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         rouEpisodes: List<VideoExtractor.RouVideoEpisode>,
         currentRouEpisodeId: String?,
         additionalEpisodes: List<VideoExtractor.AdditionalVideoEpisode>,
-        initialEpisodeUrl: String
+        initialEpisodeUrl: String,
+        downloadName: String
     ): String {
         val videoUrlJson = JSONObject.quote(videoUrl)
         val initialOrientationModeJson = JSONObject.quote(orientationLockMode)
@@ -963,6 +985,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         }
         val shortSeekLabel = seekLabel(shortSeekSeconds)
         val longSeekLabel = seekLabel(longSeekSeconds)
+        val fiveMinSeekLabel = seekLabel(300)
         val speedButtonsHtml = playbackSpeedOptions.joinToString("\n") { rate ->
             val rateText = PrivacySettings.formatPlaybackRate(rate)
             val activeClass = if (rate == 1.0) " class=\"active\"" else ""
@@ -979,6 +1002,9 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
         } else {
             if (isLocalPlayback) "本地內建播放器：載入中" else "全螢幕內建播放器：載入中"
         }
+        // 片名：顯示在頂部空白區（下載名即片名），HTML 轉義防注入。
+        val videoTitleHtml = downloadName.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;")
         val closeLabel = if (uiEnglish) "Close" else "關閉"
         val displayLabel = if (uiEnglish) "Display" else "畫面"
         val speedLabel = if (uiEnglish) "Speed" else "速度"
@@ -1068,6 +1094,24 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   overflow: hidden;
                   white-space: nowrap;
                   text-overflow: ellipsis;
+                }
+                /* 片名：放在頂部控制列下方、影片上方的空白區，長名省略。 */
+                #video-title {
+                  position: absolute;
+                  left: 0;
+                  right: 0;
+                  top: 56px;
+                  padding: 4px 16px;
+                  text-align: center;
+                  font-size: 15px;
+                  font-weight: 600;
+                  color: rgba(255, 255, 255, .92);
+                  text-shadow: 0 1px 4px rgba(0, 0, 0, .9);
+                  overflow: hidden;
+                  white-space: nowrap;
+                  text-overflow: ellipsis;
+                  pointer-events: none;
+                  z-index: 2;
                 }
                 #top-actions {
                   display: flex;
@@ -1550,10 +1594,10 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   position: relative;
                   z-index: 2;
                   display: grid;
-                  grid-template-columns: repeat(5, minmax(48px, 68px));
+                  grid-template-columns: repeat(7, minmax(40px, 58px));
                   justify-content: center;
                   align-items: center;
-                  gap: 8px;
+                  gap: 6px;
                 }
                 .seek-button {
                   min-width: 0;
@@ -1650,7 +1694,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     padding: 9px 8px 10px;
                   }
                   #primary-controls {
-                    grid-template-columns: repeat(5, minmax(44px, 60px));
+                    grid-template-columns: repeat(7, minmax(36px, 50px));
                     gap: 4px;
                   }
                   #progress-wrap {
@@ -1774,7 +1818,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   100% { opacity: 0; transform: scaleX(1.02); }
                 }
                 html.clean-view #video { height: 100%; }
-                html.clean-view #top, html.clean-view #controls,
+                html.clean-view #top, html.clean-view #controls, html.clean-view #video-title,
                 html.clean-view #tip-message, html.clean-view #tip-list-toggle,
                 html.clean-view #tip-list-drawer, html.clean-view #tip-list-backdrop,
                 html.clean-view #press-hold-speed, html.clean-view .seek-zone-feedback {
@@ -1792,6 +1836,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     <button id="loop-a" class="loop-point" type="button" title="${if (uiEnglish) "Set or clear loop point A" else "設定或清除循環 A 點"}">A</button>
                     <button id="loop-b" class="loop-point" type="button" title="${if (uiEnglish) "Set or clear loop point B" else "設定或清除循環 B 點"}">B</button>
                     <button id="orientation" title="自動旋轉">🔓</button>
+                    <button id="rotate" type="button" title="${if (uiEnglish) "Rotate screen" else "旋轉畫面"}">🔄</button>
                     <div id="display-settings-wrap">
                       <button id="display-settings" type="button" title="${if (uiEnglish) "Player display settings" else "播放器畫面設定"}">$displayLabel</button>
                       <div id="display-menu">
@@ -1803,6 +1848,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     <button id="close">$closeLabel</button>
                   </div>
                 </div>
+                <div id="video-title">$videoTitleHtml</div>
                 <video id="video" autoplay playsinline webkit-playsinline></video>
                 <div id="press-hold-speed">
                   <div id="press-hold-speed-main">▶▶ ${pressHoldPlaybackRateText}x</div>
@@ -1841,11 +1887,13 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     <input id="progress" type="range" min="0" max="1000" value="0">
                   </div>
                   <div id="primary-controls" class="control-row">
+                    <button id="back300" class="seek-button" title="倒退 $fiveMinSeekLabel">−$fiveMinSeekLabel</button>
                     <button id="back60" class="seek-button" title="倒退 $longSeekLabel">−$longSeekLabel</button>
                     <button id="back20" class="seek-button" title="倒退 $shortSeekLabel">−$shortSeekLabel</button>
                     <button id="play" title="播放">▶</button>
                     <button id="fwd20" class="seek-button" title="前進 $shortSeekLabel">+$shortSeekLabel</button>
                     <button id="fwd60" class="seek-button" title="前進 $longSeekLabel">+$longSeekLabel</button>
+                    <button id="fwd300" class="seek-button" title="前進 $fiveMinSeekLabel">+$fiveMinSeekLabel</button>
                   </div>
                   <div id="secondary-controls" class="control-row">
                     <span id="time">00:00 / --:--</span>
@@ -1912,6 +1960,7 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   var time = document.getElementById('time');
                   var mute = document.getElementById('mute');
                   var orientation = document.getElementById('orientation');
+                  var rotateBtn = document.getElementById('rotate');
                   var displaySettings = document.getElementById('display-settings');
                   var displayMenu = document.getElementById('display-menu');
                   var pictureModeButton = document.getElementById('picture-mode');
@@ -3232,6 +3281,8 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                   document.getElementById('fwd20').onclick = function(){ seekBy(shortSeekSeconds); };
                   document.getElementById('back60').onclick = function(){ seekBy(-longSeekSeconds); };
                   document.getElementById('fwd60').onclick = function(){ seekBy(longSeekSeconds); };
+                  document.getElementById('back300').onclick = function(){ seekBy(-300); };
+                  document.getElementById('fwd300').onclick = function(){ seekBy(300); };
                   mute.onclick = function() {
                     video.muted = !video.muted;
                     updateMute();
@@ -3242,6 +3293,12 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
                     var mode = AndroidPlayer.toggleOrientationLock();
                     updateOrientation(mode);
                     setStatus(mode === 'auto' ? '自動旋轉' : (mode === 'landscape' ? '已鎖定橫屏' : '已鎖定豎屏'));
+                    showChrome();
+                  };
+                  rotateBtn.onclick = function() {
+                    var mode = AndroidPlayer.rotateScreen();
+                    updateOrientation(mode);
+                    setStatus(mode === 'landscape' ? '已轉橫屏' : '已轉豎屏');
                     showChrome();
                   };
                   displaySettings.onclick = function(event) {
