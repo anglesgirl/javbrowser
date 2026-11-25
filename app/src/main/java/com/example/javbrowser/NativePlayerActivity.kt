@@ -69,7 +69,7 @@ class NativePlayerActivity : LocalizedActivity() {
             setImageResource(android.R.drawable.ic_menu_rotate)
             contentDescription = "旋轉"
             setBackgroundColor(0x66000000)
-            setColorFilter(0xFFFFFFFF)
+            setColorFilter(android.graphics.Color.WHITE)
             val size = (48 * resources.displayMetrics.density).toInt()
             layoutParams = FrameLayout.LayoutParams(size, size).apply {
                 gravity = Gravity.TOP or Gravity.END
