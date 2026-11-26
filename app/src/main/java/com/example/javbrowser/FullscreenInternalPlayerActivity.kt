@@ -647,9 +647,14 @@ class FullscreenInternalPlayerActivity : LocalizedActivity() {
             return normalizedUrl
         }
 
+        // 1.2.51：missav 不再 bypass 代理。之前 fork 特意让 missav/jable/
+        // avjoy/avtoday 走直连，但直连时播放器自己去 surrit 取 #EXT-X-KEY，
+        // Cloudflare 不认、拿不到密钥就解不了密，内置播放器播不出、内置
+        // 浏览器 Plyr 也是 0:00。改回走代理（VideoProxyServer，1.2.50 已
+        // 按 HAR 补齐 surrit 请求头），代理把密钥地址重写成走代理取。
+        // supjav/jable/avjoy/avtoday 仍维持直连，只改 missav。
         val shouldBypassProxy =
             AdditionalSiteMedia.hostMatches(intent.getStringExtra(EXTRA_PAGE_URL).orEmpty(), "supjav.com") ||
-            referer.contains("missav", ignoreCase = true) ||
                 referer.contains("jable.tv", ignoreCase = true) ||
                 referer.contains("avjoy", ignoreCase = true) ||
                 referer.contains("avtoday.io", ignoreCase = true)
