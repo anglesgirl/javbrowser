@@ -282,6 +282,111 @@ object EchH3Router {
         }
     }
 
+    /**
+     * Byte-oriented Cronet fetch for images (cover art, etc.). Unlike
+     * [fetchViaCronet] it returns raw bytes (no charset conversion —
+     * a String round-trip would corrupt binary image data) and takes
+     * no [SearchSite]: image URLs come from the site's own parsed
+     * HTML (trusted source) and the image CDN host is usually NOT in
+     * the site's allowedHosts (e.g. Whos.tv covers live on
+     * v.hersav.me, not whos.tv). Redirects are allowed to any host —
+     * an image fetch carries no cookies or credentials.
+     *
+     * Returns the bytes, or null on any transport failure (caller
+     * falls back to plain OkHttp, mirroring SearchHttpFetcher).
+     * Throws only on a body-cap overflow, which is a hard failure.
+     */
+    fun fetchBytesViaCronet(url: String): ByteArray? {
+        val parsed = url.toHttpUrlOrNull() ?: return null
+        val engine = try {
+            engine()
+        } catch (e: Exception) {
+            return null
+        }
+        val holder = CronetBytesHolder()
+        val latch = CountDownLatch(1)
+        val callback = object : UrlRequest.Callback() {
+            private val body = ByteArrayOutputStream()
+
+            override fun onRedirectReceived(
+                request: UrlRequest,
+                info: UrlResponseInfo,
+                newLocationString: String,
+            ) {
+                // Images carry no auth: allow redirects to any host.
+                request.followRedirect()
+            }
+
+            override fun onResponseStarted(request: UrlRequest, info: UrlResponseInfo) {
+                request.read(ByteBuffer.allocateDirect(READ_BUFFER))
+            }
+
+            override fun onReadCompleted(
+                request: UrlRequest,
+                info: UrlResponseInfo,
+                byteBuffer: ByteBuffer,
+            ) {
+                byteBuffer.flip()
+                val bytes = ByteArray(byteBuffer.remaining())
+                byteBuffer.get(bytes)
+                byteBuffer.clear()
+                if (body.size().toLong() + bytes.size > MAX_BODY) {
+                    holder.error = SearchTransportException("RESPONSE_TOO_LARGE")
+                    request.cancel()
+                    return
+                }
+                body.write(bytes)
+                request.read(byteBuffer)
+            }
+
+            override fun onSucceeded(request: UrlRequest, info: UrlResponseInfo) {
+                holder.bytes = body.toByteArray()
+                latch.countDown()
+            }
+
+            override fun onFailed(
+                request: UrlRequest,
+                info: UrlResponseInfo?,
+                error: CronetException,
+            ) {
+                holder.error = CronetFetchFailed("Cronet failed: ${error.message}", error)
+                latch.countDown()
+            }
+
+            override fun onCanceled(request: UrlRequest, info: UrlResponseInfo?) {
+                holder.error = CronetFetchFailed("Cronet canceled (timeout)")
+                latch.countDown()
+            }
+        }
+        val request = engine.newUrlRequestBuilder(url, callback, cronetCallbacks).apply {
+            addHeader("User-Agent", SearchHttpFetcher.USER_AGENT)
+            addHeader("Accept", "image/*,*/*;q=0.8")
+        }.build()
+        val timer = SearchScheduler.timers.schedule(
+            { request.cancel() },
+            CRONET_TIMEOUT_SEC,
+            TimeUnit.SECONDS,
+        )
+        try {
+            request.start()
+            val done = latch.await(LATCH_TIMEOUT_SEC, TimeUnit.SECONDS)
+            if (!done) {
+                request.cancel()
+                return null
+            }
+            holder.error?.let { throw it }
+            return holder.bytes
+        } finally {
+            timer.cancel(false)
+        }
+    }
+
+    private class CronetBytesHolder {
+        @Volatile var bytes: ByteArray? = null
+
+        @Volatile var error: Exception? = null
+    }
+
     private class CronetHolder {
         @Volatile var response: SearchHttpResponse? = null
 

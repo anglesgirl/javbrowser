@@ -93,7 +93,7 @@ object SearchSiteRegistry {
             SearchSite(SearchSiteIds.AVPLE, "Avple", 7, SearchParserKind.AVPLE,
                 "avple:$avpleHost", { query, page -> page ?: "https://$avpleHost/search?key=${encodedQuery(query)}" }, setOf(avpleHost)),
             SearchSite(SearchSiteIds.WHOS, "Whos.tv", 8, SearchParserKind.WHOS,
-                "whos:$whosHost", { query, page -> page ?: "https://$whosHost/videos?q=${encodedQuery(query)}" }, setOf(whosHost)),
+                "whos:$whosHost", { query, page -> page ?: "https://$whosHost/videos?q=${encodedQuery(query)}" }, setOf(whosHost, "v.hersav.me")),
             SearchSite(SearchSiteIds.JAVDAY, "JAVDAY", 9, SearchParserKind.JAVDAY,
                 "javday:javday.app", { query, page -> page ?: "https://javday.app/search/wd/${pathQuery(query)}/" }, setOf("javday.app")),
             SearchSite(SearchSiteIds.SUPJAV, "SUPJAV", 10, SearchParserKind.SUPJAV,
