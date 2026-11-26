@@ -105,12 +105,23 @@ class NativePlayerActivity : LocalizedActivity() {
 
         val headers = mutableMapOf<String, String>()
         if (referer.isNotEmpty()) headers["Referer"] = referer
-        // surrit.com 挂 Cloudflare，直接打开会被挡（用户 2026-11-27 截图：
-        // "Sorry, you have been blocked"）。真浏览器的 XHR 能过，因为它带
-        // 全套浏览器头；ExoPlayer 只发 Referer+Cookie+UA 会被当成机器人。
-        // 这里按真浏览器 XHR 的样子补齐头，让请求看起来就是 missav 页里的那次 XHR。
+        // 用户 2026-11-27 发的 HAR 定案：surrit 的视频请求（360p/video.m3u8
+        // 与 video0-8.jpeg）**不带任何 Cookie**，只带 Referer + Origin +
+        // sec-ch-ua / sec-fetch 全套。之前 1.2.47/1.2.48 只补了 Referer 与
+        // Sec-Fetch，缺了最关键的 Origin（浏览器 CORS 请求自动带，ExoPlayer
+        // 不带），Cloudflare 照样挡。按 HAR 原样补齐，UA 也对到 Chrome/137。
+        val refererOrigin = try {
+            val u = java.net.URL(referer)
+            "${u.protocol}://${u.host}"
+        } catch (e: Exception) { "" }
+        if (refererOrigin.isNotEmpty()) headers["Origin"] = refererOrigin
         headers["Accept"] = "*/*"
-        headers["Accept-Language"] = "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"
+        headers["Accept-Language"] = "zh-CN,zh;q=0.9"
+        headers["Cache-Control"] = "no-cache"
+        headers["Pragma"] = "no-cache"
+        headers["Sec-Ch-Ua"] = "\"Chromium\";v=\"137\", \"Not/A)Brand\";v=\"24\""
+        headers["Sec-Ch-Ua-Mobile"] = "?1"
+        headers["Sec-Ch-Ua-Platform"] = "\"Android\""
         headers["Sec-Fetch-Dest"] = "empty"
         headers["Sec-Fetch-Mode"] = "cors"
         headers["Sec-Fetch-Site"] = "cross-site"
@@ -135,7 +146,7 @@ class NativePlayerActivity : LocalizedActivity() {
         // surrit 的 Cloudflare 挡 OkHttp（1.2.47 头补齐了还是永远加载中），
         // Cronet 是 Chrome 自家网络栈：TLS 指纹与真浏览器一致，且走
         // QUIC/H3（UDP，用户网络 H3 是必需品）。Cronet 建不起来才回退 OkHttp。
-        val userAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        val userAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
         val exoPlayer = try {
             val dataSourceFactory = try {
                 val cronetEngine = org.chromium.net.CronetEngine.Builder(this)
