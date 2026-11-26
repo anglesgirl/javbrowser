@@ -114,6 +114,9 @@ class MainActivity : LocalizedActivity() {
     private data class MissavAspect(val landscape: Boolean, val area: Int)
     private var missavCandidatePage: String? = null
     private val missavCandidates = LinkedHashMap<String, MissavAspect?>()
+    // 1.2.52：MissAV 正片自动进播放器的防重入。同一页只自动进一次，
+    // 换页（page 不同）才允许再进。
+    private var missavAutoPlayLaunchedForPage: String? = null
     private val missavAspectExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     private val missavAspectClient = okhttp3.OkHttpClient.Builder()
         .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
@@ -1460,11 +1463,9 @@ class MainActivity : LocalizedActivity() {
                     val pageUrl0 = webView.url ?: currentPageUrl
                     if (isMissavSurritM3u8(pageUrl0, videoUrl)) {
                         missavCandidates.clear()
-                        currentVideoUrl = normalizeMissavM3u8Url(videoUrl)
-                        if (currentVideoReferer == null) {
-                            currentVideoReferer = originForUrl(pageUrl0) ?: domainConfig.getMissAvBaseUrl()
-                        }
-                        showPlayButtonIfAllowed()
+                        val normalized = normalizeMissavM3u8Url(videoUrl)
+                        val ref = currentVideoReferer ?: originForUrl(pageUrl0) ?: domainConfig.getMissAvBaseUrl()
+                        autoPlayMissavMainVideo(normalized, ref)
                         return@runOnUiThread
                     }
                     if (isMissavM3u8(pageUrl0, videoUrl)) {
@@ -2160,12 +2161,9 @@ class MainActivity : LocalizedActivity() {
                         if (currentPageUrl == sourcePage) {
                             // surrit 是正片，直接頂掉 growcdnssedge 候選
                             missavCandidates.clear()
-                            currentVideoUrl = normalizedUrl
-                            if (currentVideoReferer == null) {
-                                val pageUrl = view?.url ?: ""
-                                currentVideoReferer = originForUrl(pageUrl) ?: domainConfig.getMissAvBaseUrl()
-                            }
-                            showPlayButtonIfAllowed()
+                            val pageUrl = view?.url ?: ""
+                            val ref = currentVideoReferer ?: originForUrl(pageUrl) ?: domainConfig.getMissAvBaseUrl()
+                            autoPlayMissavMainVideo(normalizedUrl, ref)
                         }
                     }
                 } else if (isMissavM3u8(currentPageUrl, url)) {
@@ -5880,6 +5878,23 @@ class MainActivity : LocalizedActivity() {
             }
             webView.layoutParams = params
         }
+    }
+
+    // 1.2.52：MissAV 正片（surrit）一拿到就直接进内置播放器、关掉
+    // 浏览器页，不再只亮一个 ▶、挂着一个播不出的内置网页等用户手动点。
+    // 只对 surrit 主片触发；growcdnssedge 广告/预览不触发。
+    // 内置播放器走 FullscreenInternalPlayerActivity（1.2.51 已改走代理），
+    // 关掉浏览器页后，退出播放器回桌面、不回播不出的网页。
+    private fun autoPlayMissavMainVideo(normalizedUrl: String, referer: String?) {
+        val page = currentPageUrl
+        if (missavAutoPlayLaunchedForPage == page) return
+        missavAutoPlayLaunchedForPage = page
+        val ref = referer ?: currentVideoReferer ?: originForUrl(page) ?: domainConfig.getMissAvBaseUrl()
+        currentVideoUrl = normalizedUrl
+        currentVideoReferer = ref
+        android.util.Log.i("MISSAV_AUTOPLAY", "auto-play surrit, page=$page url=$normalizedUrl")
+        launchFullscreenInternalPlayer(normalizedUrl, ref)
+        finish()
     }
 
     private fun showPlayButtonIfAllowed() {
