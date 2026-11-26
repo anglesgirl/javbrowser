@@ -18,8 +18,8 @@ android {
         // minSdk 26（原 GeckoView 151 要求；Go 前置代理 .aar 同样要求 26，保留）。
         minSdk = 26
         targetSdk = 34
-        versionCode = 194
-        versionName = "1.2.46"
+        versionCode = 195
+        versionName = "1.2.47"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

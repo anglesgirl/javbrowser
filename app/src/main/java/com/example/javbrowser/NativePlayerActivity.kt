@@ -105,6 +105,15 @@ class NativePlayerActivity : LocalizedActivity() {
 
         val headers = mutableMapOf<String, String>()
         if (referer.isNotEmpty()) headers["Referer"] = referer
+        // surrit.com 挂 Cloudflare，直接打开会被挡（用户 2026-11-27 截图：
+        // "Sorry, you have been blocked"）。真浏览器的 XHR 能过，因为它带
+        // 全套浏览器头；ExoPlayer 只发 Referer+Cookie+UA 会被当成机器人。
+        // 这里按真浏览器 XHR 的样子补齐头，让请求看起来就是 missav 页里的那次 XHR。
+        headers["Accept"] = "*/*"
+        headers["Accept-Language"] = "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"
+        headers["Sec-Fetch-Dest"] = "empty"
+        headers["Sec-Fetch-Mode"] = "cors"
+        headers["Sec-Fetch-Site"] = "cross-site"
         // Cookies only for the video host itself (or the referer when
         // it is the SAME host). The old code fell back to the
         // referer's cookies unconditionally, which sent another
