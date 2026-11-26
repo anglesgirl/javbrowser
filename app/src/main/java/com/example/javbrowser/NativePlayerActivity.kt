@@ -31,6 +31,13 @@ import java.util.concurrent.TimeUnit
  * already known (HentaiMama's gdvid.info file), where the WebView player
  * stalls (plays ~1s, then jumps back).
  *
+ * 1.2.50: surrit/missav HLS goes through [VideoProxyServer] instead of
+ * direct ExoPlayer. Direct play made ExoPlayer fetch the #EXT-X-KEY
+ * itself from surrit; Cloudflare rejects it, so no key → no decrypt →
+ * buffering forever. The proxy rewrites every URL inside the m3u8
+ * (segments AND #EXT-X-KEY) to go through itself, fetching the real
+ * key with the correct Referer — the upstream fekilooo architecture.
+ *
  * Extras reuse [FullscreenInternalPlayerActivity]'s keys so callers can
  * switch players without changing their putExtra calls.
  */
@@ -38,6 +45,7 @@ class NativePlayerActivity : LocalizedActivity() {
 
     private var player: ExoPlayer? = null
     private lateinit var playerView: PlayerView
+    private var playbackProxyServer: VideoProxyServer? = null
 
     // Real-playback data: the outcome of this play reports back into the
     // sniff session it came from, so the analysis learns which candidate
@@ -142,6 +150,32 @@ class NativePlayerActivity : LocalizedActivity() {
             } else null
         if (!cookies.isNullOrEmpty()) headers["Cookie"] = cookies
 
+        // 1.2.50：surrit/missav 的 m3u8 走回上游的本地代理（VideoProxyServer），
+        // 不再直接给 ExoPlayer。直接播时 ExoPlayer 自己去 surrit 取 #EXT-X-KEY，
+        // Cloudflare 不认、拿不到密钥就解不了密、永远加载中。代理会把 m3u8 里
+        // 的分片与 #EXT-X-KEY 地址全重写成走代理，代理带 Referer 去取真密钥。
+        // 代理上游是 plain OkHttp（ECH 已刪），surrit 的请求头按 HAR 补
+        // （见 VideoProxyServer.fetchViaOkHttp 的 surrit 分支）。
+        val playbackUrl = runCatching {
+            val host = try { java.net.URL(videoUrl).host.orEmpty() } catch (e: Exception) { "" }
+            val isSurrit = host.equals("surrit.com", true) || host.endsWith(".surrit.com", true)
+            if (!isSurrit) return@runCatching videoUrl
+            val proxy = VideoProxyServer().also {
+                it.start(fi.iki.elonen.NanoHTTPD.SOCKET_READ_TIMEOUT, false)
+                playbackProxyServer = it
+            }
+            // HAR：surrit 视频请求不带 Cookie，只带 Referer + Origin + sec-ch-ua。
+            // 这里传 null，让代理不发 Cookie，与浏览器一致。
+            val proxied = proxy.buildProxyUrl(videoUrl, referer, null)
+            PlaybackDataStore.addTrace(sessionId, "播放器：surrit 走本地代理")
+            android.util.Log.i("NATIVE_PLAYER", "surrit via proxy: $videoUrl -> $proxied")
+            proxied
+        }.getOrElse { e ->
+            android.util.Log.w("NATIVE_PLAYER", "Proxy bootstrap failed, fallback direct", e)
+            PlaybackDataStore.addTrace(sessionId, "播放器：代理啟動失敗，走直連")
+            videoUrl
+        }
+
         // 1.2.48：播放器改走 Cronet，不再用 plain OkHttp。
         // surrit 的 Cloudflare 挡 OkHttp（1.2.47 头补齐了还是永远加载中），
         // Cronet 是 Chrome 自家网络栈：TLS 指纹与真浏览器一致，且走
@@ -223,7 +257,7 @@ class NativePlayerActivity : LocalizedActivity() {
         })
         playerView.player = exoPlayer
         try {
-            exoPlayer.setMediaItem(MediaItem.fromUri(videoUrl))
+            exoPlayer.setMediaItem(MediaItem.fromUri(playbackUrl))
             exoPlayer.playWhenReady = true
             exoPlayer.prepare()
             PlaybackDataStore.addTrace(sessionId, "播放器：已 prepare，等待首幀")
@@ -300,5 +334,7 @@ class NativePlayerActivity : LocalizedActivity() {
         PlaybackDataStore.addTrace(sessionId, "播放器 onDestroy")
         player?.release()
         player = null
+        playbackProxyServer?.stop()
+        playbackProxyServer = null
     }
 }

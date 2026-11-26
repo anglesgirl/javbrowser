@@ -34,6 +34,8 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
         private const val CONNECT_TIMEOUT = 15000
         private const val READ_TIMEOUT = 30000
         private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        // 1.2.50：surrit 按 HAR 用 Mobile Chrome/137 的 UA。
+        private val HAR_USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
     }
 
     private data class ProxyTarget(
@@ -247,15 +249,37 @@ class VideoProxyServer(private val authorizeUrl: (String) -> String = { it }) : 
         rangeHeader: String?,
         isRouStream: Boolean,
     ): Upstream {
+        // 1.2.50：surrit（MissAV）按用户发的 HAR 原样发请求。HAR 定案：不带
+        // Cookie，只带 Referer + Origin + sec-ch-ua / sec-fetch 全套，UA 是
+        // Mobile Chrome/137。代理默认的 Windows UA + video/no-cors/same-site
+        // 与 HAR 不符，Cloudflare 照样挡。
+        val isSurrit = realUrl.contains("surrit.com", ignoreCase = true) ||
+            referer.contains("missav", ignoreCase = true)
         val requestBuilder = Request.Builder().url(realUrl)
-            .header("User-Agent", USER_AGENT)
+            .header(
+                "User-Agent",
+                if (isSurrit) HAR_USER_AGENT else USER_AGENT
+            )
         if (referer.isNotEmpty()) requestBuilder.header("Referer", referer)
         if (outboundCookies.isNotEmpty()) requestBuilder.header("Cookie", outboundCookies)
         requestBuilder.header("Accept", "*/*")
         requestBuilder.header("Accept-Encoding", "identity;q=1, *;q=0")
-        requestBuilder.header("Sec-Fetch-Dest", "video")
-        requestBuilder.header("Sec-Fetch-Mode", "no-cors")
-        requestBuilder.header("Sec-Fetch-Site", "same-site")
+        if (isSurrit) {
+            originForUrl(referer)?.let { requestBuilder.header("Origin", it) }
+            requestBuilder.header("Accept-Language", "zh-CN,zh;q=0.9")
+            requestBuilder.header("Cache-Control", "no-cache")
+            requestBuilder.header("Pragma", "no-cache")
+            requestBuilder.header("Sec-Ch-Ua", "\"Chromium\";v=\"137\", \"Not/A)Brand\";v=\"24\"")
+            requestBuilder.header("Sec-Ch-Ua-Mobile", "?1")
+            requestBuilder.header("Sec-Ch-Ua-Platform", "\"Android\"")
+            requestBuilder.header("Sec-Fetch-Dest", "empty")
+            requestBuilder.header("Sec-Fetch-Mode", "cors")
+            requestBuilder.header("Sec-Fetch-Site", "cross-site")
+        } else {
+            requestBuilder.header("Sec-Fetch-Dest", "video")
+            requestBuilder.header("Sec-Fetch-Mode", "no-cors")
+            requestBuilder.header("Sec-Fetch-Site", "same-site")
+        }
         if (realUrl.contains("doppiocdn", ignoreCase = true) ||
             referer.contains("stripchat", ignoreCase = true)
         ) {
