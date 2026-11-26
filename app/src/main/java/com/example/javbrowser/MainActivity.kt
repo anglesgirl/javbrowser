@@ -4581,19 +4581,26 @@ class MainActivity : LocalizedActivity() {
         }
     }
 
-    /** 在本页 MissAV 候选里挑最佳：横屏优先，横屏内分辨率最大的优先；未知横竖的排后。 */
+    /** 在本页 MissAV 候选里挑最佳：横屏优先，横屏内分辨率最大的优先；未知横竖的排后；
+     *  横竖都未知时按 master 清单的质量后缀（_480p > _240p）排，不再只看先到顺序。 */
     private fun updateMissavBest() {
         val best = missavCandidates.entries
             .sortedWith(
                 compareByDescending<Map.Entry<String, MissavAspect?>> { it.value?.landscape == true }
                     .thenByDescending { it.value != null }
                     .thenByDescending { it.value?.area ?: 0 }
+                    .thenByDescending { missavQualitySuffix(it.key) }
             )
             .firstOrNull()?.key ?: return
         if (currentVideoUrl != best) {
             currentVideoUrl = best
             showPlayButtonIfAllowed()
         }
+    }
+
+    /** master/<id>_<q>p.m3u8 里的质量数 q（480/240），取不到回 0。 */
+    private fun missavQualitySuffix(url: String): Int {
+        return Regex("""_(\d+)p\.m3u8""").find(url)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
     }
 
     /**
@@ -4603,6 +4610,13 @@ class MainActivity : LocalizedActivity() {
      */
     private fun resolveM3u8Aspect(playlistUrl: String): MissavAspect? {
         fun fetch(url: String): String? {
+            // 先走 Cronet（H3，走用户网络的正常通道），失败再走明文 OkHttp。
+            // 1.2.43 只用明文 OkHttp，在用户网络上常被 RST，横竖全读不到，
+            // 候选就退回先到顺序，等于修复没生效。
+            val cronet = runCatching {
+                EchH3Router.fetchBytesViaCronet(url)?.toString(Charsets.UTF_8)
+            }.getOrNull()
+            if (cronet != null) return cronet
             val request = okhttp3.Request.Builder().url(url)
                 .header("User-Agent", MAIN_UA)
                 .get().build()
