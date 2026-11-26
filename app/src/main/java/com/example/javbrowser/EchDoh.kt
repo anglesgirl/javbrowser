@@ -34,14 +34,16 @@ import java.util.concurrent.TimeUnit
  * and co3's proven DoH client — same principle, both work on the
  * user's phone; javbrowser's 1.2.23–1.2.25 transport never
  * produced an ECH config there):
- *  - Bootstrap IPs are Cloudflare edge IPs from the 172.64.229/24
- *    range (Han1meViewer: 172.64.229.69; co3: 172.64.229.1–8).
+ *  - Bootstrap IPs are cloudflare-ech.com's edge IPs
+ *    (104.18.10.118 / 104.18.11.118, resolved 2026-11-26).
  *    Any edge IP serves any *.cloudflare-gateway.com hostname via
- *    SNI routing (verified in sandbox for all five endpoints).
- *    The previous pins (162.159.36.5/162.159.36.20, Cloudflare's
- *    public-DNS range, + 176.24.239.99) answered in the sandbox
- *    but never produced a config on the phone — route() always
- *    fell through to Cronet/plain and both RST.
+ *    SNI routing. Do NOT use the 172.64.229/24 range here: it only
+ *    serves SaaS / CNAME-connected domains, and a regular domain
+ *    dialed via it gets Cloudflare Error 1103 (whos.tv, 2026-11-26).
+ *    The previous pins (172.64.229.69 + 172.64.229.1–8, then
+ *    162.159.36.5/162.159.36.20 + 176.24.239.99) answered in the
+ *    sandbox but never produced a config on the phone — route()
+ *    always fell through to Cronet/plain and both RST.
  *  - The DoH client pins every lookup to those bootstrap IPs
  *    (Han1meViewer query() pattern), speaks HTTP/1.1 only and
  *    never goes through a proxy (co3: H2 misbehaves on flaky
@@ -104,10 +106,19 @@ object EchDoh {
     // answer wins). Logs use only the short "GW-<id>" names, never
     // the URL. All five share one bootstrap pool (see the class
     // KDoc): any Cloudflare edge IP serves any gateway hostname.
+    // Bootstrap IPs are cloudflare-ech.com's edge IPs (104.18.10.118 /
+    // 104.18.11.118), resolved 2026-11-26. Do NOT use the 172.64.229/24
+    // range here: that range only serves SaaS / CNAME-connected
+    // domains — a regular domain dialed via it gets Cloudflare
+    // Error 1103 (whos.tv hit this: its service IP is
+    // 2606:4700::6812:782 / 104.18.7.130, not 172.64.229.x).
+    // ECH-capable domains CNAME to cloudflare-ech.com, so its IPs
+    // are general Cloudflare edge IPs that serve any Cloudflare
+    // hostname, including the Gateway DoH endpoints below.
+    // (2026-11-26 user correction: "cloudflare-ech.com 直接用这个
+    // 好了，这样又稳又安全".)
     private val BOOTSTRAP_IPS = listOf(
-        "172.64.229.69", "172.64.229.1", "172.64.229.2", "172.64.229.3",
-        "172.64.229.4", "172.64.229.5", "172.64.229.6", "172.64.229.7",
-        "172.64.229.8",
+        "104.18.10.118", "104.18.11.118",
     )
 
     private val ENDPOINTS = listOf(
