@@ -1479,6 +1479,14 @@ class MainActivity : LocalizedActivity() {
                         android.util.Log.d("ROU_PLAYER", "ignored non-video or other-episode request=$videoUrl")
                         return@runOnUiThread
                     }
+                    // 预览/广告不顶掉已有的正片：MissAV 页上 d.surrit.com 的
+                    // preview.mp4 与 growcdnssedge 广告绝不覆盖 surrit 正片。
+                    val lowerFound = videoUrl.lowercase()
+                    val isPreviewOrAd = lowerFound.contains("/preview") ||
+                        lowerFound.contains("preview.mp4")
+                    val currentIsSurrit = currentVideoUrl?.lowercase()?.contains("surrit.com") == true
+                    if (isPreviewOrAd) return@runOnUiThread
+                    if (currentIsSurrit && !lowerFound.contains("surrit.com")) return@runOnUiThread
                     currentVideoUrl = videoUrl
                     if (currentVideoReferer == null &&
                         (pageUrl.contains("missav", ignoreCase = true) ||
@@ -3056,11 +3064,94 @@ class MainActivity : LocalizedActivity() {
 
     private fun checkForVideo() {
         val url = currentWebUrl ?: return
-        
+
+        // 通用媒体嗅探（猫抓式，不依赖 shouldInterceptRequest）：在页面主世界里
+        // 包住 fetch / XHR / Worker.postMessage，凡是 .m3u8 / .mp4 地址都报给
+        // Android.onVideoFound。MissAV 正片走主线程 XHR（surrit）与 Worker
+        // （hls.js），这两路都不经过 shouldInterceptRequest 的话，网络层就
+        // 永远抓不到——这正是 1.2.43–1.2.45 反复失败的原因。
+        // 只注一次；surrit 优先由 onVideoFound / shouldInterceptRequest 的
+        // MissAV 分支处理，这里只负责把地址报上来。
+        val genericSnifferJs = """
+            (function() {
+                if (window.__javGenericSniffer) return;
+                window.__javGenericSniffer = true;
+                function isMedia(u) {
+                    if (!u) return false;
+                    var s = String(u);
+                    return s.indexOf('.m3u8') !== -1 || s.indexOf('.mp4') !== -1;
+                }
+                function report(u) {
+                    if (!isMedia(u)) return;
+                    try { Android.onVideoFound(String(u)); } catch (e) {}
+                }
+                function scanText(t) {
+                    if (!t) return;
+                    var s = String(t);
+                    var re = /https?:\/\/[^"'\\\s<>]+\.(?:m3u8|mp4)[^"'\\\s<>]*/gi;
+                    var m;
+                    while ((m = re.exec(s)) !== null) { report(m[0]); }
+                }
+                function scanValue(v) {
+                    if (!v) return;
+                    if (typeof v === 'string') { scanText(v); return; }
+                    try {
+                        if (v.url) scanText(v.url);
+                        if (v.payload && v.payload.url) scanText(v.payload.url);
+                        scanText(JSON.stringify(v));
+                    } catch (e) {}
+                }
+                // 1. fetch / XHR（主线程）：surrit 走这路
+                try {
+                    var _fetch = window.fetch;
+                    if (_fetch) {
+                        window.fetch = function() {
+                            var a0 = arguments[0];
+                            scanValue(typeof a0 === 'string' ? a0 : (a0 && a0.url));
+                            return _fetch.apply(this, arguments).then(function(resp) {
+                                try { if (resp && resp.url) scanText(resp.url); } catch (e) {}
+                                return resp;
+                            });
+                        };
+                    }
+                } catch (e) {}
+                try {
+                    var _open = XMLHttpRequest.prototype.open;
+                    XMLHttpRequest.prototype.open = function(method, requestUrl) {
+                        scanText(requestUrl);
+                        return _open.apply(this, arguments);
+                    };
+                } catch (e) {}
+                // 2. Worker.postMessage：hls.js 把 m3u8 发给 Worker 走这路
+                try {
+                    var _post = Worker.prototype.postMessage;
+                    Worker.prototype.postMessage = function(msg) {
+                        scanValue(msg);
+                        return _post.apply(this, arguments);
+                    };
+                } catch (e) {}
+                // 3. 兜底：定时扫 video 元素与页面脚本里的媒体地址
+                var _scanDom = function() {
+                    try {
+                        document.querySelectorAll('video, source').forEach(function(n) {
+                            report(n.currentSrc || n.src || n.getAttribute('src') || '');
+                        });
+                        document.querySelectorAll('script').forEach(function(s) {
+                            scanText(s.textContent || '');
+                        });
+                    } catch (e) {}
+                };
+                _scanDom();
+                setInterval(_scanDom, 2000);
+                setTimeout(function() { _scanDom(); }, 5000);
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(genericSnifferJs, null)
+
         // Only check on likely video pages to save resources
         // Jable: /videos/
         // MissAV: usually has UUID or just check all pages on missav domain
-        
+
         // Inject JS to monitor video element for src changes and intercept network requests for rou.video
         if (isRouVideoUrl(url)) {
             val monitorJs = """
