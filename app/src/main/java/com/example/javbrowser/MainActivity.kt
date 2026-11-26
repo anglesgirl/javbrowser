@@ -72,6 +72,11 @@ class MainActivity : LocalizedActivity() {
     private lateinit var adFilterRules: AdFilterRules
     private lateinit var domainConfig: DomainConfig
     private lateinit var btnPlay: Button
+    private lateinit var videoLoadingOverlay: View
+    // 1.2.53：视频地址获取中遮罩的超时。20 秒还没拿到地址就撤掉遮罩，
+    // 让用户看到页面、手动点 ▶，别一直卡在黑屏转圈。
+    private val videoLoadingHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val videoLoadingTimeoutRunnable = Runnable { hideVideoLoadingOverlay() }
     private lateinit var btnHome: Button
     private lateinit var btnAddFavorite: Button
     private lateinit var btnViewFavorites: Button
@@ -358,6 +363,7 @@ class MainActivity : LocalizedActivity() {
 
         webView = findViewById(R.id.webView)
         btnPlay = findViewById(R.id.btn_play)
+        videoLoadingOverlay = findViewById(R.id.video_loading_overlay)
         btnHome = findViewById(R.id.btn_home)
         fullscreenContainer = findViewById(R.id.fullscreen_container)
         btnAddFavorite = findViewById(R.id.btn_add_favorite)
@@ -2238,6 +2244,14 @@ class MainActivity : LocalizedActivity() {
                 currentMissAvThumbnailConfig = null
                 currentJableVttUrl = null
                 videoFoundToastShown = false
+                // 1.2.53：MissAV 详情页开始加载就盖上“正在获取视频地址”遮罩，
+                // 盖住播不出的网页；拿到地址进播放器时撤掉（autoPlay 里撤）。
+                // 非详情页（列表/首页）不显示。
+                if (url != null && isMissavDetailPage(url)) {
+                    showVideoLoadingOverlay()
+                } else {
+                    hideVideoLoadingOverlay()
+                }
 
                 // DMM Cookie bypass: inject region-unlock cookie for all DMM domains
                 if (url != null && (url.contains("dmm.co.jp") || url.contains("dmm.com"))) {
@@ -5880,6 +5894,34 @@ class MainActivity : LocalizedActivity() {
         }
     }
 
+    // 1.2.53：MissAV 详情页判定（进详情页才显示“正在获取视频地址”遮罩，
+    // 列表/搜索/首页不显示）。详情页最后一段是番号（如 arso-26212、
+    // fns-278）：含连字符且含数字；列表页最后一段是固定词（new、search 等）。
+    private fun isMissavDetailPage(pageUrl: String): Boolean {
+        val uri = runCatching { Uri.parse(pageUrl) }.getOrNull() ?: return false
+        val host = uri.host.orEmpty()
+        if (!host.contains("missav", ignoreCase = true)) return false
+        val segments = uri.path.orEmpty().trim('/').split('/').filter { it.isNotEmpty() }
+        if (segments.isEmpty()) return false
+        val first = segments.first().lowercase()
+        if (first in setOf("search", "tags", "tag", "categories", "category", "actresses", "actors", "makers", "genres", "login", "register", "new", "release", "uncensored")) return false
+        val last = segments.last()
+        return last.contains('-') && last.any { it.isDigit() }
+    }
+
+    private fun showVideoLoadingOverlay() {
+        videoLoadingOverlay.visibility = View.VISIBLE
+        videoLoadingHandler.removeCallbacks(videoLoadingTimeoutRunnable)
+        videoLoadingHandler.postDelayed(videoLoadingTimeoutRunnable, 20_000)
+    }
+
+    private fun hideVideoLoadingOverlay() {
+        videoLoadingHandler.removeCallbacks(videoLoadingTimeoutRunnable)
+        if (::videoLoadingOverlay.isInitialized) {
+            videoLoadingOverlay.visibility = View.GONE
+        }
+    }
+
     // 1.2.52：MissAV 正片（surrit）一拿到就直接进内置播放器、关掉
     // 浏览器页，不再只亮一个 ▶、挂着一个播不出的内置网页等用户手动点。
     // 只对 surrit 主片触发；growcdnssedge 广告/预览不触发。
@@ -5893,11 +5935,16 @@ class MainActivity : LocalizedActivity() {
         currentVideoUrl = normalizedUrl
         currentVideoReferer = ref
         android.util.Log.i("MISSAV_AUTOPLAY", "auto-play surrit, page=$page url=$normalizedUrl")
+        hideVideoLoadingOverlay()
         launchFullscreenInternalPlayer(normalizedUrl, ref)
         finish()
     }
 
     private fun showPlayButtonIfAllowed() {
+        // 1.2.53：▶ 出现时说明已有可用视频地址（非 surrit 的候选，如
+        // growcdnssedge），遮罩撤掉、让用户看到页面点 ▶。surrit 主片
+        // 走 autoPlay（那里也撤遮罩），不经过这里。
+        hideVideoLoadingOverlay()
         btnPlay.visibility = if (
             isStripchatOverlayActive || isOnJavDbVideoPage || isOnJavTrailersVideoPage
         ) View.GONE else View.VISIBLE
