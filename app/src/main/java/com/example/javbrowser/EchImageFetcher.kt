@@ -66,7 +66,9 @@ object EchImageFetcher {
         }
         NetworkLogStore.add(
             NetworkLogEntry(
-                System.currentTimeMillis(), host, transport, null, null,
+                System.currentTimeMillis(), host, transport,
+                runCatching { EchDoh.resolve(host).echConfigList != null }.getOrDefault(false),
+                null,
                 if (result != null) null else "image fetch failed",
                 EchDoh.sourceFor(host),
             ),
