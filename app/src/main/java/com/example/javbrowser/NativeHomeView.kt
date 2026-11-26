@@ -361,7 +361,7 @@ class NativeHomeView(
             "https://www.javhdporn.net/?s=" + q,
             "https://" + domainConfig.get7MmTvDomain() + "/zh/searchall_search/all/" + q + "/1.html",
             "https://" + domainConfig.getAvpleDomain() + "/search?key=" + q,
-            "https://" + domainConfig.getWhosDomain() + "/result?search=" + q,
+            "https://" + domainConfig.getWhosDomain() + "/videos?q=" + q,
             "https://javday.app/search/?wd=" + q,
             "https://" + domainConfig.getRouVideoDomain() + "/search?q=" + q,
             "https://" + domainConfig.getRouVideoDomain() + "/search?q=" + q + "&tab=series",

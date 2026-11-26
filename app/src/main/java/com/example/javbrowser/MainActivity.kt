@@ -762,7 +762,7 @@ class MainActivity : LocalizedActivity() {
             })
             put(org.json.JSONObject().apply {
                 put("label", "Whos.tv")
-                put("template", "https://${domainConfig.getWhosDomain()}/result?search={code}")
+                put("template", "https://${domainConfig.getWhosDomain()}/videos?q={code}")
             })
             put(org.json.JSONObject().apply {
                 put("label", "JAVDAY")

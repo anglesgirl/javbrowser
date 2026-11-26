@@ -80,7 +80,7 @@ class DomainConfig(private val adFilterRules: AdFilterRules) {
     fun getWhosBaseUrl(): String = "https://${getWhosDomain()}/"
 
     fun getWhosSearchUrl(query: String): String =
-        getWhosBaseUrl().trimEnd('/') + "/result?search=" +
+        getWhosBaseUrl().trimEnd('/') + "/videos?q=" +
             android.net.Uri.encode(query)
 
     /**
