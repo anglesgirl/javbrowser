@@ -216,10 +216,16 @@ class SearchHtmlParser(private val site: SearchSite, private val rules: SearchPa
         val card = anchor.closest(rules.card) ?: boundedCard(anchor)
         val href = anchor.absUrl("href")
         // Read only this card, never the containing result list.
+        // Section headers ("大家都在搜" etc.) leak in through the card's
+        // h2-h4 when the anchor sits in a trending/section block instead
+        // of a real video card (Whos.tv homepage browse). A known header
+        // is never a video title: skip it and fall through to img alt /
+        // link text, so the item gets its real title (or is dropped).
         val title = sequenceOf(anchor.attr("title"),
             card.select(".title, .video-title, .video-name, .content-title, h2, h3, h4").text(),
             anchor.select("img[alt]").attr("alt"), card.select("img[alt]").attr("alt"), anchor.text())
-            .firstOrNull { it.isNotBlank() }?.trim() ?: return null
+            .map { it.trim() }
+            .firstOrNull { it.isNotBlank() && !isSectionHeader(it) } ?: return null
         val image = card.select("img").firstOrNull()
         val cover = image?.let { img ->
             listOf("data-src", "data-original", "src").map { img.absUrl(it) }.firstOrNull { it.toHttpUrlOrNull() != null }
@@ -238,6 +244,16 @@ class SearchHtmlParser(private val site: SearchSite, private val rules: SearchPa
             SearchQueryNormalizer.extractCode(
                 if (site.parserKind == SearchParserKind.ROU_VIDEO) card.select("span.truncate").text() else "",
                 title, href), tags, index)
+    }
+
+    /** 通用栏目标题，绝不能当成片名（Whos.tv 首页「大家都在搜」之类）。 */
+    private fun isSectionHeader(text: String): Boolean {
+        return text.trim() in setOf(
+            "大家都在搜", "热门搜索", "热门推荐", "正在热播", "最新上架", "最新视频",
+            "排行榜", "猜你喜欢", "相关推荐", "更多视频", "全部视频", "热门视频",
+            "精选推荐", "编辑推荐", "今日热门", "本周热门", "最新发布",
+            "Trending", "Trending Now", "Popular", "Recommended", "Latest Videos",
+        )
     }
 
     private fun safeRoute(segments: List<String>): String = "/" + segments.filter { it.isNotBlank() }.map { segment ->
