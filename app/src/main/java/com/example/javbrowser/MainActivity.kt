@@ -104,6 +104,21 @@ class MainActivity : LocalizedActivity() {
         .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
         .build()
+    // ── MissAV 嗅探分类（抓包日志 sniff-log-20261126-235542，FNS-278）──
+    // 详情页会同时拉多路 growcdnssedge m3u8：正片是横屏 16:9（如 856x480），
+    // 广告/竖屏短视频是竖屏（如 360x480）。只凭 URL 分不出来（都是
+    // edge-hls/.../master/<id>_<q>p.m3u8），要拉 master 清单读
+    // #EXT-X-STREAM-INF 的 RESOLUTION 才能区分；多个 m3u8 时取横屏里
+    // 分辨率最大的那路。候选只在本页内有效，换页即清；横竖在后台线程
+    // 拉清单读出后才参与比较（读出前先按先到顺序顶上，保证 ▶ 能出现）。
+    private data class MissavAspect(val landscape: Boolean, val area: Int)
+    private var missavCandidatePage: String? = null
+    private val missavCandidates = LinkedHashMap<String, MissavAspect?>()
+    private val missavAspectExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val missavAspectClient = okhttp3.OkHttpClient.Builder()
+        .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
     private val supjavMediaResolver by lazy { SupjavMediaResolver(this) { MAIN_UA } }
     private val supjavPlayerHook by lazy { assets.open("supjav-player-hook.js").bufferedReader(Charsets.UTF_8).use { it.readText() } }
     private val javrateAdLayoutHook by lazy { assets.open("javrate-ad-layout.js").bufferedReader(Charsets.UTF_8).use { it.readText() } }
@@ -1441,6 +1456,12 @@ class MainActivity : LocalizedActivity() {
                         android.util.Log.d("JAVHD_INTERCEPT", "7mmtv preview/ad ignored: $videoUrl")
                         return@runOnUiThread
                     }
+                    // MissAV：多路 m3u8 里横屏才是正片，竖屏是广告——走候选分类，不直接顶掉。
+                    val pageUrl0 = webView.url ?: currentPageUrl
+                    if (isMissavM3u8(pageUrl0, videoUrl)) {
+                        noteMissavM3u8(normalizeMissavM3u8Url(videoUrl))
+                        return@runOnUiThread
+                    }
                     // The new sites use episode lists / nested players. Only their validated
                     // network request may replace the selected stream.
                     if (AdditionalSiteMedia.isPage(webView.url ?: currentPageUrl) || AvTodayMedia.isPage(webView.url ?: currentPageUrl)) return@runOnUiThread
@@ -2110,7 +2131,20 @@ class MainActivity : LocalizedActivity() {
                 }
                 // Video Sniffing: Check if request is for an m3u8 playlist
                 // javhdporn.net 的廣告 CDN（如 streamhls.click）也會出 m3u8，跳過避免誤判
-                if ((isAvpleMainHls || isAvpleGrowMedia || (url.contains(".m3u8") && !url.contains("minisite") &&
+                // MissAV：多路 m3u8 里横屏才是正片，竖屏是广告——走候选分类，不直接顶掉。
+                if (isMissavM3u8(currentPageUrl, url)) {
+                    val normalizedUrl = normalizeMissavM3u8Url(url)
+                    val sourcePage = currentPageUrl
+                    view?.post {
+                        if (currentPageUrl == sourcePage) {
+                            noteMissavM3u8(normalizedUrl)
+                            if (currentVideoReferer == null) {
+                                val pageUrl = view?.url ?: ""
+                                currentVideoReferer = originForUrl(pageUrl) ?: domainConfig.getMissAvBaseUrl()
+                            }
+                        }
+                    }
+                } else if ((isAvpleMainHls || isAvpleGrowMedia || (url.contains(".m3u8") && !url.contains("minisite") &&
                     !currentPageUrl.contains("javhdporn.net") && !AvTodayMedia.isPage(currentPageUrl) &&
                     RouVideoStreams.playlistForPage(currentPageUrl) == null && !isAvplePage && !additionalSite &&
                     !isSevenMmTvPage(currentPageUrl)))) {
@@ -4516,6 +4550,94 @@ class MainActivity : LocalizedActivity() {
             java.net.URL(java.net.URL(playlistUrl), variant).toString()
         }.getOrNull() ?: return null
         return fetch(variantUrl)?.let { sumExtinf(it) }
+    }
+
+    /** MissAV 详情页的 growcdnssedge m3u8 才进本分类（正片/竖屏广告都在这路）。 */
+    private fun isMissavM3u8(pageUrl: String, url: String): Boolean {
+        if (!pageUrl.contains("missav", ignoreCase = true)) return false
+        val lower = url.lowercase()
+        return lower.contains("growcdnssedge.com") && lower.contains(".m3u8")
+    }
+
+    private fun noteMissavM3u8(url: String) {
+        val page = currentPageUrl
+        if (missavCandidatePage != page) {
+            missavCandidatePage = page
+            missavCandidates.clear()
+        }
+        val isNew = !missavCandidates.containsKey(url)
+        if (isNew) missavCandidates[url] = null
+        updateMissavBest()
+        if (!isNew) return
+        missavAspectExecutor.execute {
+            val aspect = resolveM3u8Aspect(url)
+            runOnUiThread {
+                if (missavCandidatePage != currentPageUrl) return@runOnUiThread
+                if (!missavCandidates.containsKey(url)) return@runOnUiThread
+                missavCandidates[url] = aspect
+                android.util.Log.d("JAVHD_INTERCEPT", "missav candidate aspect: $url -> $aspect")
+                updateMissavBest()
+            }
+        }
+    }
+
+    /** 在本页 MissAV 候选里挑最佳：横屏优先，横屏内分辨率最大的优先；未知横竖的排后。 */
+    private fun updateMissavBest() {
+        val best = missavCandidates.entries
+            .sortedWith(
+                compareByDescending<Map.Entry<String, MissavAspect?>> { it.value?.landscape == true }
+                    .thenByDescending { it.value != null }
+                    .thenByDescending { it.value?.area ?: 0 }
+            )
+            .firstOrNull()?.key ?: return
+        if (currentVideoUrl != best) {
+            currentVideoUrl = best
+            showPlayButtonIfAllowed()
+        }
+    }
+
+    /**
+     * 取 master 清单里最大一路流的宽高：读 #EXT-X-STREAM-INF 的 RESOLUTION。
+     * 失败或读不到分辨率回 null（不参与横竖比较，只按先到顺序排）。
+     * 不带 Referer、不带 cookie，与播放器拉流一致。
+     */
+    private fun resolveM3u8Aspect(playlistUrl: String): MissavAspect? {
+        fun fetch(url: String): String? {
+            val request = okhttp3.Request.Builder().url(url)
+                .header("User-Agent", MAIN_UA)
+                .get().build()
+            return runCatching {
+                missavAspectClient.newCall(request).execute().use { resp ->
+                    if (!resp.isSuccessful) return@runCatching null
+                    resp.body?.string()
+                }
+            }.getOrNull()
+        }
+        fun parseAspect(body: String): MissavAspect? {
+            var best: MissavAspect? = null
+            body.lineSequence().forEach { line ->
+                val t = line.trim()
+                if (t.startsWith("#EXT-X-STREAM-INF:")) {
+                    val res = Regex("""RESOLUTION=(\d+)x(\d+)""").find(t)
+                    val w = res?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    val h = res?.groupValues?.getOrNull(2)?.toIntOrNull()
+                    if (w != null && h != null && w > 0 && h > 0) {
+                        val a = MissavAspect(landscape = w > h, area = w * h)
+                        if (best == null || a.area > best.area) best = a
+                    }
+                }
+            }
+            return best
+        }
+        val body = fetch(playlistUrl) ?: return null
+        parseAspect(body)?.let { return it }
+        // master 清单里没写 RESOLUTION 时，跟第一条 variant 再取一次。
+        val variant = body.lineSequence().map { it.trim() }
+            .firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: return null
+        val variantUrl = runCatching {
+            java.net.URL(java.net.URL(playlistUrl), variant).toString()
+        }.getOrNull() ?: return null
+        return fetch(variantUrl)?.let { parseAspect(it) }
     }
 
     /**
