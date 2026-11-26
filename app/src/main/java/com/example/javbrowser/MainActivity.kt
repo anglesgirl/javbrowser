@@ -1456,8 +1456,17 @@ class MainActivity : LocalizedActivity() {
                         android.util.Log.d("JAVHD_INTERCEPT", "7mmtv preview/ad ignored: $videoUrl")
                         return@runOnUiThread
                     }
-                    // MissAV：多路 m3u8 里横屏才是正片，竖屏是广告——走候选分类，不直接顶掉。
+                    // MissAV：正片在 surrit.com，直接当正片；growcdnssedge 是广告/预览，走候选分类。
                     val pageUrl0 = webView.url ?: currentPageUrl
+                    if (isMissavSurritM3u8(pageUrl0, videoUrl)) {
+                        missavCandidates.clear()
+                        currentVideoUrl = normalizeMissavM3u8Url(videoUrl)
+                        if (currentVideoReferer == null) {
+                            currentVideoReferer = originForUrl(pageUrl0) ?: domainConfig.getMissAvBaseUrl()
+                        }
+                        showPlayButtonIfAllowed()
+                        return@runOnUiThread
+                    }
                     if (isMissavM3u8(pageUrl0, videoUrl)) {
                         noteMissavM3u8(normalizeMissavM3u8Url(videoUrl))
                         return@runOnUiThread
@@ -2131,8 +2140,27 @@ class MainActivity : LocalizedActivity() {
                 }
                 // Video Sniffing: Check if request is for an m3u8 playlist
                 // javhdporn.net 的廣告 CDN（如 streamhls.click）也會出 m3u8，跳過避免誤判
-                // MissAV：多路 m3u8 里横屏才是正片，竖屏是广告——走候选分类，不直接顶掉。
-                if (isMissavM3u8(currentPageUrl, url)) {
+                // MissAV：正片在 surrit.com（c.surrit.com/<uuid>/playlist.m3u8），
+                // growcdnssedge 全是廣告/預覽。surrit 直接當正片，不進候選分類；
+                // 只有沒 surrit 時才用 growcdnssedge 候選兜底。
+                // （1DM 也是這樣抓的：它列出的 720p/480p/360p 三路全是 surrit，
+                // growcdnssedge 在它那裡只是預覽。之前只盯 growcdnssedge 是盯錯了地方。）
+                if (isMissavSurritM3u8(currentPageUrl, url)) {
+                    val normalizedUrl = normalizeMissavM3u8Url(url)
+                    val sourcePage = currentPageUrl
+                    view?.post {
+                        if (currentPageUrl == sourcePage) {
+                            // surrit 是正片，直接頂掉 growcdnssedge 候選
+                            missavCandidates.clear()
+                            currentVideoUrl = normalizedUrl
+                            if (currentVideoReferer == null) {
+                                val pageUrl = view?.url ?: ""
+                                currentVideoReferer = originForUrl(pageUrl) ?: domainConfig.getMissAvBaseUrl()
+                            }
+                            showPlayButtonIfAllowed()
+                        }
+                    }
+                } else if (isMissavM3u8(currentPageUrl, url)) {
                     val normalizedUrl = normalizeMissavM3u8Url(url)
                     val sourcePage = currentPageUrl
                     view?.post {
@@ -4559,6 +4587,13 @@ class MainActivity : LocalizedActivity() {
         return lower.contains("growcdnssedge.com") && lower.contains(".m3u8")
     }
 
+    /** MissAV 正片在 surrit.com（c.surrit.com/<uuid>/playlist.m3u8 或 <uuid>/<q>p/video.m3u8）。 */
+    private fun isMissavSurritM3u8(pageUrl: String, url: String): Boolean {
+        if (!pageUrl.contains("missav", ignoreCase = true)) return false
+        val lower = url.lowercase()
+        return (lower.contains("surrit.com")) && lower.contains(".m3u8")
+    }
+
     private fun noteMissavM3u8(url: String) {
         val page = currentPageUrl
         if (missavCandidatePage != page) {
@@ -4582,8 +4617,11 @@ class MainActivity : LocalizedActivity() {
     }
 
     /** 在本页 MissAV 候选里挑最佳：横屏优先，横屏内分辨率最大的优先；未知横竖的排后；
-     *  横竖都未知时按 master 清单的质量后缀（_480p > _240p）排，不再只看先到顺序。 */
+     *  横竖都未知时按 master 清单的质量后缀（_480p > _240p）排，不再只看先到顺序。
+     *  正片已是 surrit 时不碰它——growcdnssedge 候选只是广告/预览兜底。 */
     private fun updateMissavBest() {
+        val current = currentVideoUrl
+        if (current != null && current.lowercase().contains("surrit.com")) return
         val best = missavCandidates.entries
             .sortedWith(
                 compareByDescending<Map.Entry<String, MissavAspect?>> { it.value?.landscape == true }
