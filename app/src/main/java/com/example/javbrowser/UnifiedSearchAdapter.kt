@@ -108,6 +108,9 @@ class UnifiedSearchAdapter(
         holder.title.setOnClickListener { onShowSources(group) }
         holder.cover.setOnClickListener { onShowSources(group) }
         holder.links.contentDescription = LanguageManager.text(context, "搜尋結果來源", "Search result sources")
+        // Guarantee the ECH image loader is registered even if Glide's
+        // kapt-generated module was not picked up (grey covers, 1.2.40).
+        EchGlideModule.ensureRegistered(holder.cover.context)
         Glide.with(holder.cover.context).load(group.coverUrl)
             .placeholder(android.R.color.darker_gray).error(android.R.color.darker_gray).into(holder.cover)
     }

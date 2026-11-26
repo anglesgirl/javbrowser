@@ -38,17 +38,43 @@ import java.io.InputStream
 @GlideModule
 class EchGlideModule : AppGlideModule() {
     override fun registerComponents(context: Context, glide: Glide, registry: Registry) {
-        registry.prepend(
-            String::class.java,
-            InputStream::class.java,
-            EchImageModelLoader.Factory(),
-        )
+        registerEchImageLoader(registry)
     }
 
     override fun isManifestParsingEnabled(): Boolean = false
+
+    companion object {
+        @Volatile private var registered = false
+
+        /**
+         * Programmatic fallback for [registerComponents]: the kapt
+         * annotation processor is supposed to discover this module,
+         * but a missed processor run leaves Glide on its default
+         * plain-TCP fetcher with no error (grey covers, 1.2.38 /
+         * 1.2.40). Prepending the loader directly guarantees the ECH
+         * route is used even if the generated module is not picked
+         * up. Idempotent; safe to call from every image bind.
+         */
+        @Synchronized
+        fun ensureRegistered(context: Context) {
+            if (registered) return
+            Glide.get(context).registry.let { registry ->
+                registerEchImageLoader(registry)
+            }
+            registered = true
+        }
+
+        private fun registerEchImageLoader(registry: Registry) {
+            registry.prepend(
+                String::class.java,
+                InputStream::class.java,
+                EchImageModelLoader.Factory(),
+            )
+        }
+    }
 }
 
-private class EchImageModelLoader : ModelLoader<String, InputStream> {
+internal class EchImageModelLoader : ModelLoader<String, InputStream> {
     override fun buildLoadData(
         model: String,
         width: Int,
