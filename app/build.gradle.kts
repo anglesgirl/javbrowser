@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.kapt")
     id("com.google.gms.google-services")
     id("com.google.firebase.crashlytics")
 }
@@ -17,8 +18,8 @@ android {
         // minSdk 26（原 GeckoView 151 要求；Go 前置代理 .aar 同样要求 26，保留）。
         minSdk = 26
         targetSdk = 34
-        versionCode = 187
-        versionName = "1.2.39"
+        versionCode = 188
+        versionName = "1.2.40"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -81,6 +82,11 @@ dependencies {
     
     // Glide for image loading
     implementation("com.github.bumptech.glide:glide:4.16.0")
+    // Glide annotation processor: generates the registry for
+    // @GlideModule (EchGlideModule). Without it the module is dead
+    // code — Glide silently uses its default plain-TCP fetcher and
+    // the ECH image loader never runs (grey covers, 1.2.38).
+    kapt("com.github.bumptech.glide:compiler:4.16.0")
 
     // PhotoView for pinch-to-zoom image display
     implementation("com.github.chrisbanes:PhotoView:2.3.0")

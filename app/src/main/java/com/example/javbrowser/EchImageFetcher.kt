@@ -47,10 +47,31 @@ object EchImageFetcher {
     /** Blocking. Call from a background thread (Glide's DataFetcher does). */
     fun fetchBytes(url: String): ByteArray? {
         val host = url.toHttpUrlOrNull()?.host ?: return null
-        return when (EchH3Router.route(host)) {
-            EchH3Router.Route.Ech -> fetchEchBytes(url, host)
-            EchH3Router.Route.Cronet -> fetchCronetBytes(url)
+        // Visible in the app's transmission log (NetworkLogStore), so a
+        // grey cover can be diagnosed from the phone without adb: the
+        // route is suffixed "-IMG" to distinguish image fetches from
+        // search HTML fetches for the same host. No IMG entry at all
+        // means Glide never called this fetcher (coverUrl null, or the
+        // Glide module not registered).
+        var transport = "IMG"
+        val result = when (EchH3Router.route(host)) {
+            EchH3Router.Route.Ech -> {
+                transport = "ECH-IMG"
+                fetchEchBytes(url, host)
+            }
+            EchH3Router.Route.Cronet -> {
+                transport = "Cronet-IMG"
+                fetchCronetBytes(url)
+            }
         }
+        NetworkLogStore.add(
+            NetworkLogEntry(
+                System.currentTimeMillis(), host, transport, null, null,
+                if (result != null) null else "image fetch failed",
+                EchDoh.sourceFor(host),
+            ),
+        )
+        return result
     }
 
     private fun fetchEchBytes(url: String, host: String): ByteArray? {
