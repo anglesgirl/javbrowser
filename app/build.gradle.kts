@@ -18,8 +18,8 @@ android {
         // minSdk 26（原 GeckoView 151 要求；Go 前置代理 .aar 同样要求 26，保留）。
         minSdk = 26
         targetSdk = 34
-        versionCode = 195
-        versionName = "1.2.47"
+        versionCode = 196
+        versionName = "1.2.48"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -119,6 +119,10 @@ dependencies {
     // playback on ECH-only CDNs may 403 — the javhd main path is the
     // WebView embed player and is unaffected).
     implementation("androidx.media3:media3-datasource-okhttp:1.4.1")
+    // Cronet DataSource for ExoPlayer: surrit 的 Cloudflare 挡 OkHttp
+    // （头补齐了还是永远加载中），Cronet 是 Chrome 自家网络栈，TLS
+    // 指纹与真浏览器一致，且走 QUIC/H3（UDP），1.2.48 起播放器改走它。
+    implementation("androidx.media3:media3-datasource-cronet:1.4.1")
 
     // App-layer ECH (Conscrypt) + HTTP/3 (Cronet) for search/page fetch,
     // restored 1.2.25 from the pre-2026-11-13 code (74085d6, before the

@@ -131,21 +131,33 @@ class NativePlayerActivity : LocalizedActivity() {
             } else null
         if (!cookies.isNullOrEmpty()) headers["Cookie"] = cookies
 
-        // GeckoView 遷移後：ECH 基建已刪，直鏈改走 plain OkHttp。
-        // 明文 SNI 在用戶網絡上可能被視頻 CDN 回 403（原先走 ECH 才通），
-        // javhd 主路已是嵌頁播放器（WebView），不受影響。
-        // 保留無 call timeout：長串流不能因 15 秒到就被掐斷。
-        val videoClient = OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .followRedirects(true)
-            .followSslRedirects(true)
-            .retryOnConnectionFailure(true)
-            .build()
+        // 1.2.48：播放器改走 Cronet，不再用 plain OkHttp。
+        // surrit 的 Cloudflare 挡 OkHttp（1.2.47 头补齐了还是永远加载中），
+        // Cronet 是 Chrome 自家网络栈：TLS 指纹与真浏览器一致，且走
+        // QUIC/H3（UDP，用户网络 H3 是必需品）。Cronet 建不起来才回退 OkHttp。
+        val userAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         val exoPlayer = try {
-            val dataSourceFactory = OkHttpDataSource.Factory(videoClient)
-                .setUserAgent("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
-                .setDefaultRequestProperties(headers)
+            val dataSourceFactory = try {
+                val cronetEngine = org.chromium.net.CronetEngine.Builder(this)
+                    .enableQuic(true)
+                    .setUserAgent(userAgent)
+                    .build()
+                androidx.media3.datasource.cronet.CronetDataSource.Factory(cronetEngine, java.util.concurrent.Executors.newSingleThreadExecutor())
+                    .setUserAgent(userAgent)
+                    .setDefaultRequestProperties(headers)
+            } catch (e: Exception) {
+                android.util.Log.w("NATIVE_PLAYER", "Cronet unavailable, falling back to OkHttp", e)
+                val videoClient = OkHttpClient.Builder()
+                    .connectTimeout(10, TimeUnit.SECONDS)
+                    .readTimeout(30, TimeUnit.SECONDS)
+                    .followRedirects(true)
+                    .followSslRedirects(true)
+                    .retryOnConnectionFailure(true)
+                    .build()
+                OkHttpDataSource.Factory(videoClient)
+                    .setUserAgent(userAgent)
+                    .setDefaultRequestProperties(headers)
+            }
             ExoPlayer.Builder(this)
                 .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
                 .build()
